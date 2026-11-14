@@ -4,7 +4,7 @@ import Virtualization
 /// The screen after the download. The installer writes `disk.img`; that file is the installed system.
 /// A finished preseed powers the guest off. SSH login, not the installer screen, is the finish check.
 /// This view then snapshots that disk so later machines are clones.
-/// Setup is the next wizard page: the same layout as the download, with a small guest screen where the ISO bar was.
+/// Setup is the next wizard page: the same steps as the download page, on a window large enough to read the guest.
 /// Reopening Quick start boots that disk alone, then checks SSH. It does not attach the installer again.
 struct Install: View {
     let iso: String
@@ -29,9 +29,9 @@ struct Install: View {
             header
             if setup {
                 guestScreen
-                    .frame(maxWidth: .infinity)
-                    .frame(height: 96)
+                    .frame(width: 800, height: 500)
                 stepList
+                    .frame(width: 800)
             } else {
                 guestScreen
                     .frame(width: 800, height: 500)
@@ -47,7 +47,7 @@ struct Install: View {
             actions
         }
         .padding(24)
-        .frame(width: setup ? 440 : 848, alignment: .topLeading)
+        .frame(width: 848, alignment: .topLeading)
         .onAppear {
             // A clone, a login, or a disk the installer already partitioned boots alone.
             // That boot still has to log in. A partition table is not the finish check.
@@ -70,7 +70,7 @@ struct Install: View {
         }
     }
 
-    /// Where the download page draws the ISO bar. The installer has no byte count, so the guest is the progress.
+    /// The guest, where the download page draws the ISO bar. Setup uses the same size as a running machine so the installer can be read.
     private var guestScreen: some View {
         GuestView(session: guest, capture: fromSnapshot || guest.installed)
             .background(.black, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
