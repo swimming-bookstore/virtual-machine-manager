@@ -16,8 +16,10 @@ struct WizardStep: Identifiable {
         WizardStep(id: "verify", title: "Verify checksum", detail: "SHA512SUMS", state: "wait"),
     ]
 
+    /// The second page keeps the download list and adds the preseed and patch rows.
     static let preseed = [
         WizardStep(id: "preseed", title: "Prepare preseed disk", detail: "preseed.img", state: "wait"),
+        WizardStep(id: "patch", title: "Patch the installer", detail: "boot.iso", state: "wait"),
     ]
 
     /// Debian setup is the next page of this wizard, not a different window.
@@ -260,7 +262,7 @@ final class Wizard: ObservableObject {
                 steps[index].detail = detail
             }
         case "step", "ready":
-            if event.step == "preseed" { showPreseed() }
+            if event.step == "preseed" || event.step == "patch" { showPreseed() }
             if let step = event.step, let state = event.state { applyState(step, state: state, detail: event.detail) }
             if event.event == "ready" {
                 readyPath = event.path
@@ -288,7 +290,13 @@ final class Wizard: ObservableObject {
     private func showPreseed() {
         if page == 1 { return }
         page = 1
-        steps = WizardStep.preseed
+        // Same list as the first page. The finished download rows stay, then preseed and patch.
+        var next = steps.filter { $0.id != "preseed" && $0.id != "patch" }
+        for earlier in next.indices where next[earlier].state != "fail" {
+            next[earlier].state = "done"
+        }
+        next.append(contentsOf: WizardStep.preseed)
+        steps = next
     }
 
     private func applyState(_ id: String, state: String, detail: String?) {

@@ -108,14 +108,15 @@ pub struct Prepared {
 
 /// Writes the answer disk, the boot ISO, and the empty guest disk.
 /// A missing disk is a new install. The previous login does not apply to the empty file written here.
-pub fn prepare(cache: &Path, iso: &Path, support: &Path) -> Result<Prepared> {
+/// The bool is true when this call rewrote the installer copy. A copy that is already patched is false.
+pub fn prepare(cache: &Path, iso: &Path, support: &Path) -> Result<(Prepared, bool)> {
     if !iso.is_file() {
         bail!("installer image is missing: {}", iso.display());
     }
     fs::create_dir_all(cache).map_err(|err| anyhow!("cannot create {}: {err}", cache.display()))?;
     let key = read_key(&support.join("ssh").join(AUTHORIZED))?;
     let _ = write_image(&cache.join(FILE), &image(&key)?)?;
-    write_boot(iso, &cache.join(BOOT), &key)?;
+    let patched = write_boot(iso, &cache.join(BOOT), &key)?;
     let guest = support.join("machines").join(MACHINE);
     fs::create_dir_all(&guest)
         .map_err(|err| anyhow!("cannot create {}: {err}", guest.display()))?;
@@ -124,7 +125,7 @@ pub fn prepare(cache: &Path, iso: &Path, support: &Path) -> Result<Prepared> {
         forget_login(support, &guest);
         sparse(&disk, GUEST)?;
     }
-    Ok(Prepared { disk, key: support.join("ssh").join(AUTHORIZED) })
+    Ok((Prepared { disk, key: support.join("ssh").join(AUTHORIZED) }, patched))
 }
 
 /// `ssh/logged-in` is one file for the app. Deleting `disk.img` does not remove it.
@@ -155,9 +156,9 @@ fn write_image(dest: &Path, body: &[u8]) -> Result<PathBuf> {
 }
 
 /// Copies the verified ISO and applies the guide's boot edit. The signed file is not rewritten.
-fn write_boot(iso: &Path, dest: &Path, public_key: &str) -> Result<()> {
+fn write_boot(iso: &Path, dest: &Path, public_key: &str) -> Result<bool> {
     if already_patched(dest, public_key) {
-        return Ok(());
+        return Ok(false);
     }
     let tmp = dest.with_extension("partial");
     fs::copy(iso, &tmp).map_err(|err| anyhow!("cannot copy installer: {err}"))?;
@@ -165,7 +166,7 @@ fn write_boot(iso: &Path, dest: &Path, public_key: &str) -> Result<()> {
         patch_installer(&tmp, public_key)?;
     }
     fs::rename(&tmp, dest)?;
-    Ok(())
+    Ok(true)
 }
 
 fn already_patched(dest: &Path, public_key: &str) -> bool {
@@ -855,7 +856,8 @@ mod tests {
         fs::write(&iso, installer_iso()).unwrap();
         fs::create_dir_all(dir.join("ssh")).unwrap();
         fs::write(dir.join("ssh").join(AUTHORIZED), PUB).unwrap();
-        prepare(&dir.join("cache"), &iso, &dir).unwrap();
+        let (_, patched) = prepare(&dir.join("cache"), &iso, &dir).unwrap();
+        assert!(patched);
         let boot = fs::read(dir.join("cache").join(BOOT)).unwrap();
         assert_eq!(fs::read(&iso).unwrap(), installer_iso());
         let menu = &boot[29 * 2048..30 * 2048];
@@ -875,7 +877,8 @@ mod tests {
         dec.read_to_end(&mut cpio).unwrap();
         assert!(cpio.windows(answers().len()).any(|w| w == answers().as_bytes()));
         assert!(cpio.windows(PUB.len()).any(|w| w == PUB.as_bytes()));
-        prepare(&dir.join("cache"), &iso, &dir).unwrap();
+        let (_, again) = prepare(&dir.join("cache"), &iso, &dir).unwrap();
+        assert!(!again);
         assert_eq!(fs::read(dir.join("cache").join(BOOT)).unwrap(), boot);
         let _ = fs::remove_dir_all(&dir);
     }
@@ -927,13 +930,15 @@ menuentry 'Graphical install' {
         fs::write(&iso, b"iso").unwrap();
         fs::create_dir_all(dir.join("ssh")).unwrap();
         fs::write(dir.join("ssh").join(AUTHORIZED), PUB).unwrap();
-        let prepared = prepare(&dir.join("cache"), &iso, &dir).unwrap();
+        let (prepared, patched) = prepare(&dir.join("cache"), &iso, &dir).unwrap();
+        assert!(patched);
         assert_eq!(prepared.disk, dir.join("machines/debian").join(DISK));
         assert_eq!(prepared.disk.metadata().unwrap().len(), GUEST);
         assert_eq!(prepared.key, dir.join("ssh").join(AUTHORIZED));
         assert!(dir.join("cache").join(FILE).is_file());
         assert_eq!(fs::read(dir.join("cache").join(BOOT)).unwrap(), b"iso");
-        prepare(&dir.join("cache"), &iso, &dir).unwrap();
+        let (_, again) = prepare(&dir.join("cache"), &iso, &dir).unwrap();
+        assert!(!again);
         assert_eq!(prepared.disk.metadata().unwrap().len(), GUEST);
         let _ = fs::remove_dir_all(&dir);
     }

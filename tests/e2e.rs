@@ -460,7 +460,9 @@ fn quick_start_checks_the_signature_before_the_iso() {
             "step verify done",
             "step preseed now",
             "step preseed done",
-            "ready preseed done",
+            "step patch now",
+            "step patch done",
+            "ready patch done",
         ]
     );
     assert!(events
@@ -534,8 +536,12 @@ fn quick_start_checks_the_signature_before_the_iso() {
         Some(dir.join("machines/debian/disk.img").to_str().unwrap())
     );
     assert_eq!(screen.page, 1);
-    assert_eq!(screen.steps.len(), 1);
+    assert_eq!(screen.steps.len(), 8);
+    assert_eq!(screen.row("download").state, "done");
+    assert_eq!(screen.row("verify").state, "done");
     assert_eq!(screen.row("preseed").state, "done");
+    assert_eq!(screen.row("patch").state, "done");
+    assert_eq!(screen.row("patch").detail, "boot.iso");
     assert!(screen.installing());
     assert_eq!(screen.buttons(), [] as [&str; 0]);
     assert!(dir.join("cache/preseed.img").is_file());
@@ -934,7 +940,7 @@ impl Screen {
                 }
             }
             "step" | "ready" => {
-                if step == Some("preseed") {
+                if step == Some("preseed") || step == Some("patch") {
                     self.show_preseed();
                 }
                 if let (Some(id), Some(state)) = (step, event["state"].as_str()) {
@@ -970,12 +976,27 @@ impl Screen {
             return;
         }
         self.page = 1;
-        self.steps = vec![Step {
-            id: "preseed",
-            title: "Prepare preseed disk",
-            detail: "preseed.img".into(),
-            state: "wait".into(),
-        }];
+        // Same list as the first page. The finished download rows stay, then preseed and patch.
+        self.steps.retain(|step| step.id != "preseed" && step.id != "patch");
+        for step in &mut self.steps {
+            if step.state != "fail" {
+                step.state = "done".into();
+            }
+        }
+        self.steps.extend([
+            Step {
+                id: "preseed",
+                title: "Prepare preseed disk",
+                detail: "preseed.img".into(),
+                state: "wait".into(),
+            },
+            Step {
+                id: "patch",
+                title: "Patch the installer",
+                detail: "boot.iso".into(),
+                state: "wait".into(),
+            },
+        ]);
     }
 
     fn apply_state(&mut self, id: &str, state: &str, detail: Option<&str>) {
@@ -2172,11 +2193,13 @@ fn quick_start_swift_gates_the_bar_on_a_real_download() {
     let src = include_str!("../Sources/QuickStart.swift");
     assert!(src.contains("if event.event == \"progress\", event.step == \"download\""));
     assert!(src.contains("if wizard.page == 0 && wizard.downloading {"));
-    assert!(src.contains("if event.step == \"preseed\" { showPreseed() }"));
+    assert!(src.contains("if event.step == \"preseed\" || event.step == \"patch\" { showPreseed() }"));
     assert!(src.contains("wizard.page == 1 ? \"Preseed\""));
     assert!(src.contains("static let preseed"));
     assert!(include_str!("../Sources/Install.swift").contains("Debian setup"));
     assert!(include_str!("../Sources/Install.swift").contains("Show installer"));
+    assert!(include_str!("../Sources/Install.swift").contains("private var showsInstaller: Bool { setup && !guest.snapshotReady }"));
+    assert!(include_str!("../Sources/Install.swift").contains("if !guest.snapshotReady {"));
     assert!(include_str!("../Sources/Install.swift").contains("GuestMirror"));
     assert!(include_str!("../Sources/Install.swift").contains("func attach(_ screen: InstallScreen)"));
     assert!(include_str!("../Sources/Install.swift").contains(".nonactivatingPanel"));

@@ -339,7 +339,7 @@ mod tests {
         fs::write(dir.join("ssh").join("authorized_keys"), b"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestKeyForTheInstaller\n").unwrap();
         let iso = dir.join("cache").join("debian.iso");
         fs::write(&iso, b"iso").unwrap();
-        let prepared = preseed::prepare(&dir.join("cache"), &iso, &dir).unwrap();
+        let prepared = preseed::prepare(&dir.join("cache"), &iso, &dir).unwrap().0;
         assert!(save(&dir).unwrap_err().to_string().contains("install is not finished"));
         assert!(clone_machine(&dir, None)
             .unwrap_err()

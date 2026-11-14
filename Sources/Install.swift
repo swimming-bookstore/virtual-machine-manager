@@ -8,6 +8,7 @@ import Virtualization
 /// The button beside that thumbnail opens the guest in a new window. That window does not capture the mouse or the keyboard.
 /// Reopening Quick start boots a written disk alone, then checks SSH. It does not attach the installer or a pointer.
 /// A saved snapshot is the finished install. Reopening that disk does not start the installer virtual machine.
+/// That page does not show the installer preview or the Show installer button. Nothing is installing.
 /// A partition table is not a finished login. Quick start never attaches a pointer, so neither view can capture the cursor.
 struct Install: View {
     let iso: String
@@ -31,15 +32,19 @@ struct Install: View {
     /// Quick start stays the download-sized wizard. A clone is the machine window.
     private var setup: Bool { !fromSnapshot }
 
+    /// The thumbnail and Show installer button are only while this guest is still installing.
+    /// A saved snapshot does not install again, so the wizard does not show them.
+    private var showsInstaller: Bool { setup && !guest.snapshotReady }
+
     /// A clone captures. Quick start does not, including the installer window opened from the thumbnail.
     private var capturePointer: Bool { fromSnapshot }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
             header
-            if setup {
+            if showsInstaller {
                 popupButton
-            } else {
+            } else if !setup {
                 guestScreen
                     .frame(width: 800, height: 500)
             }
@@ -58,7 +63,7 @@ struct Install: View {
         .frame(width: setup ? 440 : 848, alignment: .topLeading)
         .background {
             // A Window in the view body is a separate window. Closing it does not stop the guest.
-            if setup {
+            if showsInstaller {
                 InstallerWindow(guest: guest, presented: $guest.showWindow) {
                     GuestMirror(session: guest)
                         .frame(width: 800, height: 500)
@@ -103,6 +108,7 @@ struct Install: View {
     }
 
     /// Same slot as the ISO progress. A small live thumbnail, and a button that opens the guest in a new window.
+    /// Shown only while this guest is still installing. A saved snapshot does not install again, so neither is shown.
     /// That window does not capture the pointer or the keyboard. Quick start never attaches a pointer either.
     /// The guest view can only be in one place, so the thumbnail holds it until the window opens.
     private var popupButton: some View {
@@ -136,10 +142,14 @@ struct Install: View {
         HStack {
             Spacer(minLength: 12)
             if guest.stopped {
-                Button(guest.installed ? "Start Debian" : "Start from the guest disk") {
-                    guest.startInstalled()
+                // The installer disk is the snapshot source. Starting it again is not a machine the user runs.
+                // New virtual machine clones that snapshot. Start Debian stays for a disk that still needs the SSH check.
+                if !guest.snapshotReady {
+                    Button(guest.installed ? "Start Debian" : "Start from the guest disk") {
+                        guest.startInstalled()
+                    }
+                    .buttonStyle(.borderedProminent)
                 }
-                .buttonStyle(.borderedProminent)
                 if guest.snapshotReady {
                     Button("New virtual machine") { newMachine() }
                         .buttonStyle(.bordered)
@@ -265,6 +275,7 @@ final class GuestSession: NSObject, ObservableObject, VZVirtualMachineDelegate {
         snapshotReady = true
         saved = true
         started = true
+        showWindow = false
         error = nil
         headline = "Debian is installed and shut down. A snapshot is saved for new machines."
         markSetup("installer", state: "done", detail: nil)
@@ -464,6 +475,7 @@ final class GuestSession: NSObject, ObservableObject, VZVirtualMachineDelegate {
                     self.headline = "Debian shut down, but the snapshot was not saved."
                 } else {
                     self.markSetup("snapshot", state: "done", detail: "Saved")
+                    self.showWindow = false
                     self.snapshotReady = true
                     self.headline = "Debian is installed and shut down. A snapshot is saved for new machines."
                 }

@@ -17,8 +17,8 @@ use anyhow::{anyhow, bail, Result};
 use clap::{Parser, Subcommand};
 use serde::Serialize;
 
-const STEPS: [&str; 7] = [
-    "key", "sums", "sign", "check", "download", "verify", "preseed",
+const STEPS: [&str; 8] = [
+    "key", "sums", "sign", "check", "download", "verify", "preseed", "patch",
 ];
 
 enum OrderMsg {
@@ -86,7 +86,7 @@ fn fail(err: anyhow::Error, order: &Sender<OrderMsg>) -> ! {
 }
 
 /// A step may run only after every earlier step has finished, and a finished step cannot start again.
-fn check_order(order: &mut [&'static str; 7], id: &str, state: &str) -> Result<()> {
+fn check_order(order: &mut [&'static str; 8], id: &str, state: &str) -> Result<()> {
     let Some(index) = STEPS.iter().position(|item| *item == id) else {
         bail!("unknown step {id}");
     };
@@ -131,7 +131,7 @@ fn check_order(order: &mut [&'static str; 7], id: &str, state: &str) -> Result<(
 }
 
 fn order_loop(rx: Receiver<OrderMsg>) {
-    let mut order = ["wait"; 7];
+    let mut order = ["wait"; 8];
     while let Ok(msg) = rx.recv() {
         match msg {
             OrderMsg::Set(id, state, reply) => {
@@ -390,9 +390,13 @@ fn finish(
     step("verify", "done", "Checksum matches", order);
     step("preseed", "now", preseed::FILE, order);
     ssh::ensure(&support.join("ssh"))?;
-    let prepared = preseed::prepare(cache, dest, support)?;
+    let (prepared, patched) = preseed::prepare(cache, dest, support)?;
     step("preseed", "done", preseed::FILE, order);
-    emit!("ready", step: Some("preseed"), state: Some("done"), detail: Some(preseed::boot_args()), received: Some(bytes), total: Some(bytes), path: Some(dest.display().to_string()), disk: Some(prepared.disk.display().to_string()), key: Some(prepared.key.display().to_string()));
+    // The second page keeps the download list. Patch is the next row, after the copy is written.
+    step("patch", "now", preseed::BOOT, order);
+    let patch_detail = if patched { preseed::BOOT } else { "Already patched" };
+    step("patch", "done", patch_detail, order);
+    emit!("ready", step: Some("patch"), state: Some("done"), detail: Some(patch_detail.to_string()), received: Some(bytes), total: Some(bytes), path: Some(dest.display().to_string()), disk: Some(prepared.disk.display().to_string()), key: Some(prepared.key.display().to_string()));
     Ok(())
 }
 
@@ -477,7 +481,7 @@ mod tests {
     use super::check_order;
 
     fn run_seq(seq: &[(&str, &str)]) -> anyhow::Result<()> {
-        let mut order = ["wait"; 7];
+        let mut order = ["wait"; 8];
         for (id, state) in seq {
             check_order(&mut order, id, state)?;
         }
@@ -486,7 +490,7 @@ mod tests {
 
     fn full() -> Vec<(&'static str, &'static str)> {
         [
-            "key", "sums", "sign", "check", "download", "verify", "preseed",
+            "key", "sums", "sign", "check", "download", "verify", "preseed", "patch",
         ]
         .into_iter()
         .flat_map(|id| [(id, "now"), (id, "done")])
