@@ -29,7 +29,7 @@ pub const DISK: &str = "disk.img";
 pub const GUEST: u64 = 16 * 1024 * 1024 * 1024;
 
 pub const USER: &str = "debian";
-pub const SSH_PORT: u16 = 2222;
+pub const SSH_PORT: u16 = 22;
 /// Written into the guest so the host can log in without a password.
 pub const AUTHORIZED: &str = "authorized_keys";
 

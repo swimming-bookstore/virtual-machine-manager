@@ -6,17 +6,27 @@ import Virtualization
 /// The guest disk is virtio (`/dev/vda`), which is the disk the preseed selects.
 enum Guest {
     static let user = "debian"
-    static let sshPort: UInt16 = 2222
+    /// sshd in the guest listens here. The NAT attachment cannot map it to a host port.
+    static let sshPort: UInt16 = 22
 
     static func boot(iso: URL, preseed: URL, disk: URL) throws -> VZVirtualMachine {
-        return try machine(disk: disk, extra: [iso, preseed], pointer: false, forward: true)
+        return try machine(disk: disk, extra: [iso, preseed], pointer: false)
     }
 
     static func boot(disk: URL) throws -> VZVirtualMachine {
-        return try machine(disk: disk, extra: [], pointer: true, forward: true)
+        return try machine(disk: disk, extra: [], pointer: true)
     }
 
-    private static func machine(disk: URL, extra: [URL], pointer: Bool, forward: Bool) throws -> VZVirtualMachine {
+    /// Locally administered MAC, stable for this disk, so the DHCP lease can be found again.
+    static func macString(for disk: URL) -> String {
+        var sum: UInt16 = 0x564d
+        for byte in disk.path.utf8 {
+            sum = sum &* 33 &+ UInt16(byte)
+        }
+        return String(format: "02:56:4d:4d:%02x:%02x", UInt8(sum >> 8), UInt8(truncatingIfNeeded: sum))
+    }
+
+    private static func machine(disk: URL, extra: [URL], pointer: Bool) throws -> VZVirtualMachine {
         let config = VZVirtualMachineConfiguration()
         config.cpuCount = 2
         config.memorySize = 2 * 1024 * 1024 * 1024
@@ -35,22 +45,18 @@ enum Guest {
         config.keyboards = [VZUSBKeyboardConfiguration()]
         // The preseed install needs no pointer. Attaching one makes the view capture the host cursor.
         config.pointingDevices = pointer ? [VZUSBScreenCoordinatePointingDeviceConfiguration()] : []
-        config.networkDevices = [network(forward: forward)]
+        config.networkDevices = [network(disk: disk)]
         try config.validate()
         return VZVirtualMachine(configuration: config)
     }
 
-    /// Host port 2222 is the guest's SSH. A login there is the finish check.
-    /// The attachment takes the rules as an initializer argument. `init()` alone does not forward the port.
-    private static func network(forward: Bool) -> VZVirtioNetworkDeviceConfiguration {
+    /// `VZNATNetworkDeviceAttachment()` takes no arguments. There is no forwarding-rules type.
+    /// The host is the gateway for 192.168.64.0/24 and reaches sshd on the guest address, port 22.
+    private static func network(disk: URL) -> VZVirtioNetworkDeviceConfiguration {
         let network = VZVirtioNetworkDeviceConfiguration()
-        if forward {
-            let rule = VZNATNetworkDeviceForwardingRule(protocol: .tcp, hostPort: sshPort, guestPort: 22)
-            let rules = VZNATNetworkDeviceForwardingRules()
-            rules.forwardingRules.append(rule)
-            network.attachment = VZNATNetworkDeviceAttachment(forwardingRules: rules)
-        } else {
-            network.attachment = VZNATNetworkDeviceAttachment()
+        network.attachment = VZNATNetworkDeviceAttachment()
+        if let mac = VZMACAddress(string: macString(for: disk)) {
+            network.macAddress = mac
         }
         return network
     }
@@ -109,28 +115,86 @@ enum GuestSSH {
         let folder = dir(beside: disk)
         let key = folder.appendingPathComponent("id_ed25519")
         guard FileManager.default.isReadableFile(atPath: key.path) else { return false }
+        for host in hosts(matching: Guest.macString(for: disk)) {
+            if login(key: key, host: host) {
+                let line = "\(Guest.user) ok\n"
+                try? line.write(to: proof(beside: disk), atomically: true, encoding: .utf8)
+                try? line.write(to: folder.appendingPathComponent("logged-in"), atomically: true, encoding: .utf8)
+                return true
+            }
+        }
+        return false
+    }
+
+    /// ARP first, then the usual DHCP addresses. 192.168.64.1 is the host gateway, not the guest.
+    private static func hosts(matching mac: String) -> [String] {
+        let want = normalizeMAC(mac)
+        var matched: [String] = []
+        var others: [String] = []
+        for (host, seen) in arpGuests() {
+            if seen == want {
+                matched.append(host)
+            } else {
+                others.append(host)
+            }
+        }
+        var hosts = matched + others
+        for n in 2...8 {
+            hosts.append("192.168.64.\(n)")
+        }
+        var seen = Set<String>()
+        return hosts.filter { seen.insert($0).inserted }
+    }
+
+    private static func arpGuests() -> [(String, String)] {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/sbin/arp")
+        process.arguments = ["-an"]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
+        guard (try? process.run()) != nil else { return [] }
+        process.waitUntilExit()
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        guard let text = String(data: data, encoding: .utf8) else { return [] }
+        var found: [(String, String)] = []
+        for line in text.split(separator: "\n") {
+            guard let open = line.firstIndex(of: "("), let close = line.firstIndex(of: ")"), open < close else { continue }
+            let host = String(line[line.index(after: open)..<close])
+            guard host.hasPrefix("192.168.64."), host != "192.168.64.1" else { continue }
+            let mac = line.split(separator: " ").first { part in
+                part.split(separator: ":").count == 6
+            }.map { normalizeMAC(String($0)) } ?? ""
+            found.append((host, mac))
+        }
+        return found
+    }
+
+    private static func normalizeMAC(_ text: String) -> String {
+        text.split(separator: ":").map { part in
+            String(format: "%02x", UInt8(part, radix: 16) ?? 0)
+        }.joined(separator: ":")
+    }
+
+    private static func login(key: URL, host: String) -> Bool {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
         process.arguments = [
             "-o", "BatchMode=yes",
             "-o", "StrictHostKeyChecking=no",
             "-o", "UserKnownHostsFile=/dev/null",
-            "-o", "ConnectTimeout=2",
+            "-o", "ConnectTimeout=1",
             "-p", String(Guest.sshPort),
             "-i", key.path,
             "-l", Guest.user,
-            "127.0.0.1",
+            host,
             "true",
         ]
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice
         guard (try? process.run()) != nil else { return false }
         process.waitUntilExit()
-        guard process.terminationStatus == 0 else { return false }
-        let line = "\(Guest.user) ok\n"
-        try? line.write(to: proof(beside: disk), atomically: true, encoding: .utf8)
-        try? line.write(to: folder.appendingPathComponent("logged-in"), atomically: true, encoding: .utf8)
-        return true
+        return process.terminationStatus == 0
     }
 }
 

@@ -2126,13 +2126,15 @@ fn quick_start_swift_gates_the_bar_on_a_real_download() {
     assert!(include_str!("../Sources/Install.swift").contains("guest.start(iso: iso, disk: disk)"));
     assert!(include_str!("../Sources/Install.swift").contains("Debian is already installed. Checking SSH."));
     assert!(include_str!("../Sources/Install.swift").contains("checking = true"));
-    assert!(include_str!("../Sources/Guest.swift").contains("VZNATNetworkDeviceAttachment(forwardingRules: rules)"));
+    assert!(include_str!("../Sources/Guest.swift").contains("VZNATNetworkDeviceAttachment()"));
+    assert!(!include_str!("../Sources/Guest.swift").contains("VZNATNetworkDeviceForwardingRules"));
+    assert!(include_str!("../Sources/Guest.swift").contains("192.168.64."));
     assert!(include_str!("../Sources/Install.swift").contains("InstalledDisk.looksInstalled"));
     assert!(include_str!("../Sources/Guest.swift").contains("func forget(beside disk: URL)"));
     assert!(include_str!("../Sources/Install.swift").contains("SSH login succeeded. Saving a snapshot."));
     assert!(include_str!("../Sources/Install.swift").contains("New virtual machine"));
     assert!(include_str!("../Sources/Guest.swift").contains("GuestSSH"));
-    assert!(include_str!("../Sources/Guest.swift").contains("2222"));
+    assert!(include_str!("../Sources/Guest.swift").contains("guest port 22") || include_str!("../Sources/Guest.swift").contains("sshPort: UInt16 = 22"));
     assert!(include_str!("../Sources/QuickStart.swift").contains("[\"snapshot\", \"--dir\", dir.path]"));
     assert!(include_str!("../Sources/Welcome.swift").contains("New Debian"));
     assert!(include_str!("../Sources/App.swift").contains("id: \"debian\""));

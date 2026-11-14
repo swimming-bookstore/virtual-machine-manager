@@ -24,7 +24,7 @@ struct WizardStep: Identifiable {
     static let setup = [
         WizardStep(id: "installer", title: "Start the installer", detail: "boot.iso", state: "wait"),
         WizardStep(id: "partition", title: "Write the guest disk", detail: "/dev/vda", state: "wait"),
-        WizardStep(id: "ssh", title: "Log in with the host key", detail: "port 2222", state: "wait"),
+        WizardStep(id: "ssh", title: "Log in with the host key", detail: "guest port 22", state: "wait"),
         WizardStep(id: "snapshot", title: "Save a snapshot", detail: "snapshots/debian", state: "wait"),
     ]
 

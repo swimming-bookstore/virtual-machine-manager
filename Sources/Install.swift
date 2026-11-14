@@ -231,7 +231,7 @@ final class GuestSession: NSObject, ObservableObject, VZVirtualMachineDelegate {
         headline = fromSnapshotBoot ? "Starting Debian." : "Debian is already installed. Checking SSH."
         markSetup("installer", state: "done", detail: nil)
         markSetup("partition", state: "done", detail: "Guest disk written")
-        markSetup("ssh", state: "now", detail: "port 2222")
+        markSetup("ssh", state: "now", detail: "guest port 22")
         boot { try Guest.boot(disk: diskURL!) }
         watchSSH()
     }
@@ -312,7 +312,7 @@ final class GuestSession: NSObject, ObservableObject, VZVirtualMachineDelegate {
             checking = true
             markSetup("installer", state: "done", detail: nil)
             markSetup("partition", state: "done", detail: "Guest disk written")
-            markSetup("ssh", state: "now", detail: "port 2222")
+            markSetup("ssh", state: "now", detail: "guest port 22")
             headline = "Installer stopped. Starting Debian to check SSH."
             startInstalled()
             return
@@ -377,7 +377,7 @@ final class GuestSession: NSObject, ObservableObject, VZVirtualMachineDelegate {
                             // The already-installed boot is waiting on SSH. Do not replace that with a boot headline.
                             if self?.checking == true {
                                 self?.headline = "Debian is already installed. Checking SSH."
-                                self?.markSetup("ssh", state: "now", detail: "port 2222")
+                                self?.markSetup("ssh", state: "now", detail: "guest port 22")
                             } else {
                                 self?.headline = "Debian is running from the guest disk."
                             }
