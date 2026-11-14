@@ -553,10 +553,15 @@ fn quick_start_checks_the_signature_before_the_iso() {
         )
     );
     assert_eq!(screen.ready_path.as_deref(), Some(iso_path(&dir).as_str()));
-    assert_eq!(screen.row("download").detail, iso_path(&dir));
+    assert_eq!(screen.row("download").detail, iso_name());
     assert_eq!(
-        screen.row("snapshot").detail,
-        dir.join("snapshots/debian").display().to_string()
+        screen.row("download").path.as_deref(),
+        Some(iso_path(&dir).as_str())
+    );
+    assert_eq!(screen.row("snapshot").detail, "snapshots/debian");
+    assert_eq!(
+        screen.row("snapshot").path.as_deref(),
+        Some(dir.join("snapshots/debian").to_str().unwrap())
     );
     assert_eq!(
         screen.disk_path.as_deref(),
@@ -567,7 +572,7 @@ fn quick_start_checks_the_signature_before_the_iso() {
     assert_eq!(screen.steps.len(), 14);
     assert_eq!(screen.page_rows(), ["download", "partition", "snapshot"]);
     assert_eq!(screen.buttons(), ["Open folder"]);
-    screen.show_all = true;
+    screen.show_log = true;
     assert_eq!(
         screen.page_rows(),
         [
@@ -599,7 +604,7 @@ fn quick_start_checks_the_signature_before_the_iso() {
     assert_eq!(mid.visible_ids(), ["download", "partition", "snapshot"]);
     assert_eq!(mid.row("patch").state, "now");
     assert_eq!(mid.buttons(), ["Open folder", "Cancel"]);
-    mid.show_all = true;
+    mid.show_log = true;
     assert_eq!(
         mid.visible_ids(),
         [
@@ -645,7 +650,7 @@ fn quick_start_checks_the_signature_before_the_iso() {
             "snapshot"
         ]
     );
-    mid.show_all = false;
+    mid.show_log = false;
     assert_eq!(mid.page_rows(), ["download", "partition", "snapshot"]);
     assert_eq!(screen.row("download").state, "done");
     assert_eq!(screen.row("verify").state, "done");
@@ -709,10 +714,15 @@ fn quick_start_checks_the_signature_before_the_iso() {
     assert_eq!(cached.total, 0.0);
     assert_eq!(cached.bytes_label(), "");
     assert_eq!(cached.ready_path.as_deref(), Some(iso_path(&dir).as_str()));
-    assert_eq!(cached.row("download").detail, iso_path(&dir));
+    assert_eq!(cached.row("download").detail, iso_name());
     assert_eq!(
-        cached.row("snapshot").detail,
-        dir.join("snapshots/debian").display().to_string()
+        cached.row("download").path.as_deref(),
+        Some(iso_path(&dir).as_str())
+    );
+    assert_eq!(cached.row("snapshot").detail, "snapshots/debian");
+    assert_eq!(
+        cached.row("snapshot").path.as_deref(),
+        Some(dir.join("snapshots/debian").to_str().unwrap())
     );
     assert!(cached.installing());
     assert_eq!(cached.page, 0);
@@ -722,7 +732,7 @@ fn quick_start_checks_the_signature_before_the_iso() {
     assert_eq!(cached.row("patch").detail, "boot.iso");
     assert_eq!(cached.buttons(), ["Open folder"]);
     assert_eq!(cached.page_rows(), ["download", "partition", "snapshot"]);
-    cached.show_all = true;
+    cached.show_log = true;
     assert!(cached
         .page_rows()
         .starts_with(&["key", "sums", "sign", "check", "download"]));
@@ -915,6 +925,7 @@ struct Step {
     id: &'static str,
     title: &'static str,
     detail: String,
+    path: Option<String>,
     state: String,
 }
 
@@ -934,7 +945,8 @@ struct Screen {
     started: bool,
     running: bool,
     page: i32,
-    show_all: bool,
+    /// Log shows every step. The important rows stay Download ISO, Install guest, and Save snapshot.
+    show_log: bool,
 }
 
 fn default_detail(id: &str) -> String {
@@ -984,84 +996,98 @@ impl Screen {
                     id: "key",
                     title: "Download OpenPGP keyring",
                     detail: "key-DA87E80D6294BE9B.txt".into(),
+                    path: None,
                     state: "wait".into(),
                 },
                 Step {
                     id: "sums",
                     title: "Download checksums file",
                     detail: "SHA512SUMS".into(),
+                    path: None,
                     state: "wait".into(),
                 },
                 Step {
                     id: "sign",
                     title: "Download signature file",
                     detail: "SHA512SUMS.sign".into(),
+                    path: None,
                     state: "wait".into(),
                 },
                 Step {
                     id: "check",
                     title: "Verify signature",
                     detail: "SHA512SUMS.sign".into(),
+                    path: None,
                     state: "wait".into(),
                 },
                 Step {
                     id: "download",
                     title: "Download ISO",
                     detail: iso_glob().into(),
+                    path: None,
                     state: "wait".into(),
                 },
                 Step {
                     id: "verify",
                     title: "Verify checksum",
                     detail: "SHA512SUMS".into(),
+                    path: None,
                     state: "wait".into(),
                 },
                 Step {
                     id: "sshkey",
                     title: "Prepare the host key",
                     detail: "id_ed25519".into(),
+                    path: None,
                     state: "wait".into(),
                 },
                 Step {
                     id: "preseed",
                     title: "Prepare preseed disk",
                     detail: "preseed.img".into(),
+                    path: None,
                     state: "wait".into(),
                 },
                 Step {
                     id: "disk",
                     title: "Prepare the guest disk",
                     detail: "disk.img".into(),
+                    path: None,
                     state: "wait".into(),
                 },
                 Step {
                     id: "patch",
                     title: "Prepare installer",
                     detail: "boot.iso".into(),
+                    path: None,
                     state: "wait".into(),
                 },
                 Step {
                     id: "installer",
                     title: "Start the installer",
                     detail: "boot.iso".into(),
+                    path: None,
                     state: "wait".into(),
                 },
                 Step {
                     id: "partition",
                     title: "Install guest",
                     detail: "disk.img".into(),
+                    path: None,
                     state: "wait".into(),
                 },
                 Step {
                     id: "ssh",
                     title: "Log in with the host key",
                     detail: "guest port 22".into(),
+                    path: None,
                     state: "wait".into(),
                 },
                 Step {
                     id: "snapshot",
                     title: "Save a snapshot",
                     detail: "snapshots/debian".into(),
+                    path: None,
                     state: "wait".into(),
                 },
             ],
@@ -1079,7 +1105,7 @@ impl Screen {
             started: false,
             running: false,
             page: 0,
-            show_all: false,
+            show_log: false,
         }
     }
 
@@ -1184,7 +1210,14 @@ impl Screen {
                             .find(|row| row.id == "download")
                             .map(|row| row.state.clone())
                             .unwrap_or_else(|| "done".into());
-                        self.apply_state("download", &state, Some(path));
+                        let name = Path::new(path)
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .unwrap_or(path);
+                        self.apply_state("download", &state, Some(name));
+                        if let Some(row) = self.steps.iter_mut().find(|row| row.id == "download") {
+                            row.path = Some(path.to_string());
+                        }
                     }
                     self.show_snapshot_location();
                     if self.downloading {
@@ -1219,7 +1252,7 @@ impl Screen {
         self.visible_ids()
     }
 
-    /// Download ISO, Install guest, and Save a snapshot, unless Show all steps is on.
+    /// Download ISO, Install guest, and Save a snapshot. Log opens the rest, in order.
     fn visible_ids(&self) -> Vec<&'static str> {
         const BRIEF: &[&str] = &["download", "partition", "snapshot"];
         const ORDER: &[&str] = &[
@@ -1238,7 +1271,7 @@ impl Screen {
             "ssh",
             "snapshot",
         ];
-        let ids = if self.show_all { ORDER } else { BRIEF };
+        let ids = if self.show_log { ORDER } else { BRIEF };
         ids.iter()
             .copied()
             .filter(|id| self.steps.iter().any(|step| step.id == *id))
@@ -1268,7 +1301,8 @@ impl Screen {
             .map(|dir| dir.join("snapshots/debian"));
         let Some(path) = support else { return };
         if let Some(row) = self.steps.iter_mut().find(|step| step.id == "snapshot") {
-            row.detail = path.display().to_string();
+            row.path = Some(path.display().to_string());
+            row.detail = "snapshots/debian".into();
         }
     }
 
@@ -2673,7 +2707,7 @@ fn a_cached_iso_does_not_show_the_download_bar() {
     assert_eq!(screen.page, 0);
     assert_eq!(screen.row("preseed").state, "done");
     assert_eq!(screen.page_rows(), ["download", "partition", "snapshot"]);
-    screen.show_all = true;
+    screen.show_log = true;
     assert!(screen
         .page_rows()
         .starts_with(&["key", "sums", "sign", "check", "download"]));
@@ -2792,24 +2826,28 @@ fn setup_steps() -> Vec<Step> {
             id: "installer",
             title: "Start the installer",
             detail: "boot.iso".into(),
+            path: None,
             state: "wait".into(),
         },
         Step {
             id: "partition",
             title: "Install guest",
             detail: "disk.img".into(),
+            path: None,
             state: "wait".into(),
         },
         Step {
             id: "ssh",
             title: "Log in with the host key",
             detail: "guest port 22".into(),
+            path: None,
             state: "wait".into(),
         },
         Step {
             id: "snapshot",
             title: "Save a snapshot",
             detail: "snapshots/debian".into(),
+            path: None,
             state: "wait".into(),
         },
     ]
@@ -3358,7 +3396,11 @@ fn quick_start_swift_gates_the_bar_on_a_real_download() {
     assert!(src.contains("steps = WizardStep.initial + WizardStep.preseed + WizardStep.setup"));
     assert!(!src.contains("showPreseed"));
     assert!(src.contains("static let brief = [\"download\", \"partition\", \"snapshot\"]"));
-    assert!(src.contains("Button(wizard.showAll ? \"Show important steps\" : \"Show all steps\")"));
+    assert!(src.contains("Button(wizard.showLog ? \"Hide log\" : \"Log\")"));
+    assert!(src.contains("ScrollView"));
+    assert!(src.contains(".frame(height: 220)"));
+    assert!(src.contains(".lineLimit(1)"));
+    assert!(src.contains(".truncationMode(.middle)"));
     assert!(src.contains("Install(iso: iso, disk: disk, embedded: true, steps: $wizard.steps, missingFile: $wizard.missingFile)"));
     assert!(src.contains("Button(\"Open folder\")"));
     assert!(src.contains("support.appendingPathComponent(\"installer/preseed.img\")"));

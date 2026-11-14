@@ -5,6 +5,8 @@ struct WizardStep: Identifiable {
     var id: String
     var title: String
     var detail: String
+    /// Full path when the row label is only the file name. The log can show this.
+    var path: String? = nil
     var state: String
 
     static let initial = [
@@ -57,8 +59,8 @@ struct WorkerEvent: Decodable {
 
 final class Wizard: ObservableObject {
     @Published var steps = WizardStep.initial + WizardStep.preseed + WizardStep.setup
-    /// The short list is Download ISO, Install guest, and Save snapshot. Show all steps opens the rest, in order.
-    @Published var showAll = false
+    /// The short list is Download ISO, Install guest, and Save snapshot. Log opens the rest, in order.
+    @Published var showLog = false
     @Published var received = 0.0
     @Published var total = 0.0
     @Published var headline: String?
@@ -260,7 +262,9 @@ final class Wizard: ObservableObject {
 
     private func showSnapshotLocation() {
         guard let index = steps.firstIndex(where: { $0.id == "snapshot" }) else { return }
-        steps[index].detail = SupportDir.snapshotLocation
+        let path = SupportDir.snapshotLocation
+        steps[index].path = path
+        steps[index].detail = "snapshots/debian"
     }
 
     /// Preparing the disk writes this file. A stale login must not survive it.
@@ -385,7 +389,7 @@ final class Wizard: ObservableObject {
                 if let path = event.path {
                     isoPath = path
                     // The ISO row shows where the file is. Open folder is the only folder button.
-                    applyState("download", state: steps.first { $0.id == "download" }?.state ?? "done", detail: path)
+                    applyState("download", state: steps.first { $0.id == "download" }?.state ?? "done", detail: (path as NSString).lastPathComponent, path: path)
                 }
                 showSnapshotLocation()
                 if downloading {
@@ -409,17 +413,18 @@ final class Wizard: ObservableObject {
         }
     }
 
-    /// The short list. Show all steps opens the rest, in the same order the worker runs them.
+    /// The short list. Log opens the rest, in the same order the worker runs them.
     static let brief = ["download", "partition", "snapshot"]
 
     var visibleSteps: [WizardStep] {
-        if showAll { return steps }
+        if showLog { return steps }
         return Self.brief.compactMap { id in steps.first { $0.id == id } }
     }
 
-    private func applyState(_ id: String, state: String, detail: String?) {
+    private func applyState(_ id: String, state: String, detail: String?, path: String? = nil) {
         guard let index = steps.firstIndex(where: { $0.id == id }) else { return }
         if let detail, !detail.isEmpty { steps[index].detail = detail }
+        if let path, !path.isEmpty { steps[index].path = path }
         steps[index].state = state
     }
 
@@ -606,16 +611,18 @@ struct QuickStart: View {
                 }
             }
             top
-            VStack(spacing: 0) {
-                let shown = wizard.visibleSteps
-                ForEach(shown) { step in
-                    row(step).id(step.id + step.state + step.detail)
-                    if step.id != shown.last?.id { Divider().padding(.leading, 42) }
+            Group {
+                if wizard.showLog {
+                    ScrollView {
+                        stepList
+                    }
+                    .frame(height: 220)
+                } else {
+                    stepList
                 }
             }
-            .background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-            Button(wizard.showAll ? "Show important steps" : "Show all steps") {
-                wizard.showAll.toggle()
+            Button(wizard.showLog ? "Hide log" : "Log") {
+                wizard.showLog.toggle()
             }
             .buttonStyle(.plain)
             .font(.caption)
@@ -638,12 +645,25 @@ struct QuickStart: View {
         }
         .padding(24)
         .frame(width: 440, alignment: .topLeading)
+        .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private var stepList: some View {
+        VStack(spacing: 0) {
+            let shown = wizard.visibleSteps
+            ForEach(shown) { step in
+                row(step).id(step.id + step.state + step.detail)
+                if step.id != shown.last?.id { Divider().padding(.leading, 42) }
+            }
+        }
+        .background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
     }
 
     /// Download bar, then the guest once install starts. Same switch on the setup page.
     @ViewBuilder private var top: some View {
         if let iso = wizard.readyPath, let disk = wizard.diskPath, wizard.error == nil, !SupportDir.snapshotReady {
             InstallGuest(iso: iso, disk: disk)
+                .frame(height: 160)
         } else {
             progress
         }
@@ -687,7 +707,11 @@ struct QuickStart: View {
             Image(systemName: icon(step.state)).foregroundStyle(color(step.state)).frame(width: 18)
             VStack(alignment: .leading, spacing: 2) {
                 Text(step.title).font(.body.weight(step.state == "now" ? .semibold : .regular))
-                Text(step.detail).font(.caption).foregroundStyle(.secondary)
+                Text(wizard.showLog ? (step.path ?? step.detail) : step.detail)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
             }
             Spacer(minLength: 0)
         }
