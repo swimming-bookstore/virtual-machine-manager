@@ -1,0 +1,21 @@
+[package]
+name = "virtual-machine-worker"
+version = "0.1.0"
+edition = "2021"
+description = "Disk worker for Virtual Machine Manager. Downloads the Debian installer and checks its signature."
+
+[[bin]]
+name = "virtual-machine-worker"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+pgp = "=0.21.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10.9"
+ureq = { version = "=2.12.1", default-features = false, features = ["tls"] }
+
+[dev-dependencies]
+serde_json = "1"
