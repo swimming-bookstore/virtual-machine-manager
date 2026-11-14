@@ -22,7 +22,7 @@ struct Install: View {
     @State private var folderError: String?
     @Environment(\.openWindow) private var openWindow
 
-    init(iso: String, disk: String, fromSnapshot: Bool = false, embedded: Bool = false, steps: Binding<[WizardStep]>? = nil) {
+    init(iso: String, disk: String, fromSnapshot: Bool = false, embedded: Bool = false, steps: Binding<[WizardStep]>? = nil, missingFile: Binding<String?>? = nil) {
         self.iso = iso
         self.disk = disk
         self.fromSnapshot = fromSnapshot
@@ -72,9 +72,6 @@ struct Install: View {
         }
         .padding(24)
         .frame(width: setup ? 440 : 848, alignment: .topLeading)
-        .background {
-            // Quick start draws this same guest in the bar slot. The hidden copy does not draw a second one.
-        }
         .task {
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 400_000_000)
@@ -112,17 +109,8 @@ struct Install: View {
         }
     }
 
-/// The guest in the slot the download page uses for the ISO bar.
-/// Quick start and the setup page share one session, so both screens show the same guest.
-struct InstallGuest: View {
-    let iso: String
-    let disk: String
-
-    var body: some View {
-        Install(iso: iso, disk: disk)
-            .frame(height: 220)
-    }
-}
+    /// The guest in the slot the download page uses for the ISO bar.
+    private var guestScreen: some View {
         GuestView(session: guest, capture: capturePointer)
             .background(.black, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
             .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
@@ -226,6 +214,19 @@ struct InstallGuest: View {
                 }
             }
         }
+    }
+}
+
+/// The guest in the slot the download page uses for the ISO bar.
+/// Quick start already keeps one session mounted. This is the same slot, not a second installer.
+struct InstallGuest: View {
+    let iso: String
+    let disk: String
+
+    var body: some View {
+        Install(iso: iso, disk: disk)
+            .frame(maxWidth: .infinity)
+            .frame(height: 220)
     }
 }
 
@@ -503,8 +504,6 @@ final class GuestSession: NSObject, ObservableObject, VZVirtualMachineDelegate {
                 watchSSH()
             }
         }
-    }
-
     }
 
     private func noteStopped() {
