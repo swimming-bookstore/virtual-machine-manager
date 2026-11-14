@@ -41,7 +41,7 @@ final class Wizard: ObservableObject {
     @Published var steps = WizardStep.initial
     @Published var received = 0.0
     @Published var total = 0.0
-    @Published var headline = "Preparing Debian 13. This only needs to happen once."
+    @Published var headline: String?
     @Published var error: String?
     @Published var readyPath: String?
     @Published var cancelled = false
@@ -55,7 +55,11 @@ final class Wizard: ObservableObject {
 
     var fraction: Double { total > 0 ? min(received / total, 1) : 0 }
     var percent: Int { Int((fraction * 100).rounded()) }
-    var bytesLabel: String { total > 0 ? "\(byteCount(received)) of \(byteCount(total))" : "" }
+    var bytesLabel: String {
+        if total > 0 { return "\(byteCount(received)) of \(byteCount(total))" }
+        if downloading { return received > 0 ? byteCount(received) : "Connecting..." }
+        return ""
+    }
 
     func start() {
         guard !started else { return }
@@ -139,7 +143,7 @@ final class Wizard: ObservableObject {
         error = nil
         readyPath = nil
         cancelled = false
-        headline = "Preparing Debian 13. This only needs to happen once."
+        headline = nil
         started = false
     }
 
@@ -299,8 +303,8 @@ struct QuickStart: View {
         VStack(alignment: .leading, spacing: 18) {
             VStack(alignment: .leading, spacing: 4) {
                 Text("Debian 13").font(.title2.weight(.semibold))
-                if showStatus {
-                    Text(wizard.headline).font(.subheadline).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                if let headline = wizard.headline {
+                    Text(headline).font(.subheadline).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                 }
             }
             progress
@@ -341,23 +345,37 @@ struct QuickStart: View {
         }
     }
 
-    private var showStatus: Bool {
-        wizard.error != nil || wizard.cancelled || (wizard.readyPath == nil && wizard.steps.allSatisfy { $0.state == "wait" })
-    }
-
     @ViewBuilder private var progress: some View {
-        if wizard.downloading && wizard.total > 0 {
+        // The bar is up as soon as the ISO fetch starts, including while the size is unknown.
+        // ProgressView eases toward each value, so the fill is drawn at the byte count instead.
+        if wizard.downloading {
             VStack(alignment: .leading, spacing: 6) {
-                ProgressView(value: wizard.fraction)
+                byteBar
                 HStack {
                     Text(wizard.bytesLabel)
                     Spacer()
-                    Text("\(wizard.percent)%").monospacedDigit()
+                    if wizard.total > 0 {
+                        Text("\(wizard.percent)%").monospacedDigit()
+                    }
                 }
                 .font(.caption)
                 .foregroundStyle(.secondary)
             }
         }
+    }
+
+    private var byteBar: some View {
+        Capsule()
+            .fill(Color.primary.opacity(0.12))
+            .overlay(alignment: .leading) {
+                Capsule()
+                    .fill(Color.accentColor)
+                    .scaleEffect(x: wizard.fraction, y: 1, anchor: .leading)
+            }
+            .frame(height: 6)
+            .animation(nil, value: wizard.fraction)
+            .accessibilityLabel("Download progress")
+            .accessibilityValue(wizard.total > 0 ? "\(wizard.percent) percent" : "Connecting")
     }
 
     private func row(_ step: WizardStep) -> some View {

@@ -21,14 +21,8 @@ pub fn key_file() -> &'static str {
     KEY_FILE
 }
 
-pub fn key_url() -> &'static str {
+fn key_url() -> &'static str {
     KEY_URL
-}
-
-/// Last 16 hex digits of the key the download must match.
-pub fn key_id() -> String {
-    let fp = fingerprint();
-    fp[fp.len().saturating_sub(16)..].to_string()
 }
 
 pub fn agent() -> ureq::Agent {
@@ -292,7 +286,7 @@ mod tests {
             key_url(),
             "https://www.debian.org/CD/key-DA87E80D6294BE9B.txt"
         );
-        assert_eq!(key_id(), "da87e80d6294be9b");
+        assert_eq!(&fingerprint()[fingerprint().len() - 16..], "da87e80d6294be9b");
     }
 
     #[test]

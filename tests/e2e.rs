@@ -7,7 +7,7 @@ use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -31,20 +31,46 @@ fn iso_name() -> String {
     format!("debian-13.7.0-{}-netinst.iso", arch())
 }
 
+/// Test side of the local Debian mirror. The server thread owns the other end of each channel.
 struct World {
-    files: Vec<(&'static str, Vec<u8>)>,
-    log: Mutex<Vec<String>>,
-    cut: Mutex<bool>,
-    hold: Mutex<bool>,
-    cv: Condvar,
+    log_rx: Receiver<String>,
+    /// Each ISO request sends its release handle here. Send `()` on it to continue.
+    go_rx: Receiver<Sender<()>>,
+    /// Byte limit for a paced ISO body. `None` finishes it.
+    pace_tx: Sender<Option<usize>>,
+    wake: Sender<()>,
 }
 
-fn file(path: &str, world: &World) -> Option<Vec<u8>> {
-    world
-        .files
+fn file(path: &str, files: &[(&'static str, Vec<u8>)]) -> Option<Vec<u8>> {
+    files
         .iter()
         .find(|(p, _)| *p == path)
         .map(|(_, b)| b.clone())
+}
+
+fn log_of(world: &World) -> Vec<String> {
+    let mut lines = Vec::new();
+    while let Ok(line) = world.log_rx.try_recv() {
+        lines.push(line);
+    }
+    lines
+}
+
+/// Let a held ISO response finish. No-op when this server was not asked to hold.
+fn release(world: &World) {
+    if let Ok(go) = world.go_rx.recv_timeout(Duration::from_secs(10)) {
+        let _ = go.send(());
+    }
+}
+
+/// Stop the next ISO body at `n` bytes. Call this before the request.
+fn pause_at(world: &World, n: usize) {
+    world.pace_tx.send(Some(n)).unwrap();
+}
+
+fn more(world: &World, n: Option<usize>) {
+    world.pace_tx.send(n).unwrap();
+    let _ = world.wake.send(());
 }
 
 fn serve(
@@ -52,9 +78,10 @@ fn serve(
     sign: &[u8],
     iso: &[u8],
     key: &[u8],
-    cut: bool,
+    cut_once: bool,
     hold: bool,
-) -> (String, Arc<World>) {
+    pace: bool,
+) -> (String, World) {
     let mut files = vec![("/CD/key-DA87E80D6294BE9B.txt", key.to_vec())];
     for arch in ["amd64", "arm64"] {
         files.push((
@@ -73,46 +100,109 @@ fn serve(
             iso.to_vec(),
         ));
     }
-    let world = Arc::new(World {
-        files,
-        log: Mutex::new(Vec::new()),
-        cut: Mutex::new(cut),
-        hold: Mutex::new(hold),
-        cv: Condvar::new(),
-    });
+    let (log_tx, log_rx) = mpsc::channel();
+    let (go_tx, go_rx) = mpsc::channel();
+    let (pace_tx, pace_rx) = mpsc::channel();
+    let (wake_tx, wake_rx) = mpsc::channel::<()>();
+    let world = World {
+        log_rx,
+        go_rx,
+        pace_tx,
+        wake: wake_tx.clone(),
+    };
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
-    let bg = world.clone();
     thread::spawn(move || {
-        for conn in listener.incoming().flatten() {
-            let world = bg.clone();
-            thread::spawn(move || handle(conn, &world));
+        let (cut_tx, cut_rx) = mpsc::channel();
+        if cut_once {
+            let _ = cut_tx.send(());
+        }
+        let mut waiting: Option<Sender<Option<usize>>> = None;
+        let mut queued: Option<Option<usize>> = None;
+        let (conn_tx, conn_rx) = mpsc::channel();
+        thread::spawn(move || {
+            while let Ok(conn) = listener.accept() {
+                if conn_tx.send(conn).is_err() {
+                    break;
+                }
+            }
+        });
+        loop {
+            if pace {
+                while let Ok(limit) = pace_rx.try_recv() {
+                    if let Some(tx) = waiting.as_ref() {
+                        let _ = tx.send(limit);
+                    } else {
+                        queued = Some(limit);
+                    }
+                }
+            }
+            match conn_rx.try_recv() {
+                Ok((mut conn, _)) => {
+                    let _ = conn.set_nonblocking(false);
+                    let log_tx = log_tx.clone();
+                    let files = files.clone();
+                    let go_tx = go_tx.clone();
+                    let head = read_head(&mut conn);
+                    let path = request_path(&head);
+                    let range = request_range(&head);
+                    let _ = log_tx.send(match range {
+                        Some(start) => format!("{path} range={start}"),
+                        None => path.clone(),
+                    });
+                    let cut = path.ends_with(".iso") && cut_rx.try_recv().is_ok();
+                    let (release_tx, release_rx) = mpsc::channel();
+                    if path.ends_with(".iso") {
+                        let _ = go_tx.send(release_tx);
+                    }
+                    let (limit_tx, limit_rx) = mpsc::channel();
+                    let (next_tx, next_rx) = mpsc::channel();
+                    if pace && path.ends_with(".iso") {
+                        if let Some(limit) = queued.take() {
+                            let _ = limit_tx.send(limit);
+                        }
+                        waiting = Some(next_tx);
+                    }
+                    thread::spawn(move || {
+                        handle(conn, &files, hold, path, range, cut, release_rx, limit_rx, next_rx)
+                    });
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    let _ = wake_rx.recv_timeout(Duration::from_millis(50));
+                }
+                Err(mpsc::TryRecvError::Disconnected) => break,
+            }
         }
     });
     (base, world)
 }
 
-fn handle(mut sock: TcpStream, world: &World) {
+fn read_head(sock: &mut TcpStream) -> String {
     let _ = sock.set_read_timeout(Some(Duration::from_secs(5)));
     let mut buf = Vec::new();
     let mut tmp = [0u8; 1024];
     while !buf.windows(4).any(|w| w == b"\r\n\r\n") && buf.len() < 8192 {
-        let Ok(n) = sock.read(&mut tmp) else { return };
+        let Ok(n) = sock.read(&mut tmp) else { break };
         if n == 0 {
             break;
         }
         buf.extend_from_slice(&tmp[..n]);
     }
-    let text = String::from_utf8_lossy(&buf);
-    let path = text
-        .split_whitespace()
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+fn request_path(head: &str) -> String {
+    head.split_whitespace()
         .nth(1)
         .unwrap_or("/")
         .split('?')
         .next()
         .unwrap_or("/")
-        .to_string();
-    let range = text.lines().find_map(|line| {
+        .to_string()
+}
+
+fn request_range(head: &str) -> Option<usize> {
+    head.lines().find_map(|line| {
         let (name, value) = line.split_once(':')?;
         name.eq_ignore_ascii_case("range").then(|| {
             value
@@ -123,21 +213,29 @@ fn handle(mut sock: TcpStream, world: &World) {
                 .parse::<usize>()
                 .ok()
         })?
-    });
-    world.log.lock().unwrap().push(match range {
-        Some(start) => format!("{path} range={start}"),
-        None => path.clone(),
-    });
-    let Some(body) = file(&path, world) else {
+    })
+}
+
+fn handle(
+    mut sock: TcpStream,
+    files: &[(&'static str, Vec<u8>)],
+    hold: bool,
+    path: String,
+    range: Option<usize>,
+    cut: bool,
+    release: Receiver<()>,
+    limits: Receiver<Option<usize>>,
+    next: Receiver<Option<usize>>,
+) {
+    let Some(body) = file(&path, files) else {
         let _ = respond(&mut sock, "404 Not Found", "", b"missing");
         return;
     };
     if path.ends_with(".iso") {
-        let mut hold = world.hold.lock().unwrap();
-        while *hold {
-            hold = world.cv.wait(hold).unwrap();
+        if hold {
+            let _ = release.recv();
         }
-        if range.is_none() && std::mem::replace(&mut *world.cut.lock().unwrap(), false) {
+        if range.is_none() && cut {
             let half = body.len() / 2;
             let head = format!(
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -147,6 +245,33 @@ fn handle(mut sock: TcpStream, world: &World) {
             let _ = sock.write_all(&body[..half]);
             let _ = sock.flush();
             return;
+        }
+        if range.is_none() {
+            if let Ok(limit) = limits.try_recv() {
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(head.as_bytes());
+                let _ = sock.flush();
+                let mut sent = 0usize;
+                let mut limit = limit;
+                loop {
+                    let target = limit.map(|n| n.min(body.len())).unwrap_or(body.len());
+                    if target > sent {
+                        let _ = sock.write_all(&body[sent..target]);
+                        let _ = sock.flush();
+                        sent = target;
+                        if sent == body.len() {
+                            return;
+                        }
+                    }
+                    limit = match next.recv() {
+                        Ok(next) => next,
+                        Err(_) => return,
+                    };
+                }
+            }
         }
     }
     let _ = match range {
@@ -249,10 +374,10 @@ fn names(events: &[Value]) -> Vec<String> {
 
 #[test]
 fn quick_start_checks_the_signature_before_the_iso() {
-    let (base, world) = serve(SUMS, SIGN, ISO, KEY, false, false);
+    let (base, world) = serve(SUMS, SIGN, ISO, KEY, false, false, false);
     let (status, events, dir) = run(&base);
     assert_eq!(status, 0, "{events:?}");
-    let log = world.log.lock().unwrap().clone();
+    let log = log_of(&world);
     let iso = format!("/debian-cd/13.7.0/{}/iso-cd/{}", arch(), iso_name());
     assert_eq!(
         log,
@@ -320,26 +445,13 @@ fn quick_start_checks_the_signature_before_the_iso() {
         )
     );
     assert_eq!(std::fs::read(cache.join(iso_name())).unwrap(), ISO);
-    assert_eq!(
-        events
-            .iter()
-            .find(|e| e["step"] == "check" && e["state"] == "done")
-            .unwrap()["note"],
-        "Debian 13.7.0 signed SHA512SUMS."
-    );
-    assert_eq!(
-        events
-            .iter()
-            .find(|e| e["step"] == "key" && e["state"] == "done")
-            .unwrap()["note"],
-        format!("Key id {}.", &FP.trim()[FP.trim().len() - 16..])
-    );
     let progress: Vec<_> = events
         .iter()
         .filter(|e| e["event"] == "progress" && e["step"] == "download")
         .collect();
     assert!(progress.len() >= 2, "{progress:?}");
     assert_eq!(num(&progress[0]["received"]), Some(0.0));
+    assert_eq!(num(&progress[0]["total"]), Some(0.0));
     assert_eq!(
         num(&progress.last().unwrap()["received"]),
         Some(ISO.len() as f64)
@@ -357,17 +469,12 @@ fn quick_start_checks_the_signature_before_the_iso() {
     );
     assert_eq!(screen.ready_path.as_deref(), Some(iso_path(&dir).as_str()));
     assert_eq!(screen.buttons(), ["Open cache folder"]);
-    assert!(!screen.show_status());
     assert_eq!(screen.row("verify").detail, "Checksum matches");
 
     let (status, events) = wait(spawn(&base, &dir));
     assert_eq!(status, 0, "{events:?}");
-    assert_eq!(
-        world.log.lock().unwrap().len(),
-        7,
-        "cached iso was fetched again: {:?}",
-        world.log.lock().unwrap()
-    );
+    let log = log_of(&world);
+    assert_eq!(log.len(), 3, "cached iso was fetched again: {log:?}");
     assert!(events.iter().any(|e| e["event"] == "ready"));
     assert!(events
         .iter()
@@ -391,15 +498,10 @@ fn quick_start_checks_the_signature_before_the_iso() {
 fn a_bad_signature_stops_before_the_iso() {
     let mut sums = SUMS.to_vec();
     sums[0] ^= 0xff;
-    let (base, world) = serve(&sums, SIGN, ISO, KEY, false, false);
+    let (base, world) = serve(&sums, SIGN, ISO, KEY, false, false, false);
     let (status, events, dir) = run(&base);
     assert_ne!(status, 0);
-    assert!(world
-        .log
-        .lock()
-        .unwrap()
-        .iter()
-        .all(|line| !line.contains(".iso")));
+    assert!(log_of(&world).iter().all(|line| !line.contains(".iso")));
     assert_eq!(
         events.iter().find(|e| e["event"] == "error").unwrap()["step"],
         "check"
@@ -408,7 +510,7 @@ fn a_bad_signature_stops_before_the_iso() {
     let mut screen = finish(&events, status);
     let error = screen.error.clone().unwrap();
     assert!(!screen.bar_visible());
-    assert_eq!(screen.headline, "Download failed");
+    assert_eq!(screen.headline.as_deref(), Some("Download failed"));
     assert_eq!(screen.buttons(), ["Open cache folder", "Try again"]);
     assert_eq!(screen.row("check").state, "fail");
     assert_eq!(screen.row("check").detail, error);
@@ -436,13 +538,11 @@ fn a_bad_key_stops_before_the_checksum_file() {
         b"-----BEGIN PGP PUBLIC KEY BLOCK-----\nnope\n",
         false,
         false,
+        false,
     );
     let (status, events, _) = run(&base);
     assert_ne!(status, 0);
-    assert_eq!(
-        world.log.lock().unwrap().as_slice(),
-        ["/CD/key-DA87E80D6294BE9B.txt"]
-    );
+    assert_eq!(log_of(&world), ["/CD/key-DA87E80D6294BE9B.txt"]);
     assert_eq!(
         events.iter().find(|e| e["event"] == "error").unwrap()["step"],
         "key"
@@ -454,14 +554,14 @@ fn a_bad_key_stops_before_the_checksum_file() {
     assert_eq!(screen.row("key").detail, error);
     assert!(screen.steps.iter().skip(1).all(|step| step.state == "wait"));
     assert_eq!(screen.buttons(), ["Open cache folder", "Try again"]);
-    assert_eq!(screen.headline, "Download failed");
+    assert_eq!(screen.headline.as_deref(), Some("Download failed"));
 }
 
 #[test]
 fn a_checksum_mismatch_removes_the_iso() {
     let mut iso = ISO.to_vec();
     iso[0] ^= 0xff;
-    let (base, _) = serve(SUMS, SIGN, &iso, KEY, false, false);
+    let (base, _) = serve(SUMS, SIGN, &iso, KEY, false, false, false);
     let (status, events, dir) = run(&base);
     assert_ne!(status, 0);
     let error = events.iter().find(|e| e["event"] == "error").unwrap();
@@ -481,14 +581,14 @@ fn a_checksum_mismatch_removes_the_iso() {
     assert_eq!(screen.row("verify").detail, shown);
     assert!(screen.ready_path.is_none());
     assert_eq!(screen.buttons(), ["Open cache folder", "Try again"]);
-    assert_eq!(screen.headline, "Download failed");
+    assert_eq!(screen.headline.as_deref(), Some("Download failed"));
 }
 
 #[test]
 fn a_partial_download_resumes() {
-    let (base, world) = serve(SUMS, SIGN, ISO, KEY, true, false);
+    let (base, world) = serve(SUMS, SIGN, ISO, KEY, true, false, false);
     let (status, events, dir) = run(&base);
-    assert_ne!(status, 0);
+    assert_ne!(status, 0, "{events:?} log={:?}", log_of(&world));
     assert!(dir
         .join("cache")
         .join(format!("{}.partial", iso_name()))
@@ -511,15 +611,10 @@ fn a_partial_download_resumes() {
     assert_eq!(screen.received, 0.0);
     assert!(screen.steps.iter().all(|step| step.state == "wait"));
     assert_eq!(screen.buttons(), ["Open cache folder", "Cancel"]);
-    assert_eq!(screen.headline, PREPARE);
+    assert!(screen.headline.is_none());
     let (status, events) = wait(spawn(&base, &dir));
     assert_eq!(status, 0, "{events:?}");
-    assert!(world
-        .log
-        .lock()
-        .unwrap()
-        .iter()
-        .any(|line| line.contains("range=")));
+    assert!(log_of(&world).iter().any(|line| line.contains("range=")));
     assert_eq!(
         std::fs::read(dir.join("cache").join(iso_name())).unwrap(),
         ISO
@@ -533,14 +628,11 @@ fn a_partial_download_resumes() {
 
 #[test]
 fn a_second_download_is_refused_while_the_lock_is_held() {
-    let (base, world) = serve(SUMS, SIGN, ISO, KEY, false, true);
+    let (base, world) = serve(SUMS, SIGN, ISO, KEY, false, true, false);
     let dir = dir();
     let mut first = spawn(&base, &dir);
     let started = Instant::now();
-    while !world
-        .log
-        .lock()
-        .unwrap()
+    while !log_of(&world)
         .iter()
         .any(|line| line.contains("SHA512SUMS.sign"))
     {
@@ -558,8 +650,7 @@ fn a_second_download_is_refused_while_the_lock_is_held() {
         .unwrap();
     assert!(!second.status.success());
     assert!(String::from_utf8_lossy(&second.stdout).contains("a download is already running"));
-    *world.hold.lock().unwrap() = false;
-    world.cv.notify_all();
+    release(&world);
     assert!(first.wait().unwrap().success());
     let screen = finish(&parse_events(&second.stdout), 1);
     let error = screen.error.clone().unwrap();
@@ -569,8 +660,7 @@ fn a_second_download_is_refused_while_the_lock_is_held() {
     assert!(error.contains("a download is already running"));
     assert!(screen.steps.iter().skip(1).all(|step| step.state == "wait"));
     assert_eq!(screen.buttons(), ["Open cache folder", "Try again"]);
-    assert_eq!(screen.headline, "Download failed");
-    assert!(screen.show_status());
+    assert_eq!(screen.headline.as_deref(), Some("Download failed"));
 }
 
 /// Quick start window. Same rules as Sources/QuickStart.swift.
@@ -585,7 +675,7 @@ struct Screen {
     steps: Vec<Step>,
     received: f64,
     total: f64,
-    headline: String,
+    headline: Option<String>,
     error: Option<String>,
     ready_path: Option<String>,
     cancelled: bool,
@@ -593,8 +683,6 @@ struct Screen {
     started: bool,
     running: bool,
 }
-
-const PREPARE: &str = "Preparing Debian 13. This only needs to happen once.";
 
 fn iso_glob() -> &'static str {
     match arch() {
@@ -663,7 +751,7 @@ impl Screen {
             ],
             received: 0.0,
             total: 0.0,
-            headline: PREPARE.into(),
+            headline: None,
             error: None,
             ready_path: None,
             cancelled: false,
@@ -695,7 +783,7 @@ impl Screen {
         self.error =
             Some("The worker is not built. Run cargo build --release, then try again.".into());
         self.fail_current();
-        self.headline = "Could not start".into();
+        self.headline = Some("Could not start".into());
     }
 
     fn reset(&mut self) {
@@ -712,7 +800,7 @@ impl Screen {
         self.cancelled = true;
         self.running = false;
         self.error = None;
-        self.headline = "Cancelled. The download was not saved.".into();
+        self.headline = Some("Cancelled. The download was not saved.".into());
         if let Some(step) = self.steps.iter_mut().find(|step| step.state == "now") {
             step.state = "wait".into();
             step.detail = "Cancelled".into();
@@ -729,7 +817,7 @@ impl Screen {
             && status != 0
         {
             self.error = Some("The download stopped before the image was ready.".into());
-            self.headline = "Download failed".into();
+            self.headline = Some("Download failed".into());
             self.fail_current();
         }
     }
@@ -774,7 +862,7 @@ impl Screen {
             "error" => {
                 let detail = event["detail"].as_str();
                 self.error = Some(detail.unwrap_or("Download failed.").to_string());
-                self.headline = "Download failed".into();
+                self.headline = Some("Download failed".into());
                 if let Some(id) = step {
                     if self.steps.iter().any(|row| row.id == id) {
                         self.apply_state(id, "fail", detail);
@@ -854,13 +942,11 @@ impl Screen {
     }
 
     fn bar_visible(&self) -> bool {
-        self.downloading && self.total > 0.0
+        self.downloading
     }
 
-    fn show_status(&self) -> bool {
-        self.error.is_some()
-            || self.cancelled
-            || (self.ready_path.is_none() && self.steps.iter().all(|step| step.state == "wait"))
+    fn shows_percent(&self) -> bool {
+        self.bar_visible() && self.total > 0.0
     }
 
     fn buttons(&self) -> Vec<&'static str> {
@@ -880,6 +966,12 @@ impl Screen {
                 byte_count(self.received),
                 byte_count(self.total)
             )
+        } else if self.downloading {
+            if self.received > 0.0 {
+                byte_count(self.received)
+            } else {
+                "Connecting...".into()
+            }
         } else {
             String::new()
         }
@@ -932,10 +1024,10 @@ fn drive(events: &[Value]) -> Screen {
             assert_eq!(screen.total, 0.0);
         }
         if kind == "step" && event["state"] == "now" {
-            assert!(!screen.show_status());
+            assert!(screen.headline.is_none());
         }
         assert_eq!(screen.downloading, saw_download);
-        assert_eq!(screen.bar_visible(), saw_download && screen.total > 0.0);
+        assert_eq!(screen.bar_visible(), saw_download);
     }
     screen
 }
@@ -944,64 +1036,121 @@ fn iso_path(dir: &Path) -> String {
     dir.join("cache").join(iso_name()).display().to_string()
 }
 
-fn watch(
-    base: &str,
-    dir: &Path,
-) -> (
-    std::process::Child,
-    Arc<Mutex<Vec<Value>>>,
-    thread::JoinHandle<()>,
-) {
+fn watch(base: &str, dir: &Path) -> (std::process::Child, Receiver<Value>, thread::JoinHandle<()>) {
     let mut child = spawn(base, dir);
     let stdout = child.stdout.take().unwrap();
-    let events = Arc::new(Mutex::new(Vec::new()));
-    let sink = events.clone();
+    let (tx, rx) = mpsc::channel();
     let reader = thread::spawn(move || {
         for line in std::io::BufReader::new(stdout).lines() {
             let Ok(line) = line else { break };
             if line.is_empty() {
                 continue;
             }
-            sink.lock()
-                .unwrap()
-                .push(serde_json::from_str(&line).expect(&line));
+            if tx.send(serde_json::from_str(&line).expect(&line)).is_err() {
+                break;
+            }
         }
     });
-    (child, events, reader)
+    (child, rx, reader)
 }
 
-fn until(events: &Mutex<Vec<Value>>, pred: impl Fn(&Value) -> bool) -> Vec<Value> {
+fn finish_watch(
+    mut child: std::process::Child,
+    reader: thread::JoinHandle<()>,
+    events: &Receiver<Value>,
+    seen: &mut Vec<Value>,
+) -> (i32, Vec<Value>) {
+    let started = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status.code().unwrap_or(1),
+            Ok(None) if started.elapsed() > Duration::from_secs(30) => {
+                let _ = child.kill();
+                panic!("worker timed out");
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(20)),
+            Err(err) => panic!("wait failed: {err}"),
+        }
+    };
+    reader.join().unwrap();
+    while let Ok(event) = events.try_recv() {
+        seen.push(event);
+    }
+    (status, seen.clone())
+}
+
+/// The bar stays hidden until the first ISO progress line, and that line has no size yet.
+fn bar_hidden_until_iso_progress(events: &[Value]) {
+    let mut screen = Screen::new();
+    screen.start();
+    let mut saw = false;
+    for event in events {
+        let kind = event["event"].as_str().unwrap_or("");
+        let step = event["step"].as_str();
+        if !saw && kind == "progress" && step == Some("download") {
+            assert_eq!(
+                num(&event["total"]),
+                Some(0.0),
+                "first bar paint must not wait for the content length: {event}"
+            );
+            saw = true;
+        }
+        screen.apply(event);
+        assert_eq!(screen.bar_visible(), saw, "{event}");
+        if !saw {
+            assert!(!screen.shows_percent());
+            assert_eq!(screen.bytes_label(), "");
+            assert_eq!(screen.received, 0.0);
+            assert_eq!(screen.total, 0.0);
+        }
+    }
+    assert!(saw, "download never painted a bar");
+}
+
+fn until(events: &Receiver<Value>, seen: &mut Vec<Value>, pred: impl Fn(&Value) -> bool) -> Vec<Value> {
     let started = Instant::now();
     loop {
-        let got = events.lock().unwrap().clone();
-        if got.iter().any(&pred) {
-            return got;
+        if seen.iter().any(&pred) {
+            return seen.clone();
         }
-        if started.elapsed() > Duration::from_secs(10) {
-            panic!("timed out waiting for the window event: {got:?}");
+        match events.recv_timeout(Duration::from_millis(200)) {
+            Ok(event) => seen.push(event),
+            Err(RecvTimeoutError::Timeout) if started.elapsed() > Duration::from_secs(10) => {
+                panic!("timed out waiting for the window event: {seen:?}");
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => {
+                panic!("worker closed its event channel: {seen:?}");
+            }
         }
-        thread::sleep(Duration::from_millis(20));
     }
 }
 
 #[test]
 fn cancel_stops_the_window_and_ignores_later_events() {
-    let (base, world) = serve(SUMS, SIGN, ISO, KEY, false, true);
+    let (base, world) = serve(SUMS, SIGN, ISO, KEY, false, true, false);
     let dir = dir();
     let (mut child, events, reader) = watch(&base, &dir);
-    let before = until(&events, |event| {
-        event["step"] == "download" && event["state"] == "now"
+    let mut seen = Vec::new();
+    let before = until(&events, &mut seen, |event| {
+        event["event"] == "progress" && event["step"] == "download"
     });
+    let release = world
+        .go_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("iso request never published a release handle");
     let mut screen = drive(&before);
     assert_eq!(screen.row("download").state, "now");
-    assert!(!screen.bar_visible());
+    assert!(screen.bar_visible());
+    assert_eq!(screen.bytes_label(), "Connecting...");
     screen.cancel();
-    let _ = child.kill();
+    release.send(()).unwrap();
     let status = child.wait().unwrap().code().unwrap_or(1);
     reader.join().unwrap();
-    *world.hold.lock().unwrap() = false;
-    world.cv.notify_all();
-    let after = events.lock().unwrap().clone();
+    let mut after = seen;
+    while let Ok(event) = events.try_recv() {
+        after.push(event);
+    }
     let frozen: Vec<_> = screen
         .steps
         .iter()
@@ -1022,44 +1171,47 @@ fn cancel_stops_the_window_and_ignores_later_events() {
     assert_eq!(screen.headline, headline);
     assert_eq!(screen.received, received);
     assert!(screen.error.is_none());
-    assert_eq!(screen.headline, "Cancelled. The download was not saved.");
+    assert_eq!(screen.headline.as_deref(), Some("Cancelled. The download was not saved."));
     assert_eq!(screen.row("download").state, "wait");
     assert_eq!(screen.row("download").detail, "Cancelled");
     assert_eq!(screen.row("check").state, "done");
     assert_eq!(screen.buttons(), ["Open cache folder", "Try again"]);
-    assert!(screen.show_status());
-    assert!(!screen.bar_visible());
+    assert!(
+        screen.bar_visible(),
+        "cancel does not wipe a bar that was already on screen"
+    );
     screen.retry();
     let (status, events) = wait(spawn(&base, &dir));
     assert_eq!(status, 0, "{events:?}");
     let screen = finish(&events, status);
-    assert!(screen.bar_visible());
     assert_eq!(screen.ready_path.as_deref(), Some(iso_path(&dir).as_str()));
 }
 
 #[test]
 fn a_killed_worker_fails_the_step_that_was_running() {
-    let (base, world) = serve(SUMS, SIGN, ISO, KEY, false, true);
+    let (base, world) = serve(SUMS, SIGN, ISO, KEY, false, true, false);
     let dir = dir();
     let (mut child, events, reader) = watch(&base, &dir);
-    let seen = until(&events, |event| {
-        event["step"] == "download" && event["state"] == "now"
+    let mut seen_lines = Vec::new();
+    let seen = until(&events, &mut seen_lines, |event| {
+        event["event"] == "progress" && event["step"] == "download"
     });
     let mut screen = drive(&seen);
+    assert!(screen.bar_visible());
+    assert_eq!(screen.row("download").state, "now");
     let _ = child.kill();
     let status = child.wait().unwrap().code().unwrap_or(1);
     reader.join().unwrap();
-    *world.hold.lock().unwrap() = false;
-    world.cv.notify_all();
+    release(&world);
     screen.worker_exited(status);
     assert_eq!(
         screen.error.as_deref(),
         Some("The download stopped before the image was ready.")
     );
-    assert_eq!(screen.headline, "Download failed");
+    assert_eq!(screen.headline.as_deref(), Some("Download failed"));
     assert_eq!(screen.row("download").state, "fail");
     assert_eq!(screen.row("download").detail, iso_name());
-    assert!(!screen.bar_visible());
+    assert!(screen.bar_visible());
     assert!(screen.ready_path.is_none());
     assert_eq!(screen.buttons(), ["Open cache folder", "Try again"]);
     assert!(!screen.cancelled);
@@ -1067,7 +1219,7 @@ fn a_killed_worker_fails_the_step_that_was_running() {
 
 #[test]
 fn deleting_the_finished_iso_clears_the_window_and_starts_again() {
-    let (base, world) = serve(SUMS, SIGN, ISO, KEY, false, false);
+    let (base, world) = serve(SUMS, SIGN, ISO, KEY, false, false, false);
     let (status, events, dir) = run(&base);
     assert_eq!(status, 0, "{events:?}");
     let cache = dir.join("cache");
@@ -1085,19 +1237,13 @@ fn deleting_the_finished_iso_clears_the_window_and_starts_again() {
     assert!(screen.steps.iter().all(|step| step.state == "wait"));
     assert!(!screen.bar_visible());
     assert!(screen.ready_path.is_none());
-    assert_eq!(screen.headline, PREPARE);
+    assert!(screen.headline.is_none());
     assert_eq!(screen.buttons(), ["Open cache folder", "Cancel"]);
     assert!(screen.running);
-    let fetched = world.log.lock().unwrap().len();
+    let _ = log_of(&world);
     let (status, events) = wait(spawn(&base, &dir));
     assert_eq!(status, 0, "{events:?}");
-    assert!(world
-        .log
-        .lock()
-        .unwrap()
-        .iter()
-        .skip(fetched)
-        .any(|line| line.contains(".iso")));
+    assert!(log_of(&world).iter().any(|line| line.contains(".iso")));
     let screen = finish(&events, status);
     assert!(screen.bar_visible());
     assert_eq!(screen.percent(), 100);
@@ -1127,8 +1273,7 @@ fn deleting_the_finished_iso_clears_the_window_and_starts_again() {
 fn the_window_ignores_checksum_bytes_and_formats_its_own() {
     let mut screen = Screen::new();
     assert!(!screen.bar_visible());
-    assert!(screen.show_status());
-    assert_eq!(screen.headline, PREPARE);
+    assert!(screen.headline.is_none());
     assert_eq!(screen.buttons(), ["Open cache folder", "Cancel"]);
     assert_eq!(screen.row("key").title, "Download OpenPGP keyring");
     assert_eq!(screen.row("download").detail, iso_glob());
@@ -1144,7 +1289,9 @@ fn the_window_ignores_checksum_bytes_and_formats_its_own() {
 
     screen.apply(&serde_json::json!({"event": "progress", "step": "download", "detail": "0 KiB", "received": 0, "total": 0}));
     assert!(screen.downloading);
-    assert!(!screen.bar_visible());
+    assert!(screen.bar_visible(), "unknown size still shows the bar");
+    assert_eq!(screen.bytes_label(), "Connecting...");
+    assert_eq!(screen.percent(), 0);
     screen.apply(&serde_json::json!({"event": "progress", "step": "download", "detail": "1 KiB of 1.5 GiB", "received": 1024, "total": 1_610_612_736u64}));
     assert_eq!(screen.bytes_label(), "1 KB of 1.5 GB");
     assert_eq!(screen.percent(), 0);
@@ -1168,7 +1315,7 @@ fn the_window_ignores_checksum_bytes_and_formats_its_own() {
         missing.error.as_deref(),
         Some("The worker is not built. Run cargo build --release, then try again.")
     );
-    assert_eq!(missing.headline, "Could not start");
+    assert_eq!(missing.headline.as_deref(), Some("Could not start"));
     assert_eq!(missing.row("key").state, "fail");
     assert_eq!(missing.buttons(), ["Open cache folder", "Try again"]);
     assert!(!missing.bar_visible());
@@ -1180,11 +1327,300 @@ fn the_window_ignores_checksum_bytes_and_formats_its_own() {
     );
 }
 
+/// The ISO bar is on screen while the mirror is still holding the response.
+#[test]
+fn the_download_bar_shows_when_the_iso_step_starts() {
+    let (base, world) = serve(SUMS, SIGN, ISO, KEY, false, true, false);
+    let dir = dir();
+    let (child, events, reader) = watch(&base, &dir);
+    let mut seen = Vec::new();
+    let early = until(&events, &mut seen, |event| {
+        event["event"] == "step" && event["step"] == "check" && event["state"] == "done"
+    });
+    let check_done = early
+        .iter()
+        .position(|event| {
+            event["event"] == "step" && event["step"] == "check" && event["state"] == "done"
+        })
+        .unwrap();
+    let screen = drive(&early[..=check_done]);
+    assert_eq!(screen.row("check").state, "done");
+    assert_eq!(screen.row("download").state, "wait");
+    assert!(!screen.bar_visible());
+    assert!(!screen.shows_percent());
+    assert_eq!(screen.bytes_label(), "");
+
+    let started = until(&events, &mut seen, |event| {
+        event["event"] == "progress" && event["step"] == "download"
+    });
+    assert_eq!(
+        started
+            .iter()
+            .filter(|event| event["event"] == "progress" && event["step"] == "download")
+            .count(),
+        1,
+        "size must not arrive while the response is held: {started:?}"
+    );
+    let step_at = started
+        .iter()
+        .position(|event| {
+            event["event"] == "step" && event["step"] == "download" && event["state"] == "now"
+        })
+        .unwrap();
+    let progress_at = started
+        .iter()
+        .position(|event| event["event"] == "progress" && event["step"] == "download")
+        .unwrap();
+    assert_eq!(progress_at, step_at + 1, "{started:?}");
+    let at_step = drive(&started[..=step_at]);
+    assert_eq!(at_step.row("download").state, "now");
+    assert!(!at_step.bar_visible());
+    let screen = drive(&started);
+    assert_eq!(screen.row("download").state, "now");
+    assert_eq!(screen.row("download").detail, iso_name());
+    assert!(screen.bar_visible());
+    assert!(!screen.shows_percent());
+    assert_eq!(screen.received, 0.0);
+    assert_eq!(screen.total, 0.0);
+    assert_eq!(screen.percent(), 0);
+    assert_eq!(screen.bytes_label(), "Connecting...");
+    bar_hidden_until_iso_progress(&started);
+
+    release(&world);
+    let (status, all) = finish_watch(child, reader, &events, &mut seen);
+    assert_eq!(status, 0, "{all:?}");
+    bar_hidden_until_iso_progress(&all);
+    let screen = finish(&all, status);
+    assert!(screen.bar_visible());
+    assert!(screen.shows_percent());
+    assert_eq!(screen.percent(), 100);
+    assert_eq!(screen.received, ISO.len() as f64);
+    assert_eq!(screen.total, ISO.len() as f64);
+    assert_eq!(
+        screen.bytes_label(),
+        format!(
+            "{} of {}",
+            byte_count(ISO.len() as f64),
+            byte_count(ISO.len() as f64)
+        )
+    );
+    assert_eq!(screen.row("download").state, "done");
+    assert_eq!(screen.ready_path.as_deref(), Some(iso_path(&dir).as_str()));
+}
+
+/// Headers can name the size while the body is still held. The bar shows that size immediately.
+#[test]
+fn the_download_bar_shows_the_size_before_any_body_byte() {
+    let (base, world) = serve(SUMS, SIGN, ISO, KEY, false, false, true);
+    pause_at(&world, 0);
+    let dir = dir();
+    let (child, events, reader) = watch(&base, &dir);
+    let mut seen = Vec::new();
+    let sized = until(&events, &mut seen, |event| {
+        event["event"] == "progress"
+            && event["step"] == "download"
+            && num(&event["total"]).unwrap_or(0.0) > 0.0
+    });
+    assert!(log_of(&world).iter().any(|line| line.contains(".iso")));
+    let first = sized
+        .iter()
+        .position(|event| event["event"] == "progress" && event["step"] == "download")
+        .unwrap();
+    let connecting = drive(&sized[..=first]);
+    assert!(connecting.bar_visible());
+    assert!(!connecting.shows_percent());
+    assert_eq!(connecting.total, 0.0);
+    assert_eq!(connecting.bytes_label(), "Connecting...");
+    let screen = drive(&sized);
+    assert_eq!(screen.row("download").state, "now");
+    assert!(screen.bar_visible());
+    assert!(screen.shows_percent());
+    assert_eq!(screen.received, 0.0);
+    assert_eq!(screen.total, ISO.len() as f64);
+    assert_eq!(screen.percent(), 0);
+    assert_eq!(
+        screen.bytes_label(),
+        format!("0 KB of {}", byte_count(ISO.len() as f64))
+    );
+    let partial = dir
+        .join("cache")
+        .join(format!("{}.partial", iso_name()));
+    assert_eq!(std::fs::metadata(&partial).unwrap().len(), 0);
+
+    more(&world, None);
+    let (status, all) = finish_watch(child, reader, &events, &mut seen);
+    assert_eq!(status, 0, "{all:?}");
+    let screen = finish(&all, status);
+    assert!(screen.bar_visible());
+    assert!(screen.shows_percent());
+    assert_eq!(screen.percent(), 100);
+    assert_eq!(screen.received, ISO.len() as f64);
+    assert_eq!(std::fs::read(dir.join("cache").join(iso_name())).unwrap(), ISO);
+    assert!(!partial.exists());
+}
+
+/// A slice of the body is enough. The bar shows that slice before the rest is released.
+#[test]
+fn the_download_bar_shows_partial_bytes_before_the_body_finishes() {
+    let (base, world) = serve(SUMS, SIGN, ISO, KEY, false, false, true);
+    pause_at(&world, 0);
+    let dir = dir();
+    let (child, events, reader) = watch(&base, &dir);
+    let mut seen = Vec::new();
+    let sized = until(&events, &mut seen, |event| {
+        event["event"] == "progress"
+            && event["step"] == "download"
+            && num(&event["total"]).unwrap_or(0.0) == ISO.len() as f64
+            && num(&event["received"]).unwrap_or(1.0) == 0.0
+    });
+    let connecting = sized.iter().position(|event| {
+        event["event"] == "progress"
+            && event["step"] == "download"
+            && num(&event["total"]) == Some(0.0)
+    });
+    assert!(connecting.is_some(), "bar must appear before the size is known");
+    assert!(drive(&sized[..=connecting.unwrap()]).bar_visible());
+    assert!(!drive(&sized[..=connecting.unwrap()]).shows_percent());
+    let empty = drive(&sized);
+    assert!(empty.bar_visible());
+    assert!(empty.shows_percent());
+    assert_eq!(empty.percent(), 0);
+    assert_eq!(empty.received, 0.0);
+    // The next body tick is dropped if it lands inside 250ms of the size tick.
+    thread::sleep(Duration::from_millis(300));
+    let sent = 1024usize;
+    more(&world, Some(sent));
+    let mid = until(&events, &mut seen, |event| {
+        event["event"] == "progress"
+            && event["step"] == "download"
+            && num(&event["received"]).unwrap_or(0.0) == sent as f64
+    });
+    let screen = drive(&mid);
+    assert_eq!(screen.row("download").state, "now");
+    assert!(screen.bar_visible());
+    assert!(screen.shows_percent());
+    assert_eq!(screen.received, sent as f64);
+    assert_eq!(screen.total, ISO.len() as f64);
+    assert!(screen.percent() > 0 && screen.percent() < 100);
+    assert_eq!(
+        screen.percent(),
+        ((sent as f64 / ISO.len() as f64) * 100.0).round() as i64
+    );
+    assert_eq!(
+        screen.bytes_label(),
+        format!(
+            "{} of {}",
+            byte_count(sent as f64),
+            byte_count(ISO.len() as f64)
+        )
+    );
+    let partial = dir.join("cache").join(format!("{}.partial", iso_name()));
+    assert_eq!(std::fs::metadata(&partial).unwrap().len(), sent as u64);
+
+    more(&world, None);
+    let (status, all) = finish_watch(child, reader, &events, &mut seen);
+    assert_eq!(status, 0, "{all:?}");
+    let screen = finish(&all, status);
+    assert!(screen.bar_visible());
+    assert_eq!(screen.percent(), 100);
+    assert_eq!(screen.received, ISO.len() as f64);
+    assert_eq!(std::fs::read(dir.join("cache").join(iso_name())).unwrap(), ISO);
+    assert!(!partial.exists());
+}
+
+/// A resumed fetch paints the bytes already on disk before the range response comes back.
+#[test]
+fn a_resume_shows_the_download_bar_before_the_range_response() {
+    let (base, _world) = serve(SUMS, SIGN, ISO, KEY, true, false, false);
+    let (status, _, dir) = run(&base);
+    assert_ne!(status, 0);
+    let partial = dir.join("cache").join(format!("{}.partial", iso_name()));
+    let have = std::fs::metadata(&partial).unwrap().len();
+    assert!(have > 0 && have < ISO.len() as u64, "{have}");
+    let (base, world) = serve(SUMS, SIGN, ISO, KEY, false, true, false);
+    let (child, events, reader) = watch(&base, &dir);
+    let mut seen = Vec::new();
+    let started = until(&events, &mut seen, |event| {
+        event["event"] == "progress" && event["step"] == "download"
+    });
+    assert_eq!(
+        started
+            .iter()
+            .filter(|event| event["event"] == "progress" && event["step"] == "download")
+            .count(),
+        1
+    );
+    let screen = drive(&started);
+    assert_eq!(screen.row("download").state, "now");
+    assert!(screen.bar_visible());
+    assert!(!screen.shows_percent());
+    assert_eq!(screen.received, have as f64);
+    assert_eq!(screen.total, 0.0);
+    assert_eq!(screen.bytes_label(), byte_count(have as f64));
+    bar_hidden_until_iso_progress(&started);
+
+    release(&world);
+    let (status, all) = finish_watch(child, reader, &events, &mut seen);
+    assert_eq!(status, 0, "{all:?}");
+    assert!(log_of(&world).iter().any(|line| line.contains("range=")));
+    let screen = finish(&all, status);
+    assert!(screen.bar_visible());
+    assert_eq!(screen.percent(), 100);
+    assert_eq!(screen.received, ISO.len() as f64);
+    assert_eq!(std::fs::read(dir.join("cache").join(iso_name())).unwrap(), ISO);
+}
+
+#[test]
+fn a_cached_iso_does_not_show_the_download_bar() {
+    let (base, world) = serve(SUMS, SIGN, ISO, KEY, false, false, false);
+    let (status, events, dir) = run(&base);
+    assert_eq!(status, 0, "{events:?}");
+    let fetched = finish(&events, status);
+    assert!(fetched.bar_visible());
+    assert_eq!(fetched.percent(), 100);
+    let _ = log_of(&world);
+    let (status, again) = wait(spawn(&base, &dir));
+    assert_eq!(status, 0, "{again:?}");
+    let again_log = log_of(&world);
+    assert_eq!(
+        again_log.len(),
+        3,
+        "cached iso was fetched again: {again_log:?}"
+    );
+    assert!(again
+        .iter()
+        .all(|event| !(event["event"] == "progress" && event["step"] == "download")));
+    assert!(again
+        .iter()
+        .any(|event| event["event"] == "progress" && event["step"] == "verify"));
+    let mut screen = Screen::new();
+    screen.start();
+    for event in &again {
+        screen.apply(event);
+        assert!(!screen.bar_visible(), "{event}");
+        assert!(!screen.shows_percent());
+    }
+    screen.worker_exited(status);
+    assert!(!screen.bar_visible());
+    assert_eq!(screen.received, 0.0);
+    assert_eq!(screen.total, 0.0);
+    assert_eq!(screen.bytes_label(), "");
+    assert_eq!(screen.ready_path.as_deref(), Some(iso_path(&dir).as_str()));
+    assert_eq!(screen.row("download").state, "done");
+    assert_eq!(screen.row("download").detail, iso_name());
+}
+
 #[test]
 fn quick_start_swift_gates_the_bar_on_a_real_download() {
     let src = include_str!("../Sources/QuickStart.swift");
     assert!(src.contains("if event.event == \"progress\", event.step == \"download\""));
-    assert!(src.contains("if wizard.downloading && wizard.total > 0"));
+    assert!(src.contains("if wizard.downloading {"));
+    assert!(!src.contains("wizard.downloading && wizard.total > 0"));
+    assert!(src.contains("Connecting..."));
+    assert!(src.contains("scaleEffect(x: wizard.fraction"));
+    assert!(src.contains(".animation(nil, value: wizard.fraction)"));
+    assert!(!src.contains("ProgressView(value: wizard.fraction)"));
+    assert!(src.contains("if wizard.total > 0 {"));
     assert!(src.contains("downloading = false"));
     let apply = src.split("private func apply(").nth(1).unwrap();
     let ready = apply.split("if event.event == \"ready\"").nth(1).unwrap();

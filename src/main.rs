@@ -5,23 +5,19 @@ mod verify;
 
 use std::env;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, IsTerminal, Read, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
 const STEPS: [&str; 6] = ["key", "sums", "sign", "check", "download", "verify"];
-const TITLES: [&str; 6] = [
-    "Download OpenPGP keyring",
-    "Download checksums file",
-    "Download signature file",
-    "Verify signature",
-    "Download ISO",
-    "Verify checksum",
-];
-static ORDER: Mutex<[&'static str; 6]> = Mutex::new(["wait"; 6]);
+
+enum OrderMsg {
+    Set(&'static str, &'static str, Sender<Result<(), String>>),
+    Current(Sender<Option<&'static str>>),
+}
 
 #[derive(Serialize)]
 struct Event<'a> {
@@ -38,8 +34,6 @@ struct Event<'a> {
     total: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     path: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    note: Option<String>,
 }
 
 fn blank(event: &str) -> Event<'_> {
@@ -51,7 +45,6 @@ fn blank(event: &str) -> Event<'_> {
         received: None,
         total: None,
         path: None,
-        note: None,
     }
 }
 
@@ -71,32 +64,10 @@ macro_rules! emit {
     }};
 }
 
-fn note(line: &str) {
-    let mut err = io::stderr().lock();
-    let _ = if io::stderr().is_terminal() {
-        write!(err, "\r\x1b[2K{line}")
-    } else {
-        writeln!(err, "{line}")
-    };
-    let _ = err.flush();
-}
-
-fn note_done() {
-    if io::stderr().is_terminal() {
-        let _ = writeln!(io::stderr());
-    }
-}
-
-fn fail(detail: String) -> ! {
-    note_done();
-    note(&detail);
-    note_done();
-    let step = ORDER.lock().ok().and_then(|order| {
-        order
-            .iter()
-            .position(|state| *state == "now")
-            .map(|i| STEPS[i])
-    });
+fn fail(detail: String, order: &Sender<OrderMsg>) -> ! {
+    let (tx, rx) = mpsc::channel();
+    let _ = order.send(OrderMsg::Current(tx));
+    let step = rx.recv().ok().flatten();
     emit!("error", step: step, state: Some("fail"), detail: Some(detail));
     std::process::exit(1);
 }
@@ -148,28 +119,33 @@ fn check_order(order: &mut [&'static str; 6], id: &str, state: &str) -> Result<(
     }
 }
 
-fn step(id: &'static str, state: &'static str, detail: &str, extra: Option<String>) {
-    if let Some(err) = {
-        let mut order = ORDER.lock().unwrap_or_else(|err| err.into_inner());
-        check_order(&mut order, id, state).err()
-    } {
-        fail(err);
+fn order_loop(rx: Receiver<OrderMsg>) {
+    let mut order = ["wait"; 6];
+    while let Ok(msg) = rx.recv() {
+        match msg {
+            OrderMsg::Set(id, state, reply) => {
+                let _ = reply.send(check_order(&mut order, id, state));
+            }
+            OrderMsg::Current(reply) => {
+                let step = order
+                    .iter()
+                    .position(|state| *state == "now")
+                    .map(|i| STEPS[i]);
+                let _ = reply.send(step);
+            }
+        }
     }
-    let mark = match state {
-        "done" => "done",
-        "now" => "now ",
-        "fail" => "fail",
-        _ => "wait",
-    };
-    let title = STEPS
-        .iter()
-        .position(|item| *item == id)
-        .map(|i| TITLES[i])
-        .unwrap_or(id);
-    note_done();
-    note(&format!("{mark}  {title}  {detail}"));
-    note_done();
-    emit!("step", step: Some(id), state: Some(state), detail: Some(detail.to_string()), note: extra);
+}
+
+fn step(id: &'static str, state: &'static str, detail: &str, order: &Sender<OrderMsg>) {
+    let (tx, rx) = mpsc::channel();
+    if order.send(OrderMsg::Set(id, state, tx)).is_err() {
+        fail("step order closed".to_string(), order);
+    }
+    if let Err(err) = rx.recv().unwrap_or_else(|_| Err("step order closed".into())) {
+        fail(err, order);
+    }
+    emit!("step", step: Some(id), state: Some(state), detail: Some(detail.to_string()));
 }
 
 fn support_dir() -> PathBuf {
@@ -228,13 +204,7 @@ impl Progress {
             return;
         }
         self.last = Instant::now();
-        let detail = if total > 0 {
-            format!("{} of {}", gib(received), gib(total))
-        } else {
-            gib(received)
-        };
-        note(&format!("{:<10} {detail}", self.step));
-        emit!("progress", step: Some(self.step), state: Some("now"), detail: Some(detail), received: Some(received), total: Some(total));
+        emit!("progress", step: Some(self.step), state: Some("now"), received: Some(received), total: Some(total));
     }
 }
 
@@ -262,13 +232,19 @@ fn total_size(resp: &ureq::Response, status: u16, already: u64) -> u64 {
 fn download(agent: &ureq::Agent, url: &str, partial: &Path) -> Result<u64, String> {
     let url = verify::locate(url);
     let have = partial.metadata().map(|m| m.len()).unwrap_or(0);
+    let mut progress = Progress::new("download");
+    // DNS, TLS, and mirror redirects can take seconds. Paint the bar before that, not after the headers.
+    progress.tick(have, 0, true);
     let mut request = agent.get(&url);
     if have > 0 {
         request = request.set("Range", &format!("bytes={have}-"));
     }
     let resp = match request.call() {
         Ok(resp) => resp,
-        Err(ureq::Error::Status(416, _)) if have > 0 => return Ok(have),
+        Err(ureq::Error::Status(416, _)) if have > 0 => {
+            progress.tick(have, have, true);
+            return Ok(have);
+        }
         Err(ureq::Error::Status(code, resp)) => return Err(verify::status_msg(&url, code, resp)),
         Err(err) => return Err(format!("{url}: {err}")),
     };
@@ -289,7 +265,6 @@ fn download(agent: &ureq::Agent, url: &str, partial: &Path) -> Result<u64, Strin
     };
     let mut reader = resp.into_reader();
     let mut buf = vec![0u8; 256 * 1024];
-    let mut progress = Progress::new("download");
     progress.tick(received, total, true);
     loop {
         let n = reader
@@ -329,7 +304,7 @@ fn hold_lock(cache: &Path) -> Result<File, String> {
     Ok(file)
 }
 
-fn run(dir: &Path) -> Result<(), String> {
+fn run(dir: &Path, order: &Sender<OrderMsg>) -> Result<(), String> {
     let arch = guest_arch()?;
     let cache = dir.join("cache");
     fs::create_dir_all(&cache)
@@ -339,50 +314,38 @@ fn run(dir: &Path) -> Result<(), String> {
     let base = verify::current_dir(arch)?;
     let key_name = verify::key_file();
 
-    step("key", "now", key_name, None);
+    step("key", "now", key_name, order);
     let key = verify::fetch_key(&agent)?;
     verify::debian_key(&key)?;
     fs::write(cache.join(key_name), &key).map_err(|err| err.to_string())?;
-    step(
-        "key",
-        "done",
-        key_name,
-        Some(format!("Key id {}.", verify::key_id())),
-    );
+    step("key", "done", key_name, order);
 
-    step("sums", "now", "SHA512SUMS", None);
+    step("sums", "now", "SHA512SUMS", order);
     let sums = verify::fetch(&agent, &format!("{base}/SHA512SUMS"))?;
     fs::write(cache.join("SHA512SUMS"), &sums).map_err(|err| err.to_string())?;
-    step("sums", "done", "SHA512SUMS", None);
+    step("sums", "done", "SHA512SUMS", order);
 
-    step("sign", "now", "SHA512SUMS.sign", None);
+    step("sign", "now", "SHA512SUMS.sign", order);
     let signature = verify::fetch(&agent, &format!("{base}/SHA512SUMS.sign"))?;
     fs::write(cache.join("SHA512SUMS.sign"), &signature).map_err(|err| err.to_string())?;
-    step("sign", "done", "SHA512SUMS.sign", None);
+    step("sign", "done", "SHA512SUMS.sign", order);
 
-    step("check", "now", "SHA512SUMS.sign", None);
+    step("check", "now", "SHA512SUMS.sign", order);
     let published = verify::published(arch, &key, &sums, &signature)?;
-    step(
-        "check",
-        "done",
-        "Signature is valid",
-        Some(format!("Debian {} signed SHA512SUMS.", published.version)),
-    );
+    step("check", "done", "Signature is valid", order);
 
     emit!("detail", step: Some("download"), detail: Some(published.name.clone()));
     let url = verify::image_url(&published.version, arch, &published.name);
     let dest = cache.join(&published.name);
     let partial = cache.join(format!("{}.partial", published.name));
-    step("download", "now", &published.name, None);
+    step("download", "now", &published.name, order);
     if !dest.is_file() {
-        note(&format!("download   {url}"));
-        note_done();
         download(&agent, &url, &partial)?;
         fs::rename(&partial, &dest).map_err(|err| err.to_string())?;
     }
-    step("download", "done", &published.name, None);
+    step("download", "done", &published.name, order);
 
-    step("verify", "now", "SHA512SUMS", None);
+    step("verify", "now", "SHA512SUMS", order);
     let mut progress = Progress::new("verify");
     let got = verify::hash_file(&dest, &mut |done, total| progress.tick(done, total, false))?;
     let size = dest.metadata().map(|meta| meta.len()).unwrap_or(0);
@@ -394,10 +357,10 @@ fn run(dir: &Path) -> Result<(), String> {
             published.name
         ));
     }
-    finish(&url, &published, &dest)
+    finish(&url, &published, &dest, order)
 }
 
-fn finish(url: &str, published: &verify::Published, dest: &Path) -> Result<(), String> {
+fn finish(url: &str, published: &verify::Published, dest: &Path, order: &Sender<OrderMsg>) -> Result<(), String> {
     let bytes = dest.metadata().map_err(|err| err.to_string())?.len();
     let cache = dest.parent().ok_or("image path has no directory")?;
     let manifest = serde_json::json!({
@@ -416,16 +379,8 @@ fn finish(url: &str, published: &verify::Published, dest: &Path) -> Result<(), S
     )
     .map_err(|err| err.to_string())?;
     fs::rename(&tmp, cache.join("manifest.json")).map_err(|err| err.to_string())?;
-    let ready = "The ISO matches SHA512SUMS.";
-    step(
-        "verify",
-        "done",
-        "Checksum matches",
-        Some(ready.to_string()),
-    );
-    note(&format!("ready      {}  {}", dest.display(), gib(bytes)));
-    note_done();
-    emit!("ready", step: Some("verify"), state: Some("done"), detail: Some("Checksum matches".to_string()), received: Some(bytes), total: Some(bytes), path: Some(dest.display().to_string()), note: Some(ready.to_string()));
+    step("verify", "done", "Checksum matches", order);
+    emit!("ready", step: Some("verify"), state: Some("done"), detail: Some("Checksum matches".to_string()), received: Some(bytes), total: Some(bytes), path: Some(dest.display().to_string()));
     Ok(())
 }
 
@@ -458,12 +413,17 @@ fn main() {
             return;
         }
         Some(other) if other.starts_with('-') => args.as_slice(),
-        Some(other) => fail(format!("unknown command {other}\n{}", usage())),
+        Some(other) => {
+            let (tx, _rx) = mpsc::channel();
+            fail(format!("unknown command {other}\n{}", usage()), &tx);
+        }
         None => &args[..],
     };
-    match parse_dir(rest).and_then(|dir| run(&dir)) {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || order_loop(rx));
+    match parse_dir(rest).and_then(|dir| run(&dir, &tx)) {
         Ok(()) => {}
-        Err(err) => fail(err),
+        Err(err) => fail(err, &tx),
     }
 }
 
