@@ -16,7 +16,7 @@ struct WizardStep: Identifiable {
         WizardStep(id: "verify", title: "Verify checksum", detail: "SHA512SUMS", state: "wait"),
     ]
 
-    /// Page two. Debian setup is the next page.
+    /// Host key, preseed, guest disk, and the installer copy. Same list as the download steps.
     static let preseed = [
         WizardStep(id: "sshkey", title: "Prepare the host key", detail: "id_ed25519", state: "wait"),
         WizardStep(id: "preseed", title: "Prepare preseed disk", detail: "preseed.img", state: "wait"),
@@ -24,12 +24,12 @@ struct WizardStep: Identifiable {
         WizardStep(id: "patch", title: "Prepare installer", detail: "boot.iso", state: "wait"),
     ]
 
-    /// The installer rows. They are the third page, not this one. A clone window is not this wizard.
+    /// The installer rows. Same list as the download steps. A clone window is not this wizard.
     static let setup = [
         WizardStep(id: "installer", title: "Start the installer", detail: "boot.iso", state: "wait"),
         WizardStep(id: "partition", title: "Install guest", detail: "disk.img", state: "wait"),
         WizardStep(id: "ssh", title: "Log in with the host key", detail: "guest port 22", state: "wait"),
-        WizardStep(id: "snapshot", title: "Save a snapshot", detail: "snapshots/debian", state: "wait"),
+        WizardStep(id: "snapshot", title: "Save a snapshot", detail: SupportDir.snapshotLocation, state: "wait"),
     ]
 
     static var isoName: String {
@@ -56,10 +56,9 @@ struct WorkerEvent: Decodable {
 }
 
 final class Wizard: ObservableObject {
-    @Published var steps = WizardStep.initial
-    @Published var page = 0
-    /// Set when the user leaves the page the worker is on. Events do not pull them back.
-    private var pinned = false
+    @Published var steps = WizardStep.initial + WizardStep.preseed + WizardStep.setup
+    /// The short list is Download ISO, Install guest, and Save snapshot. Show all steps opens the rest, in order.
+    @Published var showAll = false
     @Published var received = 0.0
     @Published var total = 0.0
     @Published var headline: String?
@@ -68,6 +67,8 @@ final class Wizard: ObservableObject {
     @Published var diskPath: String?
     @Published var cancelled = false
     @Published var downloading = false
+    /// Set by the guest when an installer file disappears. The next poll restarts that step.
+    @Published var missingFile: String?
 
     private var started = false
     /// ISO path from the last ready event. Rewinding does not forget it, so a deleted ISO still maps to the download step.
@@ -157,10 +158,15 @@ final class Wizard: ObservableObject {
         output?.readabilityHandler = nil
     }
 
-    /// A finished step's file was removed. Run again from that step. Earlier steps stay done.
+    /// A finished step's file was removed. Run again from that step once this run has stopped.
     func cacheWentAway() {
         guard !cancelled else { return }
         if process?.isRunning == true { return }
+        if let missing = missingFile, steps.first(where: { $0.id == missing })?.state == "done" {
+            missingFile = nil
+            resume(from: missing)
+            return
+        }
         guard let missing = firstMissing() else { return }
         resume(from: missing)
     }
@@ -208,25 +214,20 @@ final class Wizard: ObservableObject {
                 && has(support.appendingPathComponent("ssh/id_ed25519.pub"))
                 && has(support.appendingPathComponent("ssh/authorized_keys"))
         case "preseed":
-            return has(support.appendingPathComponent("preseed.img"))
+            return has(support.appendingPathComponent("installer/preseed.img"))
         case "disk":
             let disk = diskPath.map { URL(fileURLWithPath: $0) }
                 ?? support.appendingPathComponent("machines/debian/disk.img")
             return has(disk)
         case "patch":
-            return has(support.appendingPathComponent("boot.iso"))
+            return has(support.appendingPathComponent("installer/boot.iso"))
         default:
             return true
         }
     }
 
-    /// Drop this step and everything after it. The page follows the step that has to run.
+    /// Drop this step and everything after it. Earlier rows stay done.
     private func rewind(to id: String) {
-        if !Self.pageTwo.contains(id) {
-            steps.removeAll { Self.pageTwo.contains($0.id) }
-        } else if !steps.contains(where: { $0.id == "sshkey" }) {
-            steps.append(contentsOf: WizardStep.preseed)
-        }
         guard let index = steps.firstIndex(where: { $0.id == id }) else { return }
         for i in index..<steps.count {
             steps[i].state = i == index ? "now" : "wait"
@@ -240,8 +241,6 @@ final class Wizard: ObservableObject {
         error = nil
         headline = nil
         cancelled = false
-        page = Self.pageTwo.contains(id) ? 1 : 0
-        pinned = false
     }
 
     private static func detail(for id: String) -> String {
@@ -257,6 +256,11 @@ final class Wizard: ObservableObject {
         case "patch": return "boot.iso"
         default: return ""
         }
+    }
+
+    private func showSnapshotLocation() {
+        guard let index = steps.firstIndex(where: { $0.id == "snapshot" }) else { return }
+        steps[index].detail = SupportDir.snapshotLocation
     }
 
     /// Preparing the disk writes this file. A stale login must not survive it.
@@ -275,9 +279,8 @@ final class Wizard: ObservableObject {
         supportSource?.cancel()
         supportSource = nil
         buffer.removeAll()
-        steps = WizardStep.initial
-        page = 0
-        pinned = false
+        steps = WizardStep.initial + WizardStep.preseed + WizardStep.setup
+        showAll = false
         received = 0
         total = 0
         downloading = false
@@ -316,13 +319,13 @@ final class Wizard: ObservableObject {
         diskSource = src
     }
 
-    /// preseed.img and boot.iso sit beside the cache. Deleting them does not write the cache folder.
+    /// preseed.img and boot.iso live in installer/. Deleting them does not write the cache folder.
     private func watchSupport() {
         supportSource?.cancel()
         supportSource = nil
-        let support = CacheFolder.url.deletingLastPathComponent()
-        try? FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
-        let fd = open(support.path, O_EVTONLY)
+        let installer = CacheFolder.url.deletingLastPathComponent().appendingPathComponent("installer", isDirectory: true)
+        try? FileManager.default.createDirectory(at: installer, withIntermediateDirectories: true)
+        let fd = open(installer.path, O_EVTONLY)
         guard fd >= 0 else { return }
         let src = DispatchSource.makeFileSystemObjectSource(fileDescriptor: fd, eventMask: [.write, .delete, .rename], queue: .main)
         src.setEventHandler { [weak self] in self?.cacheWentAway() }
@@ -349,7 +352,6 @@ final class Wizard: ObservableObject {
             steps[index].state = "wait"
             steps[index].detail = "Cancelled"
         }
-        follow()
     }
 
     private func consume(_ data: Data) {
@@ -376,12 +378,16 @@ final class Wizard: ObservableObject {
                 steps[index].detail = detail
             }
         case "step", "ready":
-            if let step = event.step, Self.pageTwo.contains(step) { showPreseed() }
             if let step = event.step, let state = event.state { applyState(step, state: state, detail: event.detail) }
             if event.event == "ready" {
                 readyPath = event.path
                 diskPath = event.disk
-                if let path = event.path { isoPath = path }
+                if let path = event.path {
+                    isoPath = path
+                    // The ISO row shows where the file is. Open folder is the only folder button.
+                    applyState("download", state: steps.first { $0.id == "download" }?.state ?? "done", detail: path)
+                }
+                showSnapshotLocation()
                 if downloading {
                     total = max(total, 1)
                     received = total
@@ -390,7 +396,6 @@ final class Wizard: ObservableObject {
                 if let disk = event.disk { watchDisk(disk) }
                 watchSupport()
             }
-            follow()
         case "error":
             error = event.detail ?? "Download failed."
             headline = "Download failed"
@@ -399,61 +404,17 @@ final class Wizard: ObservableObject {
             } else {
                 failCurrent()
             }
-            follow()
         default:
             break
         }
     }
 
-    /// Remember the host key, preseed, the guest disk, and the installer copy. They stay off the download page.
-    private func showPreseed() {
-        guard !steps.contains(where: { $0.id == "sshkey" }) else { return }
-        for earlier in steps.indices where steps[earlier].state != "fail" {
-            steps[earlier].state = "done"
-        }
-        steps.append(contentsOf: WizardStep.preseed)
-    }
+    /// The short list. Show all steps opens the rest, in the same order the worker runs them.
+    static let brief = ["download", "partition", "snapshot"]
 
-    /// The page the worker has reached. Prepare is the second page. Install is the third, once the files are ready.
-    private var latest: Int {
-        if readyPath != nil && diskPath != nil && error == nil { return 2 }
-        return preseedReached ? 1 : 0
-    }
-
-    private static let pageTwo = ["sshkey", "preseed", "disk", "patch"]
-
-    private var preseedReached: Bool {
-        steps.contains { Self.pageTwo.contains($0.id) && $0.state != "wait" }
-    }
-
-    /// Move to the worker's page unless the user is looking at another one.
-    private func follow() {
-        if page > latest {
-            page = latest
-            pinned = false
-        }
-        if !pinned { page = latest }
-    }
-
-    func back() {
-        guard page > 0 else { return }
-        page -= 1
-        pinned = true
-    }
-
-    func forward() {
-        guard page < latest else { return }
-        page += 1
-        pinned = page != latest
-    }
-
-    var canGoBack: Bool { page > 0 }
-    var canGoForward: Bool { page < latest }
-
-    /// Rows for the page on screen. Page two is the host key, preseed, the disk, and the installer copy.
     var visibleSteps: [WizardStep] {
-        let ids = page == 1 ? Self.pageTwo : ["key", "sums", "sign", "check", "download", "verify"]
-        return ids.compactMap { id in steps.first { $0.id == id } }
+        if showAll { return steps }
+        return Self.brief.compactMap { id in steps.first { $0.id == id } }
     }
 
     private func applyState(_ id: String, state: String, detail: String?) {
@@ -492,7 +453,7 @@ enum CacheFolder {
     }
 }
 
-/// Opens a directory in Finder. The download page uses the cache. Prepare and setup use the data folder, which also holds the host key, the guest disk, and the snapshot.
+/// Opens a directory in Finder. The wizard opens the data folder, which also holds the cache, the host key, the guest disk, and the snapshot.
 private func openFolder(_ folder: URL, name: String) -> String? {
     do { try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true) }
     catch { return "Could not create the \(name). \(error.localizedDescription)" }
@@ -506,9 +467,14 @@ private func openFolder(_ folder: URL, name: String) -> String? {
 enum SupportDir {
     static var url: URL { CacheFolder.url.deletingLastPathComponent() }
 
-    /// Host key, preseed, boot copy, cache, guest disk, and snapshot. Prepare and setup are not the download cache.
+    /// Host key, installer copies, cache, guest disk, and snapshot. The wizard is not only the download cache.
     static func open() -> String? {
         openFolder(url, name: "folder")
+    }
+
+    /// The worker calls this a snapshot. The directory is snapshots/debian beside the cache.
+    static var snapshotLocation: String {
+        url.appendingPathComponent("snapshots/debian", isDirectory: true).path
     }
 
     /// Both files. Deleting the snapshot disk is the same as deleting the ready marker.
@@ -609,23 +575,18 @@ struct QuickStart: View {
     @State private var folderError: String?
 
     var body: some View {
-        // Install stays mounted, so Back does not stop the guest. Prepare is the page under it.
+        // One page. Install stays mounted under the list so the guest is not stopped to show a step.
+        // The top slot is the download bar until the guest starts, then that guest.
         ZStack(alignment: .topLeading) {
             if let iso = wizard.readyPath, let disk = wizard.diskPath, wizard.error == nil {
-                Install(
-                    iso: iso,
-                    disk: disk,
-                    onBack: wizard.canGoBack ? { wizard.back() } : nil as (() -> Void)?,
-                    onForward: wizard.canGoForward ? { wizard.forward() } : nil as (() -> Void)?
-                )
-                    .opacity(wizard.page == 2 ? 1 : 0)
-                    .allowsHitTesting(wizard.page == 2)
-                    .accessibilityHidden(wizard.page != 2)
+                Install(iso: iso, disk: disk, embedded: true, steps: $wizard.steps, missingFile: $wizard.missingFile)
+                    .opacity(0)
+                    .allowsHitTesting(false)
+                    .accessibilityHidden(true)
+                    .frame(width: 0, height: 0)
+                    .clipped()
             }
-            if wizard.page != 2 || wizard.readyPath == nil || wizard.error != nil {
-                download
-                    .background(.background)
-            }
+            download
         }
         .onAppear { wizard.start() }
         .task {
@@ -636,22 +597,15 @@ struct QuickStart: View {
         }
     }
 
-    private var pageTitle: String {
-        switch wizard.page {
-        case 1: return "Prepare"
-        default: return "Debian 13"
-        }
-    }
-
     private var download: some View {
         VStack(alignment: .leading, spacing: 18) {
             VStack(alignment: .leading, spacing: 4) {
-                Text(pageTitle).font(.title2.weight(.semibold))
+                Text("Debian 13").font(.title2.weight(.semibold))
                 if let headline = wizard.headline {
                     Text(headline).font(.subheadline).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                 }
             }
-            progress
+            top
             VStack(spacing: 0) {
                 let shown = wizard.visibleSteps
                 ForEach(shown) { step in
@@ -660,25 +614,18 @@ struct QuickStart: View {
                 }
             }
             .background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-            if let path = wizard.readyPath, wizard.error == nil {
-                Text(path).font(.caption).foregroundStyle(.tertiary).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+            Button(wizard.showAll ? "Show important steps" : "Show all steps") {
+                wizard.showAll.toggle()
             }
+            .buttonStyle(.plain)
+            .font(.caption)
+            .foregroundStyle(.secondary)
             if let error = wizard.error {
                 Text(error).font(.callout).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true)
             }
             HStack {
-                if wizard.page == 0 {
-                    Button("Open cache folder") { folderError = CacheFolder.open() }.buttonStyle(.bordered)
-                } else {
-                    Button("Open folder") { folderError = SupportDir.open() }.buttonStyle(.bordered)
-                }
+                Button("Open folder") { folderError = SupportDir.open() }.buttonStyle(.bordered)
                 Spacer(minLength: 12)
-                if wizard.canGoBack {
-                    Button("Back", action: wizard.back).buttonStyle(.bordered)
-                }
-                if wizard.canGoForward {
-                    Button("Next", action: wizard.forward).buttonStyle(.bordered)
-                }
                 if wizard.error != nil || wizard.cancelled {
                     Button("Try again", action: wizard.retry).buttonStyle(.borderedProminent)
                 } else if wizard.readyPath == nil {
@@ -693,10 +640,19 @@ struct QuickStart: View {
         .frame(width: 440, alignment: .topLeading)
     }
 
+    /// Download bar, then the guest once install starts. Same switch on the setup page.
+    @ViewBuilder private var top: some View {
+        if let iso = wizard.readyPath, let disk = wizard.diskPath, wizard.error == nil, !SupportDir.snapshotReady {
+            InstallGuest(iso: iso, disk: disk)
+        } else {
+            progress
+        }
+    }
+
     @ViewBuilder private var progress: some View {
         // The bar is up as soon as the ISO fetch starts, including while the size is unknown.
         // ProgressView eases toward each value, so the fill is drawn at the byte count instead.
-        if wizard.page == 0 && wizard.downloading {
+        if wizard.downloading {
             VStack(alignment: .leading, spacing: 6) {
                 byteBar
                 HStack {

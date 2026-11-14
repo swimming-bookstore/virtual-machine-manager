@@ -156,6 +156,47 @@ fn order_loop(rx: Receiver<OrderMsg>) {
     }
 }
 
+/// True when this step's file is on disk. Signature check has no file of its own.
+fn wrote(dir: &Path, cache: &Path, id: &str) -> bool {
+    let has = |path: &Path| path.is_file();
+    match id {
+        "key" => has(&cache.join(verify::key_file())),
+        "sums" => has(&cache.join("SHA512SUMS")),
+        "sign" => has(&cache.join("SHA512SUMS.sign")),
+        "check" => true,
+        "download" => cached_iso(cache, guest_arch().unwrap_or("amd64")).is_ok(),
+        "verify" => has(&cache.join("manifest.json")),
+        "sshkey" => {
+            has(&dir.join("ssh").join("id_ed25519"))
+                && has(&dir.join("ssh").join("id_ed25519.pub"))
+                && has(&dir.join("ssh").join(preseed::AUTHORIZED))
+        }
+        "preseed" => has(&dir.join(preseed::DIR).join(preseed::FILE)),
+        "disk" => has(&dir
+            .join("machines")
+            .join(preseed::MACHINE)
+            .join(preseed::DISK)),
+        "patch" => has(&dir.join(preseed::DIR).join(preseed::BOOT)),
+        _ => false,
+    }
+}
+
+/// Writes until the step's file is still there. One delete during the write is not a failed run.
+fn keep(
+    dir: &Path,
+    cache: &Path,
+    id: &'static str,
+    mut write: impl FnMut() -> Result<()>,
+) -> Result<()> {
+    for _ in 0..4 {
+        write()?;
+        if wrote(dir, cache, id) {
+            return Ok(());
+        }
+    }
+    bail!("{id} file is missing");
+}
+
 fn step(id: &'static str, state: &'static str, detail: &str, order: &Sender<OrderMsg>) {
     let (tx, rx) = mpsc::channel();
     if order.send(OrderMsg::Set(id, state, tx)).is_err() {
@@ -404,14 +445,14 @@ fn require_earlier(cache: &Path, support: &Path, arch: &str, start: &str) -> Res
                 need(&support.join("ssh").join("id_ed25519.pub"))?;
                 need(&support.join("ssh").join(preseed::AUTHORIZED))?;
             }
-            "preseed" => need(&support.join(preseed::FILE))?,
+            "preseed" => need(&support.join(preseed::DIR).join(preseed::FILE))?,
             "disk" => need(
                 &support
                     .join("machines")
                     .join(preseed::MACHINE)
                     .join(preseed::DISK),
             )?,
-            "patch" => need(&support.join(preseed::BOOT))?,
+            "patch" => need(&support.join(preseed::DIR).join(preseed::BOOT))?,
             other => bail!("unknown step {other}"),
         }
     }
@@ -463,9 +504,15 @@ fn run(dir: &Path, from: Option<&str>, order: &Sender<OrderMsg>) -> Result<()> {
 
     let key = if reaches(start, "key") {
         step("key", "now", key_name, order);
-        let key = verify::fetch_key(&agent)?;
-        verify::debian_key(&key)?;
-        fs::write(cache.join(key_name), &key)?;
+        let key = {
+            keep(dir, &cache, "key", || {
+                let fetched = verify::fetch_key(&agent)?;
+                verify::debian_key(&fetched)?;
+                fs::write(cache.join(key_name), &fetched)?;
+                Ok(())
+            })?;
+            read_cached(&cache.join(key_name))?
+        };
         step("key", "done", key_name, order);
         key
     } else {
@@ -474,8 +521,14 @@ fn run(dir: &Path, from: Option<&str>, order: &Sender<OrderMsg>) -> Result<()> {
 
     let sums = if reaches(start, "sums") {
         step("sums", "now", "SHA512SUMS", order);
-        let sums = verify::fetch(&agent, &format!("{base}/SHA512SUMS"))?;
-        fs::write(cache.join("SHA512SUMS"), &sums)?;
+        let sums = {
+            keep(dir, &cache, "sums", || {
+                let fetched = verify::fetch(&agent, &format!("{base}/SHA512SUMS"))?;
+                fs::write(cache.join("SHA512SUMS"), &fetched)?;
+                Ok(())
+            })?;
+            read_cached(&cache.join("SHA512SUMS"))?
+        };
         step("sums", "done", "SHA512SUMS", order);
         sums
     } else {
@@ -484,8 +537,14 @@ fn run(dir: &Path, from: Option<&str>, order: &Sender<OrderMsg>) -> Result<()> {
 
     let signature = if reaches(start, "sign") {
         step("sign", "now", "SHA512SUMS.sign", order);
-        let signature = verify::fetch(&agent, &format!("{base}/SHA512SUMS.sign"))?;
-        fs::write(cache.join("SHA512SUMS.sign"), &signature)?;
+        let signature = {
+            keep(dir, &cache, "sign", || {
+                let fetched = verify::fetch(&agent, &format!("{base}/SHA512SUMS.sign"))?;
+                fs::write(cache.join("SHA512SUMS.sign"), &fetched)?;
+                Ok(())
+            })?;
+            read_cached(&cache.join("SHA512SUMS.sign"))?
+        };
         step("sign", "done", "SHA512SUMS.sign", order);
         signature
     } else {
@@ -505,11 +564,14 @@ fn run(dir: &Path, from: Option<&str>, order: &Sender<OrderMsg>) -> Result<()> {
     let dest = cache.join(&published.name);
     if reaches(start, "download") {
         emit!("detail", step: Some("download"), detail: Some(published.name.clone()));
-        let partial = cache.join(format!("{}.partial", published.name));
         step("download", "now", &published.name, order);
         if !dest.is_file() {
-            download(&agent, &url, &partial)?;
-            fs::rename(&partial, &dest)?;
+            keep(dir, &cache, "download", || {
+                let partial = cache.join(format!("{}.partial", published.name));
+                download(&agent, &url, &partial)?;
+                fs::rename(&partial, &dest)?;
+                Ok(())
+            })?;
         }
         step("download", "done", &published.name, order);
     } else if !dest.is_file() {
@@ -529,7 +591,12 @@ fn run(dir: &Path, from: Option<&str>, order: &Sender<OrderMsg>) -> Result<()> {
                 published.name
             );
         }
-        write_manifest(&url, &published, &dest)?;
+        if !wrote(dir, &cache, "verify") {
+            keep(dir, &cache, "verify", || {
+                write_manifest(&url, &published, &dest)?;
+                Ok(())
+            })?;
+        }
         step("verify", "done", "Checksum matches", order);
     }
 
@@ -540,24 +607,46 @@ fn run(dir: &Path, from: Option<&str>, order: &Sender<OrderMsg>) -> Result<()> {
     if reaches(start, "sshkey") {
         let ssh = dir.join("ssh");
         step("sshkey", "now", "id_ed25519", order);
-        ssh::ensure(&ssh)?;
+        if !wrote(dir, &cache, "sshkey") {
+            keep(dir, &cache, "sshkey", || {
+                ssh::ensure(&ssh)?;
+                Ok(())
+            })?;
+        }
         step("sshkey", "done", "id_ed25519", order);
     } else {
         ssh::ensure(&dir.join("ssh"))?;
     }
     if reaches(start, "preseed") {
         step("preseed", "now", preseed::FILE, order);
-        preseed::write_preseed(dir)?;
+        if !wrote(dir, &cache, "preseed") {
+            keep(dir, &cache, "preseed", || {
+                preseed::write_preseed(dir)?;
+                Ok(())
+            })?;
+        }
         step("preseed", "done", preseed::FILE, order);
     }
     if reaches(start, "disk") {
         step("disk", "now", preseed::DISK, order);
-        preseed::write_guest_disk(dir)?;
+        if !wrote(dir, &cache, "disk") {
+            keep(dir, &cache, "disk", || {
+                preseed::write_guest_disk(dir)?;
+                Ok(())
+            })?;
+        }
         step("disk", "done", preseed::DISK, order);
     }
-    preseed::prepare_installer(&dest, dir)?;
-    step("patch", "now", preseed::BOOT, order);
-    step("patch", "done", preseed::BOOT, order);
+    if reaches(start, "patch") {
+        step("patch", "now", preseed::BOOT, order);
+        if !wrote(dir, &cache, "patch") {
+            keep(dir, &cache, "patch", || {
+                preseed::prepare_installer(&dest, dir)?;
+                Ok(())
+            })?;
+        }
+        step("patch", "done", preseed::BOOT, order);
+    }
     let prepared = preseed::Prepared {
         disk: dir
             .join("machines")
@@ -583,7 +672,7 @@ struct Cli {
 enum Command {
     /// Download the Debian 13 installer and check its signature.
     Download {
-        /// Support directory. Downloads go in PATH/cache. preseed.img and boot.iso stay beside that cache. Defaults to the app support directory.
+        /// Support directory. Downloads go in PATH/cache. preseed.img and boot.iso go in PATH/installer. Defaults to the app support directory.
         #[arg(long, value_name = "PATH")]
         dir: Option<PathBuf>,
         /// Run again from this step. Earlier steps already have their files and are not repeated.

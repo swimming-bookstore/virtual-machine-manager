@@ -21,6 +21,8 @@ use flate2::Compression;
 pub const FILE: &str = "preseed.img";
 pub const LABEL: &str = "PRESEED";
 pub const BOOT: &str = "boot.iso";
+/// Not the download cache. The signed ISO stays in cache/.
+pub const DIR: &str = "installer";
 
 const SECTOR: u64 = 2048;
 
@@ -107,13 +109,17 @@ pub struct Prepared {
 }
 
 /// Writes the answer disk. The empty guest disk and the installer copy are later steps.
-/// Those files are not downloads, so they stay out of the cache.
+/// Those files are not downloads, so they stay out of the cache, in installer/.
 pub fn write_preseed(support: &Path) -> Result<()> {
-    fs::create_dir_all(support)
-        .map_err(|err| anyhow!("cannot create {}: {err}", support.display()))?;
     let key = read_key(&support.join("ssh").join(AUTHORIZED))?;
-    let _ = write_image(&support.join(FILE), &image(&key)?)?;
+    let _ = write_image(&installer_dir(support)?.join(FILE), &image(&key)?)?;
     Ok(())
+}
+
+fn installer_dir(support: &Path) -> Result<PathBuf> {
+    let dir = support.join(DIR);
+    fs::create_dir_all(&dir).map_err(|err| anyhow!("cannot create {}: {err}", dir.display()))?;
+    Ok(dir)
 }
 
 /// Creates the empty guest disk when it is missing. An existing file is left as it is.
@@ -138,10 +144,8 @@ pub fn prepare_installer(iso: &Path, support: &Path) -> Result<bool> {
     if !iso.is_file() {
         bail!("installer image is missing: {}", iso.display());
     }
-    fs::create_dir_all(support)
-        .map_err(|err| anyhow!("cannot create {}: {err}", support.display()))?;
     let key = read_key(&support.join("ssh").join(AUTHORIZED))?;
-    write_boot(iso, &support.join(BOOT), &key)
+    write_boot(iso, &installer_dir(support)?.join(BOOT), &key)
 }
 
 /// Writes the answer disk, the empty guest disk, and the boot ISO.
@@ -904,7 +908,7 @@ mod tests {
         fs::write(dir.join("ssh").join(AUTHORIZED), PUB).unwrap();
         let (_, patched) = prepare(&iso, &dir).unwrap();
         assert!(patched);
-        let boot = fs::read(dir.join(BOOT)).unwrap();
+        let boot = fs::read(dir.join(DIR).join(BOOT)).unwrap();
         assert_eq!(fs::read(&iso).unwrap(), installer_iso());
         let menu = &boot[29 * 2048..30 * 2048];
         let text = String::from_utf8_lossy(menu);
@@ -927,7 +931,7 @@ mod tests {
         assert!(cpio.windows(PUB.len()).any(|w| w == PUB.as_bytes()));
         let (_, again) = prepare(&iso, &dir).unwrap();
         assert!(!again);
-        assert_eq!(fs::read(dir.join(BOOT)).unwrap(), boot);
+        assert_eq!(fs::read(dir.join(DIR).join(BOOT)).unwrap(), boot);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -983,8 +987,10 @@ menuentry 'Graphical install' {
         assert_eq!(prepared.disk, dir.join("machines/debian").join(DISK));
         assert_eq!(prepared.disk.metadata().unwrap().len(), GUEST);
         assert_eq!(prepared.key, dir.join("ssh").join(AUTHORIZED));
-        assert!(dir.join(FILE).is_file());
-        assert_eq!(fs::read(dir.join(BOOT)).unwrap(), b"iso");
+        assert!(dir.join(DIR).join(FILE).is_file());
+        assert_eq!(fs::read(dir.join(DIR).join(BOOT)).unwrap(), b"iso");
+        assert!(!dir.join(FILE).exists());
+        assert!(!dir.join(BOOT).exists());
         assert!(!dir.join("cache").join(FILE).exists());
         assert!(!dir.join("cache").join(BOOT).exists());
         let (_, again) = prepare(&iso, &dir).unwrap();

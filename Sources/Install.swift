@@ -4,29 +4,31 @@ import Virtualization
 /// The screen after the download. The installer installs Debian onto `disk.img`.
 /// A finished preseed powers the guest off. SSH login, not the installer screen, is the finish check.
 /// This view then snapshots that disk so later machines are clones.
-/// Setup is the third page of this wizard. It lists the installer rows, with a small thumbnail instead of the ISO bar.
-/// The button beside that thumbnail opens the guest in a new window. That window does not capture the mouse or the keyboard.
+/// Quick start is one page. This view stays mounted so the guest keeps running, and its rows are not drawn there.
+/// The top slot is the download bar, then this guest once install starts. The same switch is on both screens.
 /// Reopening Quick start boots a written disk alone, then checks SSH. It does not attach the installer or a pointer.
 /// A saved snapshot is the finished install. Reopening that disk does not start the installer virtual machine.
-/// That page does not show the installer preview or the Show installer button. Nothing is installing.
+/// That page shows the download bar slot empty. Nothing is installing.
 /// A partition table is not a finished login. Quick start never attaches a pointer, so neither view can capture the cursor.
 struct Install: View {
     let iso: String
     let disk: String
     var fromSnapshot = false
-    /// Wizard Back and Next. A clone window does not get them. The guest keeps running.
-    var onBack: (() -> Void)? = nil
-    var onForward: (() -> Void)? = nil
+    /// Quick start keeps this view mounted and draws the steps itself. A clone window draws them here.
+    var embedded = false
+    var steps: Binding<[WizardStep]>? = nil
+    var missingFile: Binding<String?>? = nil
     @StateObject private var guest: GuestSession
     @State private var folderError: String?
     @Environment(\.openWindow) private var openWindow
 
-    init(iso: String, disk: String, fromSnapshot: Bool = false, onBack: (() -> Void)? = nil, onForward: (() -> Void)? = nil) {
+    init(iso: String, disk: String, fromSnapshot: Bool = false, embedded: Bool = false, steps: Binding<[WizardStep]>? = nil) {
         self.iso = iso
         self.disk = disk
         self.fromSnapshot = fromSnapshot
-        self.onBack = onBack
-        self.onForward = onForward
+        self.embedded = embedded
+        self.steps = steps
+        self.missingFile = missingFile
         let loggedIn = fromSnapshot || GuestSSH.loggedIn(beside: URL(fileURLWithPath: disk))
         let written = loggedIn || InstalledDisk.looksInstalled(disk)
         // The installer disk is machines/debian. A snapshot finishes that VM only while this disk is still the installed one.
@@ -38,9 +40,9 @@ struct Install: View {
     /// Quick start stays the download-sized wizard. A clone is the machine window.
     private var setup: Bool { !fromSnapshot }
 
-    /// The thumbnail and Show installer button are only while this guest is still installing.
-    /// A saved snapshot does not install again, so the wizard does not show them.
-    private var showsInstaller: Bool { setup && !guest.snapshotReady }
+    /// The guest replaces the download bar while this install is still running.
+    /// A saved snapshot does not install again, so the bar slot stays empty.
+    private var showsGuest: Bool { setup && !guest.snapshotReady }
 
     /// A clone captures. Quick start does not, including the installer window opened from the thumbnail.
     private var capturePointer: Bool { fromSnapshot }
@@ -48,13 +50,13 @@ struct Install: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
             header
-            if showsInstaller {
-                popupButton
+            if showsGuest && !embedded {
+                guestTop
             } else if !setup {
                 guestScreen
                     .frame(width: 800, height: 500)
             }
-            if setup { stepList }
+            if setup && !embedded { stepList }
             Text(disk)
                 .font(.caption)
                 .foregroundStyle(.tertiary)
@@ -71,15 +73,7 @@ struct Install: View {
         .padding(24)
         .frame(width: setup ? 440 : 848, alignment: .topLeading)
         .background {
-            // A Window in the view body is a separate window. Closing it does not stop the guest.
-            if showsInstaller {
-                InstallerWindow(guest: guest, presented: $guest.showWindow) {
-                    GuestMirror(session: guest)
-                        .frame(width: 800, height: 500)
-                        .background(.black, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-                        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-                }
-            }
+            // Quick start draws this same guest in the bar slot. The hidden copy does not draw a second one.
         }
         .task {
             while !Task.isCancelled {
@@ -88,6 +82,10 @@ struct Install: View {
             }
         }
         .onAppear {
+            if let steps {
+                guest.steps = steps
+            }
+            guest.missingFile = missingFile
             // A saved snapshot means the installer already shut down. Leave that VM stopped.
             // A clone, a login, or a disk the installer already partitioned boots alone.
             // Quick start still does not attach a pointer, so the installer window cannot capture the host cursor.
@@ -100,7 +98,6 @@ struct Install: View {
             }
         }
         .onDisappear {
-            guest.showWindow = false
             guest.stop()
         }
     }
@@ -115,35 +112,31 @@ struct Install: View {
         }
     }
 
-    /// The guest, where the download page draws the ISO bar. Setup opens it in its own window.
-    private var guestScreen: some View {
+/// The guest in the slot the download page uses for the ISO bar.
+/// Quick start and the setup page share one session, so both screens show the same guest.
+struct InstallGuest: View {
+    let iso: String
+    let disk: String
+
+    var body: some View {
+        Install(iso: iso, disk: disk)
+            .frame(height: 220)
+    }
+}
         GuestView(session: guest, capture: capturePointer)
             .background(.black, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
             .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
     }
 
-    /// Same slot as the ISO progress. A small live thumbnail, and a button that opens the guest in a new window.
-    /// Shown only while this guest is still installing. A saved snapshot does not install again, so neither is shown.
-    /// That window does not capture the pointer or the keyboard. Quick start never attaches a pointer either.
-    /// The guest view can only be in one place, so the thumbnail holds it until the window opens.
-    private var popupButton: some View {
-        HStack(alignment: .center, spacing: 12) {
-            Group {
-                guestScreen
-            }
-            .frame(width: 160, height: 100)
-            .background(.black, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-            .allowsHitTesting(false)
-            Spacer(minLength: 0)
-            Button("Show installer") { guest.showWindow = true }
-                .buttonStyle(.bordered)
-                .disabled(guest.showWindow)
-        }
-        .frame(height: 100)
+    /// Same slot as the ISO progress. The guest replaces the bar while install is running.
+    /// A saved snapshot does not install again, so this slot is empty. Quick start never attaches a pointer.
+    private var guestTop: some View {
+        guestScreen
+            .frame(maxWidth: .infinity)
+            .frame(height: 220)
     }
 
-    /// Installer rows only. Prepare is the previous page.
+    /// Installer rows. A clone window is not this wizard.
     private var stepList: some View {
         let shown = guest.setupSteps
         return VStack(spacing: 0) {
@@ -157,14 +150,8 @@ struct Install: View {
 
     private var actions: some View {
         HStack {
-            if setup {
+            if setup && !embedded {
                 Button("Open folder") { folderError = SupportDir.open() }.buttonStyle(.bordered)
-            }
-            if setup, let onBack {
-                Button("Back", action: onBack).buttonStyle(.bordered)
-            }
-            if setup, let onForward {
-                Button("Next", action: onForward).buttonStyle(.bordered)
             }
             Spacer(minLength: 12)
             if guest.stopped {
@@ -250,9 +237,13 @@ final class GuestSession: NSObject, ObservableObject, VZVirtualMachineDelegate {
     @Published var loggedIn: Bool
     @Published var stopped = false
     @Published var snapshotReady = false
-    @Published var cloning = false
     @Published var showWindow = false
+    @Published var cloning = false
     @Published var setupSteps = WizardStep.setup
+    /// Quick start passes its own list. A clone keeps the rows on this session.
+    var steps: Binding<[WizardStep]>?
+    /// A removed installer file. Quick start restarts the download step that writes it.
+    var missingFile: Binding<String?>?
     let view = InstallScreen()
     private var machine: VZVirtualMachine?
     private var diskURL: URL?
@@ -286,7 +277,7 @@ final class GuestSession: NSObject, ObservableObject, VZVirtualMachineDelegate {
             markSetup("installer", state: "done", detail: nil)
             markSetup("partition", state: "done", detail: "Installed")
             markSetup("ssh", state: "done", detail: "debian")
-            markSetup("snapshot", state: "done", detail: "Saved")
+            markSetup("snapshot", state: "done", detail: SupportDir.snapshotLocation)
         }
     }
 
@@ -307,7 +298,7 @@ final class GuestSession: NSObject, ObservableObject, VZVirtualMachineDelegate {
         markSetup("installer", state: "done", detail: nil)
         markSetup("partition", state: "done", detail: "Installed")
         markSetup("ssh", state: "done", detail: "debian")
-        markSetup("snapshot", state: "done", detail: "Saved")
+        markSetup("snapshot", state: "done", detail: SupportDir.snapshotLocation)
     }
 
     func start(iso: String, disk: String) {
@@ -337,11 +328,13 @@ final class GuestSession: NSObject, ObservableObject, VZVirtualMachineDelegate {
         setupSteps = WizardStep.setup
         markSetup("installer", state: "now", detail: "boot.iso")
         headline = "Starting the installer."
-        let support = URL(fileURLWithPath: iso).deletingLastPathComponent().deletingLastPathComponent()
-        let installer = support.appendingPathComponent("boot.iso")
-        let preseed = support.appendingPathComponent("preseed.img")
+        let installer = URL(fileURLWithPath: iso).deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("installer", isDirectory: true)
         boot {
-            try Guest.boot(iso: installer, preseed: preseed, disk: diskURL!)
+            try Guest.boot(
+                iso: installer.appendingPathComponent("boot.iso"),
+                preseed: installer.appendingPathComponent("preseed.img"),
+                disk: diskURL!
+            )
         }
     }
 
@@ -452,11 +445,11 @@ final class GuestSession: NSObject, ObservableObject, VZVirtualMachineDelegate {
             return
         }
         headline = "SSH login succeeded. Saving a snapshot."
-        markSetup("snapshot", state: "now", detail: "snapshots/debian")
+        markSetup("snapshot", state: "now", detail: SupportDir.snapshotLocation)
         saveSnapshot()
     }
 
-    /// A step's file disappeared. Run that step again. The download wizard handles its own files.
+    /// A step's file disappeared. Run that step again, including while the installer is still going.
     func noteMissingFiles() {
         guard !leaving, let disk = diskURL else { return }
         if !FileManager.default.fileExists(atPath: disk.path) {
@@ -465,10 +458,21 @@ final class GuestSession: NSObject, ObservableObject, VZVirtualMachineDelegate {
                 headline = "The virtual machine did not start."
                 stopped = true
                 machine?.stop { _ in }
+            } else if !fromSnapshotBoot, missingFile?.wrappedValue == nil, setupSteps.first(where: { $0.id == "installer" })?.state == "done" {
+                missingFile?.wrappedValue = "disk"
             }
             return
         }
         if fromSnapshotBoot { return }
+        let installer = disk.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("installer", isDirectory: true)
+        if !FileManager.default.fileExists(atPath: installer.appendingPathComponent("boot.iso").path) {
+            if missingFile?.wrappedValue == nil { missingFile?.wrappedValue = "patch" }
+            return
+        }
+        if !FileManager.default.fileExists(atPath: installer.appendingPathComponent("preseed.img").path) {
+            if missingFile?.wrappedValue == nil { missingFile?.wrappedValue = "preseed" }
+            return
+        }
         let proof = GuestSSH.loggedIn(beside: disk)
         let snap = SupportDir.snapshotReady
         if snapshotReady && !snap {
@@ -476,11 +480,11 @@ final class GuestSession: NSObject, ObservableObject, VZVirtualMachineDelegate {
             saved = false
             showWindow = false
             if proof {
-                markSetup("snapshot", state: "now", detail: "snapshots/debian")
+                markSetup("snapshot", state: "now", detail: SupportDir.snapshotLocation)
                 headline = "SSH login succeeded. Saving a snapshot."
                 saveSnapshot()
             } else {
-                markSetup("snapshot", state: "wait", detail: "snapshots/debian")
+                markSetup("snapshot", state: "wait", detail: SupportDir.snapshotLocation)
                 headline = "The snapshot was removed."
             }
         }
@@ -499,6 +503,8 @@ final class GuestSession: NSObject, ObservableObject, VZVirtualMachineDelegate {
                 watchSSH()
             }
         }
+    }
+
     }
 
     private func noteStopped() {
@@ -527,7 +533,7 @@ final class GuestSession: NSObject, ObservableObject, VZVirtualMachineDelegate {
                 return
             }
             headline = "SSH login succeeded. Saving a snapshot."
-            markSetup("snapshot", state: "now", detail: "snapshots/debian")
+            markSetup("snapshot", state: "now", detail: SupportDir.snapshotLocation)
             saveSnapshot()
             return
         }
@@ -560,7 +566,7 @@ final class GuestSession: NSObject, ObservableObject, VZVirtualMachineDelegate {
                     self.failSetup()
                     self.headline = "Debian shut down, but the snapshot was not saved."
                 } else {
-                    self.markSetup("snapshot", state: "done", detail: "Saved")
+                    self.markSetup("snapshot", state: "done", detail: SupportDir.snapshotLocation)
                     self.showWindow = false
                     self.snapshotReady = true
                     self.headline = "Debian is installed and shut down. A snapshot is saved for new machines."
@@ -632,6 +638,14 @@ final class GuestSession: NSObject, ObservableObject, VZVirtualMachineDelegate {
             for earlier in setupSteps.indices where earlier < index && setupSteps[earlier].state != "done" && setupSteps[earlier].state != "fail" {
                 setupSteps[earlier].state = "done"
             }
+        }
+        if let steps {
+            var list = steps.wrappedValue
+            for row in setupSteps {
+                guard let at = list.firstIndex(where: { $0.id == row.id }) else { continue }
+                list[at] = row
+            }
+            steps.wrappedValue = list
         }
     }
 
