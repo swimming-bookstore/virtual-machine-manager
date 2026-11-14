@@ -16,7 +16,7 @@ struct WizardStep: Identifiable {
         WizardStep(id: "verify", title: "Verify checksum", detail: "SHA512SUMS", state: "wait"),
     ]
 
-    /// The second page keeps the download list and adds the preseed and patch rows.
+    /// Page two is only these rows. The download list stays on the first page.
     static let preseed = [
         WizardStep(id: "preseed", title: "Prepare preseed disk", detail: "preseed.img", state: "wait"),
         WizardStep(id: "patch", title: "Patch the installer", detail: "boot.iso", state: "wait"),
@@ -56,6 +56,8 @@ struct WorkerEvent: Decodable {
 final class Wizard: ObservableObject {
     @Published var steps = WizardStep.initial
     @Published var page = 0
+    /// Set when the user leaves the page the worker is on. Events do not pull them back.
+    private var pinned = false
     @Published var received = 0.0
     @Published var total = 0.0
     @Published var headline: String?
@@ -161,6 +163,7 @@ final class Wizard: ObservableObject {
         buffer.removeAll()
         steps = WizardStep.initial
         page = 0
+        pinned = false
         received = 0
         total = 0
         downloading = false
@@ -236,6 +239,7 @@ final class Wizard: ObservableObject {
             steps[index].state = "wait"
             steps[index].detail = "Cancelled"
         }
+        follow()
     }
 
     private func consume(_ data: Data) {
@@ -274,6 +278,7 @@ final class Wizard: ObservableObject {
                 if let path = event.path { watch((path as NSString).deletingLastPathComponent) }
                 if let disk = event.disk { watchDisk(disk) }
             }
+            follow()
         case "error":
             error = event.detail ?? "Download failed."
             headline = "Download failed"
@@ -282,21 +287,60 @@ final class Wizard: ObservableObject {
             } else {
                 failCurrent()
             }
+            follow()
         default:
             break
         }
     }
 
+    /// Remember preseed and patch. They stay off the download page.
     private func showPreseed() {
-        if page == 1 { return }
-        page = 1
-        // Same list as the first page. The finished download rows stay, then preseed and patch.
-        var next = steps.filter { $0.id != "preseed" && $0.id != "patch" }
-        for earlier in next.indices where next[earlier].state != "fail" {
-            next[earlier].state = "done"
+        guard !steps.contains(where: { $0.id == "preseed" }) else { return }
+        for earlier in steps.indices where steps[earlier].state != "fail" {
+            steps[earlier].state = "done"
         }
-        next.append(contentsOf: WizardStep.preseed)
-        steps = next
+        steps.append(contentsOf: WizardStep.preseed)
+    }
+
+    /// The page the worker has reached. Setup is only after the image is ready.
+    private var latest: Int {
+        if error == nil, readyPath != nil, diskPath != nil { return 2 }
+        if preseedReached { return 1 }
+        return 0
+    }
+
+    private var preseedReached: Bool {
+        steps.contains { ($0.id == "preseed" || $0.id == "patch") && $0.state != "wait" }
+    }
+
+    /// Move to the worker's page unless the user is looking at another one.
+    private func follow() {
+        if page > latest {
+            page = latest
+            pinned = false
+        }
+        if !pinned { page = latest }
+    }
+
+    func back() {
+        guard page > 0 else { return }
+        page -= 1
+        pinned = true
+    }
+
+    func forward() {
+        guard page < latest else { return }
+        page += 1
+        pinned = page != latest
+    }
+
+    var canGoBack: Bool { page > 0 }
+    var canGoForward: Bool { page < latest }
+
+    /// Rows for the page on screen. Page two does not repeat the download list.
+    var visibleSteps: [WizardStep] {
+        let ids = page == 1 ? ["preseed", "patch"] : ["key", "sums", "sign", "check", "download", "verify"]
+        return ids.compactMap { id in steps.first { $0.id == id } }
     }
 
     private func applyState(_ id: String, state: String, detail: String?) {
@@ -439,11 +483,17 @@ struct QuickStart: View {
     @State private var folderError: String?
 
     var body: some View {
-        Group {
+        // Install stays mounted after the image is ready, so Back does not stop the guest.
+        ZStack(alignment: .topLeading) {
             if let iso = wizard.readyPath, let disk = wizard.diskPath, wizard.error == nil {
-                Install(iso: iso, disk: disk)
-            } else {
+                Install(iso: iso, disk: disk, onBack: { wizard.back() })
+                    .opacity(wizard.page == 2 ? 1 : 0)
+                    .allowsHitTesting(wizard.page == 2)
+                    .accessibilityHidden(wizard.page != 2)
+            }
+            if wizard.page != 2 {
                 download
+                    .background(.background)
             }
         }
         .onAppear(perform: wizard.start)
@@ -465,9 +515,10 @@ struct QuickStart: View {
             }
             progress
             VStack(spacing: 0) {
-                ForEach(wizard.steps) { step in
+                let shown = wizard.visibleSteps
+                ForEach(shown) { step in
                     row(step).id(step.id + step.state + step.detail)
-                    if step.id != wizard.steps.last?.id { Divider().padding(.leading, 42) }
+                    if step.id != shown.last?.id { Divider().padding(.leading, 42) }
                 }
             }
             .background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
@@ -480,6 +531,12 @@ struct QuickStart: View {
             HStack {
                 Button("Open cache folder") { folderError = CacheFolder.open() }.buttonStyle(.bordered)
                 Spacer(minLength: 12)
+                if wizard.canGoBack {
+                    Button("Back", action: wizard.back).buttonStyle(.bordered)
+                }
+                if wizard.canGoForward {
+                    Button("Next", action: wizard.forward).buttonStyle(.bordered)
+                }
                 if wizard.error != nil || wizard.cancelled {
                     Button("Try again", action: wizard.retry).buttonStyle(.borderedProminent)
                 } else if wizard.readyPath == nil {

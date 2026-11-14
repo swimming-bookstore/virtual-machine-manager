@@ -535,8 +535,50 @@ fn quick_start_checks_the_signature_before_the_iso() {
         screen.disk_path.as_deref(),
         Some(dir.join("machines/debian/disk.img").to_str().unwrap())
     );
-    assert_eq!(screen.page, 1);
+    assert_eq!(screen.page, 2);
     assert_eq!(screen.steps.len(), 8);
+    assert!(screen.visible_ids().is_empty(), "setup is not the preseed list");
+    let patch_now = events
+        .iter()
+        .position(|event| {
+            event["event"] == "step" && event["step"] == "patch" && event["state"] == "now"
+        })
+        .unwrap();
+    let mut mid = drive(&events[..=patch_now]);
+    assert_eq!(mid.page, 1);
+    assert_eq!(mid.visible_ids(), ["preseed", "patch"]);
+    assert_eq!(mid.row("patch").state, "now");
+    assert_eq!(mid.buttons(), ["Open cache folder", "Back", "Cancel"]);
+    mid.back();
+    assert_eq!(mid.page, 0);
+    assert!(mid.pinned);
+    assert_eq!(
+        mid.visible_ids(),
+        ["key", "sums", "sign", "check", "download", "verify"]
+    );
+    assert_eq!(mid.buttons(), ["Open cache folder", "Next", "Cancel"]);
+    for event in &events[patch_now + 1..] {
+        mid.apply(event);
+    }
+    assert_eq!(mid.page, 0, "a pinned page stays put when the worker moves on");
+    assert!(mid.installing());
+    assert_eq!(mid.buttons(), ["Open cache folder", "Next"]);
+    mid.forward();
+    assert_eq!(mid.page, 1);
+    assert_eq!(mid.visible_ids(), ["preseed", "patch"]);
+    assert_eq!(mid.row("patch").detail, "boot.iso");
+    assert_eq!(mid.buttons(), ["Open cache folder", "Back", "Next"]);
+    mid.forward();
+    assert_eq!(mid.page, 2);
+    assert!(!mid.pinned);
+    assert_eq!(mid.buttons(), [] as [&str; 0]);
+    mid.back();
+    assert_eq!(mid.page, 1);
+    mid.back();
+    assert_eq!(mid.page, 0);
+    mid.forward();
+    mid.forward();
+    assert_eq!(mid.page, 2);
     assert_eq!(screen.row("download").state, "done");
     assert_eq!(screen.row("verify").state, "done");
     assert_eq!(screen.row("preseed").state, "done");
@@ -547,7 +589,7 @@ fn quick_start_checks_the_signature_before_the_iso() {
     let setup = open_setup(&screen, &dir);
     assert_eq!(setup.title, "Debian setup");
     assert!(setup.shows_installer());
-    assert_eq!(setup.buttons(), ["Show installer"]);
+    assert_eq!(setup.buttons(), ["Back", "Show installer"]);
     assert_eq!(setup.row("installer").state, "now");
     assert!(!setup.captures_pointer());
     assert!(dir.join("cache/preseed.img").is_file());
@@ -577,17 +619,21 @@ fn quick_start_checks_the_signature_before_the_iso() {
     assert!(events
         .iter()
         .any(|e| e["event"] == "progress" && e["step"] == "verify"));
-    let cached = finish(&events, status);
+    let mut cached = finish(&events, status);
     assert!(!cached.bar_visible());
     assert_eq!(cached.received, 0.0);
     assert_eq!(cached.total, 0.0);
     assert_eq!(cached.bytes_label(), "");
     assert_eq!(cached.ready_path.as_deref(), Some(iso_path(&dir).as_str()));
     assert!(cached.installing());
+    assert_eq!(cached.page, 2);
+    assert_eq!(cached.buttons(), [] as [&str; 0]);
+    cached.back();
     assert_eq!(cached.page, 1);
+    assert_eq!(cached.visible_ids(), ["preseed", "patch"]);
     assert_eq!(cached.row("preseed").state, "done");
     assert_eq!(cached.row("patch").detail, "Already patched");
-    assert_eq!(cached.buttons(), [] as [&str; 0]);
+    assert_eq!(cached.buttons(), ["Open cache folder", "Back", "Next"]);
     let setup = open_setup(&cached, &dir);
     assert!(setup.shows_installer());
     assert_eq!(setup.row("installer").state, "now");
@@ -783,6 +829,7 @@ struct Screen {
     started: bool,
     running: bool,
     page: i32,
+    pinned: bool,
 }
 
 fn iso_glob() -> &'static str {
@@ -861,6 +908,7 @@ impl Screen {
             started: false,
             running: false,
             page: 0,
+            pinned: false,
         }
     }
 
@@ -908,6 +956,7 @@ impl Screen {
             step.state = "wait".into();
             step.detail = "Cancelled".into();
         }
+        self.follow();
     }
 
     fn worker_exited(&mut self, status: i32) {
@@ -965,6 +1014,7 @@ impl Screen {
                         self.received = self.total;
                     }
                 }
+                self.follow();
             }
             "error" => {
                 let detail = event["detail"].as_str();
@@ -973,22 +1023,23 @@ impl Screen {
                 if let Some(id) = step {
                     if self.steps.iter().any(|row| row.id == id) {
                         self.apply_state(id, "fail", detail);
-                        return;
+                    } else {
+                        self.fail_current();
                     }
+                } else {
+                    self.fail_current();
                 }
-                self.fail_current();
+                self.follow();
             }
             _ => {}
         }
     }
 
     fn show_preseed(&mut self) {
-        if self.page == 1 {
+        if self.steps.iter().any(|step| step.id == "preseed") {
             return;
         }
-        self.page = 1;
-        // Same list as the first page. The finished download rows stay, then preseed and patch.
-        self.steps.retain(|step| step.id != "preseed" && step.id != "patch");
+        // Page two is only these rows. The download list stays on the first page.
         for step in &mut self.steps {
             if step.state != "fail" {
                 step.state = "done".into();
@@ -1008,6 +1059,66 @@ impl Screen {
                 state: "wait".into(),
             },
         ]);
+    }
+
+    fn preseed_reached(&self) -> bool {
+        self.steps.iter().any(|step| {
+            (step.id == "preseed" || step.id == "patch") && step.state != "wait"
+        })
+    }
+
+    fn latest(&self) -> i32 {
+        if self.error.is_none() && self.ready_path.is_some() && self.disk_path.is_some() {
+            2
+        } else if self.preseed_reached() {
+            1
+        } else {
+            0
+        }
+    }
+
+    fn follow(&mut self) {
+        if self.page > self.latest() {
+            self.page = self.latest();
+            self.pinned = false;
+        }
+        if !self.pinned {
+            self.page = self.latest();
+        }
+    }
+
+    fn back(&mut self) {
+        if self.page > 0 {
+            self.page -= 1;
+            self.pinned = true;
+        }
+    }
+
+    fn forward(&mut self) {
+        if self.page < self.latest() {
+            self.page += 1;
+            self.pinned = self.page != self.latest();
+        }
+    }
+
+    fn can_go_back(&self) -> bool {
+        self.page > 0
+    }
+
+    fn can_go_forward(&self) -> bool {
+        self.page < self.latest()
+    }
+
+    fn visible_ids(&self) -> Vec<&'static str> {
+        let ids: &[&str] = match self.page {
+            0 => &["key", "sums", "sign", "check", "download", "verify"],
+            1 => &["preseed", "patch"],
+            _ => &[],
+        };
+        ids.iter()
+            .copied()
+            .filter(|id| self.steps.iter().any(|step| step.id == *id))
+            .collect()
     }
 
     fn apply_state(&mut self, id: &str, state: &str, detail: Option<&str>) {
@@ -1094,10 +1205,17 @@ impl Screen {
     }
 
     fn buttons(&self) -> Vec<&'static str> {
-        if self.installing() {
+        // Page three is Debian setup. Its buttons are not this row.
+        if self.page == 2 {
             return vec![];
         }
         let mut buttons = vec!["Open cache folder"];
+        if self.can_go_back() {
+            buttons.push("Back");
+        }
+        if self.can_go_forward() {
+            buttons.push("Next");
+        }
         if self.error.is_some() || self.cancelled {
             buttons.push("Try again");
         } else if self.ready_path.is_none() {
@@ -1274,7 +1392,7 @@ fn snapshot_waits_for_ssh_then_clones() {
         installed.headline.as_deref(),
         Some("Debian is installed and shut down. A snapshot is saved for new machines.")
     );
-    assert_eq!(installed.buttons(), ["New virtual machine"]);
+    assert_eq!(installed.buttons(), ["Back", "New virtual machine"]);
     assert!(!installed.shows_installer, "a saved snapshot hides the thumbnail");
     assert_eq!(installed.row("snapshot").state, "done");
     assert_eq!(installed.row("ssh").detail, "debian");
@@ -1405,10 +1523,10 @@ impl Installed {
     }
 
     fn buttons(&self) -> Vec<&'static str> {
+        let mut buttons = vec!["Back"];
         if !self.stopped {
-            return vec![];
+            return buttons;
         }
-        let mut buttons = Vec::new();
         if !self.snapshot_ready {
             buttons.push("Start Debian");
         } else {
@@ -1883,7 +2001,7 @@ fn the_download_bar_shows_when_the_iso_step_starts() {
             byte_count(ISO.len() as f64)
         )
     );
-    assert_eq!(screen.page, 1);
+    assert_eq!(screen.page, 2);
     assert_eq!(screen.row("preseed").state, "done");
     assert_eq!(screen.ready_path.as_deref(), Some(iso_path(&dir).as_str()));
     assert!(screen.installing());
@@ -2098,8 +2216,10 @@ fn a_cached_iso_does_not_show_the_download_bar() {
     assert_eq!(screen.bytes_label(), "");
     assert_eq!(screen.ready_path.as_deref(), Some(iso_path(&dir).as_str()));
     assert!(screen.installing());
-    assert_eq!(screen.page, 1);
+    assert_eq!(screen.page, 2);
     assert_eq!(screen.row("preseed").state, "done");
+    screen.back();
+    assert_eq!(screen.visible_ids(), ["preseed", "patch"]);
 }
 
 /// Reopen is a new process. The ISO is cached, so the worker is fast, then the window
@@ -2356,6 +2476,9 @@ impl Setup {
 
     fn buttons(&self) -> Vec<&'static str> {
         let mut buttons = Vec::new();
+        if !self.from_snapshot {
+            buttons.push("Back");
+        }
         if self.shows_installer() {
             buttons.push("Show installer");
         }
@@ -2429,11 +2552,11 @@ fn the_setup_page_hides_the_installer_once_the_snapshot_is_saved() {
     assert_eq!(setup.title, "Debian setup");
     assert!(setup.shows_installer());
     assert!(!setup.captures_pointer());
-    assert_eq!(setup.buttons(), ["Show installer"]);
+    assert_eq!(setup.buttons(), ["Back", "Show installer"]);
     assert_eq!(setup.row("installer").state, "now");
     assert_eq!(setup.row("partition").state, "wait");
     setup.show_window = true;
-    assert_eq!(setup.buttons(), ["Show installer"]);
+    assert_eq!(setup.buttons(), ["Back", "Show installer"]);
 
     let disk = dir.join("machines/debian/disk.img");
     let mut file = std::fs::OpenOptions::new().write(true).open(&disk).unwrap();
@@ -2449,14 +2572,14 @@ fn the_setup_page_hides_the_installer_once_the_snapshot_is_saved() {
     assert!(written.shows_installer());
     assert!(written.checking);
     assert!(!written.stopped);
-    assert_eq!(written.buttons(), ["Show installer"]);
+    assert_eq!(written.buttons(), ["Back", "Show installer"]);
 
     std::fs::write(dir.join("ssh/logged-in"), b"debian ok\n").unwrap();
     let saved = cli(&["snapshot", "--dir", dir.to_str().unwrap()]);
     assert!(saved.status.success(), "{}", String::from_utf8_lossy(&saved.stdout));
     let done = finish_install(&saved.stdout);
     assert!(!done.shows_installer);
-    assert_eq!(done.buttons(), ["New virtual machine"]);
+    assert_eq!(done.buttons(), ["Back", "New virtual machine"]);
     assert_eq!(done.row("installer").state, "done");
     assert_eq!(done.row("snapshot").detail, "Saved");
     let reopened = open_setup(&screen, &dir);
@@ -2464,7 +2587,7 @@ fn the_setup_page_hides_the_installer_once_the_snapshot_is_saved() {
     assert!(!reopened.shows_installer());
     assert!(!reopened.checking);
     assert!(reopened.stopped);
-    assert_eq!(reopened.buttons(), ["New virtual machine"]);
+    assert_eq!(reopened.buttons(), ["Back", "New virtual machine"]);
     assert_eq!(
         reopened.headline.as_deref(),
         Some("Debian is installed and shut down. A snapshot is saved for new machines.")
@@ -2554,6 +2677,11 @@ fn quick_start_swift_gates_the_bar_on_a_real_download() {
     assert!(src.contains("if wizard.page == 0 && wizard.downloading {"));
     assert!(src.contains("if event.step == \"preseed\" || event.step == \"patch\" { showPreseed() }"));
     assert!(src.contains("wizard.page == 1 ? \"Preseed\""));
+    assert!(src.contains("page == 1 ? [\"preseed\", \"patch\"]"));
+    assert!(src.contains(".opacity(wizard.page == 2 ? 1 : 0)"));
+    assert!(src.contains("Button(\"Back\", action: wizard.back)"));
+    assert!(src.contains("Button(\"Next\", action: wizard.forward)"));
+    assert!(include_str!("../Sources/Install.swift").contains("Button(\"Back\", action: onBack)"));
     assert!(src.contains("static let preseed"));
     assert!(include_str!("../Sources/Install.swift").contains("Debian setup"));
     assert!(include_str!("../Sources/Install.swift").contains("Show installer"));

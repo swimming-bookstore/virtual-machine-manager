@@ -14,13 +14,16 @@ struct Install: View {
     let iso: String
     let disk: String
     var fromSnapshot = false
+    /// Wizard Back. A clone window does not get one. The guest keeps running.
+    var onBack: (() -> Void)? = nil
     @StateObject private var guest: GuestSession
     @Environment(\.openWindow) private var openWindow
 
-    init(iso: String, disk: String, fromSnapshot: Bool = false) {
+    init(iso: String, disk: String, fromSnapshot: Bool = false, onBack: (() -> Void)? = nil) {
         self.iso = iso
         self.disk = disk
         self.fromSnapshot = fromSnapshot
+        self.onBack = onBack
         let loggedIn = fromSnapshot || GuestSSH.loggedIn(beside: URL(fileURLWithPath: disk))
         let written = loggedIn || InstalledDisk.looksInstalled(disk)
         // The installer disk is machines/debian. Once snapshots/debian/ready exists, that VM is finished.
@@ -140,6 +143,9 @@ struct Install: View {
 
     private var actions: some View {
         HStack {
+            if setup, let onBack {
+                Button("Back", action: onBack).buttonStyle(.bordered)
+            }
             Spacer(minLength: 12)
             if guest.stopped {
                 // The installer disk is the snapshot source. Starting it again is not a machine the user runs.

@@ -392,7 +392,7 @@ fn finish(
     ssh::ensure(&support.join("ssh"))?;
     let (prepared, patched) = preseed::prepare(cache, dest, support)?;
     step("preseed", "done", preseed::FILE, order);
-    // The second page keeps the download list. Patch is the next row, after the copy is written.
+    // Page two is only preseed and patch. Patch is the row after the copy is written.
     step("patch", "now", preseed::BOOT, order);
     let patch_detail = if patched { preseed::BOOT } else { "Already patched" };
     step("patch", "done", patch_detail, order);
