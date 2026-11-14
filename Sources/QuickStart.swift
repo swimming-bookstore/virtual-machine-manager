@@ -40,7 +40,7 @@ struct WorkerEvent: Decodable {
     var total: Double?
     var path: String?
     var disk: String?
-    var marker: String?
+    var key: String?
 }
 
 final class Wizard: ObservableObject {

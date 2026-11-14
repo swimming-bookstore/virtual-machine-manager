@@ -2,7 +2,8 @@ import SwiftUI
 import Virtualization
 
 /// The screen after the download. The installer writes `disk.img`; that file is the installed system.
-/// A finished preseed powers the guest off. This view then snapshots that disk so later machines are clones.
+/// A finished preseed powers the guest off. SSH login, not the installer screen, is the finish check.
+/// This view then snapshots that disk so later machines are clones.
 struct Install: View {
     let iso: String
     let disk: String
@@ -99,9 +100,10 @@ final class GuestSession: NSObject, ObservableObject, VZVirtualMachineDelegate {
     private var started = false
     private var leaving = false
     private var installing = false
+    private var checking = false
     private var saved = false
     private var watch: Timer?
-    private var shutdown: DispatchWorkItem?
+    private var probing = false
 
     init(fromSnapshot: Bool = false) {
         installed = fromSnapshot
@@ -115,13 +117,15 @@ final class GuestSession: NSObject, ObservableObject, VZVirtualMachineDelegate {
         error = nil
         stopped = false
         diskURL = URL(fileURLWithPath: disk)
-        // Reopening Quick start must not boot the installer over a disk that already finished.
-        if InstallMarker.done(beside: diskURL!) {
+        // Reopening Quick start must not boot the installer over a disk SSH already reached.
+        if GuestSSH.loggedIn(beside: diskURL!) {
             installed = true
-            stopped = true
             installing = false
-            headline = "Debian is already installed. Saving a snapshot."
-            saveSnapshot()
+            checking = true
+            headline = "Debian is already installed. Checking SSH."
+            stopped = false
+            boot { try Guest.boot(disk: diskURL!) }
+            watchSSH()
             return
         }
         installing = true
@@ -129,7 +133,7 @@ final class GuestSession: NSObject, ObservableObject, VZVirtualMachineDelegate {
         let folder = URL(fileURLWithPath: iso).deletingLastPathComponent()
         let installer = folder.appendingPathComponent("boot.iso")
         let preseed = folder.appendingPathComponent("preseed.img")
-        watchMarker()
+        watchSSH()
         boot {
             try Guest.boot(iso: installer, preseed: preseed, disk: diskURL!)
         }
@@ -145,25 +149,27 @@ final class GuestSession: NSObject, ObservableObject, VZVirtualMachineDelegate {
         error = nil
         headline = "Starting Debian."
         boot { try Guest.boot(disk: diskURL!) }
+        watchSSH()
     }
 
     /// The installer powers off when the preseed check passes. The next start is the disk it wrote.
+/// A black installer screen is not finished. SSH after this boot is.
     func startInstalled() {
         guard let disk = diskURL else { return }
         error = nil
         stopped = false
         installed = true
         installing = false
+        checking = true
         watch?.invalidate()
-        shutdown?.cancel()
         machine = nil
         boot { try Guest.boot(disk: disk) }
+        watchSSH()
     }
 
     func stop() {
         leaving = true
         watch?.invalidate()
-        shutdown?.cancel()
         machine?.stop { _ in }
     }
 
@@ -175,50 +181,69 @@ final class GuestSession: NSObject, ObservableObject, VZVirtualMachineDelegate {
         DispatchQueue.main.async {
             let message = err.localizedDescription
             self.noteStopped()
-            if !self.snapshotReady && self.error == nil {
+            if !self.snapshotReady && self.error == nil && !self.checking {
                 self.fail(message)
             }
         }
     }
 
-    /// Late command has synced. Give the installer time to unmount, then power off if it did not.
-    private func watchMarker() {
+    /// A black installer screen is not finished. SSH after the installed disk boots is.
+    private func watchSSH() {
         watch?.invalidate()
-        watch = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
-            self?.checkMarker()
+        watch = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
+            self?.checkSSH()
         }
     }
 
-    private func checkMarker() {
-        guard installing, shutdown == nil, let disk = diskURL, InstallMarker.done(beside: disk) else { return }
-        headline = "Install finished. Shutting down."
-        let work = DispatchWorkItem { [weak self] in
-            guard let self, !self.stopped, self.machine?.state == .running else { return }
-            self.machine?.stop { _ in }
+    private func checkSSH() {
+        guard installed, checking, !snapshotReady, !probing, let disk = diskURL, machine?.state == .running else { return }
+        probing = true
+        let disk = disk
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let ok = GuestSSH.probe(beside: disk)
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.probing = false
+                if ok { self.loginSucceeded() }
+            }
         }
-        shutdown = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 45, execute: work)
+    }
+
+    private func loginSucceeded() {
+        guard installed, checking, !snapshotReady else { return }
+        headline = "SSH login succeeded. Saving a snapshot."
+        watch?.invalidate()
+        saveSnapshot()
     }
 
     private func noteStopped() {
         guard !leaving, !stopped else { return }
         stopped = true
         watch?.invalidate()
-        shutdown?.cancel()
         machine = nil
-        if installing, let disk = diskURL, InstallMarker.done(beside: disk) {
+        if installing {
             installing = false
             installed = true
-            headline = "Install finished. Saving a snapshot."
+            checking = true
+            headline = "Installer stopped. Starting Debian to check SSH."
+            startInstalled()
+            return
+        }
+        if checking, installed, let disk = diskURL, GuestSSH.loggedIn(beside: disk) {
+            headline = "SSH login succeeded. Saving a snapshot."
             saveSnapshot()
             return
         }
-        headline = installed
-            ? "Debian stopped. The guest disk is the installed system."
-            : "The installer stopped. The guest disk is the installed system."
+        headline = checking
+            ? "Debian stopped. Waiting to check SSH."
+            : "Debian stopped. The guest disk is the installed system."
     }
 
     func saveAgain() {
+        guard let disk = diskURL, GuestSSH.loggedIn(beside: disk) else {
+            error = "SSH has not logged in."
+            return
+        }
         saved = false
         error = nil
         headline = "Saving a snapshot."
@@ -226,7 +251,7 @@ final class GuestSession: NSObject, ObservableObject, VZVirtualMachineDelegate {
     }
 
     private func saveSnapshot() {
-        guard !saved, let disk = diskURL else { return }
+        guard !saved, let disk = diskURL, GuestSSH.loggedIn(beside: disk) else { return }
         saved = true
         let support = disk.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in

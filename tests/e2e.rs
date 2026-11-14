@@ -546,11 +546,12 @@ fn quick_start_checks_the_signature_before_the_iso() {
             .len(),
         16 * 1024 * 1024 * 1024
     );
-    let marker = dir.join("machines/debian/marker.img");
-    assert_eq!(std::fs::metadata(&marker).unwrap().len(), 1024 * 1024);
-    assert!(!std::fs::read(&marker).unwrap().windows(14).any(|w| w == b"vmm-install-ok"));
+    let key = dir.join("ssh/authorized_keys");
+    assert!(key.is_file(), "host key was not generated");
+    assert!(std::fs::read_to_string(&key).unwrap().contains("ssh-ed25519"));
+    assert!(!dir.join("machines/debian/marker.img").exists());
     let ready = events.iter().find(|e| e["event"] == "ready").unwrap();
-    assert_eq!(ready["marker"], marker.display().to_string());
+    assert_eq!(ready["key"], key.display().to_string());
     assert_eq!(screen.row("preseed").state, "done");
 
     let (status, events) = wait(spawn(&base, &dir));
@@ -1145,9 +1146,9 @@ fn iso_path(dir: &Path) -> String {
     dir.join("cache").join(iso_name()).display().to_string()
 }
 
-/// The installer is not run here. The worker still refuses a snapshot until the finish token and partition table exist.
+/// The installer is not run here. The worker still refuses a snapshot until SSH has logged in and the partition table exists.
 #[test]
-fn snapshot_waits_for_the_finish_token_then_clones() {
+fn snapshot_waits_for_ssh_then_clones() {
     let (base, _) = serve(SUMS, SIGN, ISO, KEY, false, false, false);
     let (status, events, dir) = run(&base);
     assert_eq!(status, 0, "{events:?}");
@@ -1157,8 +1158,8 @@ fn snapshot_waits_for_the_finish_token_then_clones() {
         screen.disk_path.as_deref(),
         Some(dir.join("machines/debian/disk.img").to_str().unwrap())
     );
-    let marker = dir.join("machines/debian/marker.img");
-    assert_eq!(std::fs::metadata(&marker).unwrap().len(), 1024 * 1024);
+    assert!(dir.join("ssh/id_ed25519").is_file());
+    assert!(dir.join("ssh/authorized_keys").is_file());
 
     let missing = cli(&["clone", "--dir", dir.to_str().unwrap()]);
     assert!(!missing.status.success());
@@ -1193,8 +1194,11 @@ fn snapshot_waits_for_the_finish_token_then_clones() {
     file.seek(SeekFrom::Start(4096)).unwrap();
     file.write_all(b"GUEST-BYTES!").unwrap();
     drop(file);
-    std::fs::write(&marker, b"vmm-install-ok").unwrap();
     std::fs::write(dir.join("machines/debian/nvram.bin"), b"efi").unwrap();
+    let refused = cli(&["snapshot", "--dir", dir.to_str().unwrap()]);
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stdout).contains("SSH has not logged in"));
+    std::fs::write(dir.join("ssh/logged-in"), b"debian ok\n").unwrap();
 
     let saved = cli(&["snapshot", "--dir", dir.to_str().unwrap()]);
     assert!(
@@ -1211,7 +1215,7 @@ fn snapshot_waits_for_the_finish_token_then_clones() {
     assert!(dir.join("snapshots/debian/ready").is_file());
     assert!(std::fs::read_to_string(dir.join("snapshots/debian/ready"))
         .unwrap()
-        .starts_with("vmm-install-ok"));
+        .starts_with("ssh-ok"));
     assert_eq!(
         std::fs::metadata(dir.join("snapshots/debian/disk.img"))
             .unwrap()
@@ -1981,9 +1985,10 @@ fn quick_start_swift_gates_the_bar_on_a_real_download() {
     assert!(src.contains("static let preseed"));
     assert!(include_str!("../Sources/Install.swift").contains("Installing Debian"));
     assert!(include_str!("../Sources/Install.swift").contains("guest.start(iso: iso, disk: disk)"));
-    assert!(include_str!("../Sources/Install.swift").contains("Install finished. Shutting down."));
+    assert!(include_str!("../Sources/Install.swift").contains("SSH login succeeded. Saving a snapshot."));
     assert!(include_str!("../Sources/Install.swift").contains("New virtual machine"));
-    assert!(include_str!("../Sources/Guest.swift").contains("marker.img"));
+    assert!(include_str!("../Sources/Guest.swift").contains("GuestSSH"));
+    assert!(include_str!("../Sources/Guest.swift").contains("2222"));
     assert!(include_str!("../Sources/QuickStart.swift").contains("[\"snapshot\", \"--dir\", dir.path]"));
     assert!(include_str!("../Sources/Welcome.swift").contains("New Debian"));
     assert!(include_str!("../Sources/App.swift").contains("id: \"debian\""));

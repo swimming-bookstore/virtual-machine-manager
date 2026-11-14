@@ -166,14 +166,14 @@ menuentry 'Install' {
     <div><strong>User</strong> account <span class="mono">debian</span>, root login off. The password is locked (<span class="mono">!</span>), so the install can finish unattended.</div>
     <div><strong>Disk</strong> one partition on <span class="mono">/dev/vda</span>, which is the virtio guest disk. GRUB is installed there too.</div>
     <div><strong>Packages</strong> tasksel does not run. The cdrom is not the apt source.</div>
-    <div><strong>Finish</strong> no media check. When Debian and GRUB are on disk, the installer writes a finish token and powers off.</div>
+    <div><strong>Finish</strong> no media check. A failed install stays on screen. When Debian, GRUB, and the host SSH key are on disk, the installer powers off. The host logs in, then snapshots the disk.</div>
   </div>
 
   <h2>The other preseed disk</h2>
   <p><span class="mono">preseed.img</span> is a 64 KiB FAT12 stick labeled <span class="mono">PRESEED</span> with the same file at its root. It is attached beside the installer. The boot line does not pass <span class="mono">preseed/file=/hd-media/preseed.cfg</span>. The copy inside the text initrd is the one the installer loads.</p>
 
   <h2>After the installer stops</h2>
-  <p>The preseed does not trust a reboot. <span class="mono">late_command</span> checks that <span class="mono">/target/etc/debian_version</span> and <span class="mono">/target/boot/grub/grub.cfg</span> exist, then writes <span class="mono">vmm-install-ok</span> to the virtio disk whose size is 1 MiB. That disk is <span class="mono">marker.img</span>, beside the guest disk. The installer then halts and powers off. The host reads the token, and if the guest is still running it stops the machine. Only then does it snapshot <span class="mono">disk.img</span> and <span class="mono">nvram.bin</span> into <span class="mono">snapshots/debian/</span>.</p>
+  <p>The preseed does not trust the installer screen. <span class="mono">late_command</span> checks that <span class="mono">/target/etc/debian_version</span> and <span class="mono">/target/boot/grub/grub.cfg</span> exist, copies <span class="mono">/authorized_keys</span> into the debian account, enables sshd, and powers off. The host generates an ed25519 key in <span class="mono">ssh/</span> and forwards port 2222 to the guest. A black screen is not finished. The host boots the guest disk and snapshots it only after that key logs in.</p>
   <p>The snapshot is taken once, after the guest has stopped, so it is the installed system and not a half-written disk. New Debian machines are clones of that directory. On APFS the clone shares blocks with the snapshot, so creating another machine does not copy 16 GiB. Start Debian still boots the original guest disk, without the installer USB.</p>
   <p>While preseed is running, the guest has a keyboard and no pointer. The install view also ignores clicks, so the host cursor is not captured. When the guest stops, Start Debian boots <span class="mono">disk.img</span> alone. That file, next to <span class="mono">nvram.bin</span>, is the installed system.</p>
 </main>
@@ -183,7 +183,7 @@ const panels = [
   ["The stub is not the menu", "The El Torito EFI image contains a one-line GRUB config. It searches for /.disk/info and sources /boot/grub/grub.cfg. Patching only that stub still shows the stock menu."],
   ["The menu that waits", "The file firmware ends up running is /boot/grub/grub.cfg on the ISO. The patch sets its default to the text install entry and set timeout=0, then inserts the auto parameters on that entry's linux line."],
   ["The initrd already knows", "The kernel is /install.amd/vmlinuz or /install.a64/vmlinuz. Its initrd.gz now ends with another gzip member. The installer finds /preseed.cfg and does not ask the questions that file answers."],
-  ["The installed system", "partman writes /dev/vda. That is disk.img, a sparse 16 GiB file. When the install checks out, the guest writes the finish token, powers off, and the host snapshots that disk."]
+  ["The installed system", "partman writes /dev/vda. That is disk.img, a sparse 16 GiB file. The host snapshots it only after SSH login succeeds."]
 ];
 const nodes = [...document.querySelectorAll("#boot .step")];
 const panel = document.getElementById("panel");

@@ -6,9 +6,9 @@
 //! key. `preseed.cfg` is appended to that initrd. The graphical initrd does not see it.
 //! Virtualization.framework has no CD drive, so the boot copy is a USB disk.
 //!
-//! When the target has a Debian version and a GRUB config, late_command writes
-//! `vmm-install-ok` to the 1 MiB marker disk and the installer powers off. The marker
-//! is chosen by size, not by virtio order, so it cannot be the guest disk.
+//! When the target has a Debian version and a GRUB config, late_command copies
+//! `/authorized_keys` from the text initrd into the debian account and enables
+//! sshd. The host treats the install as finished only after it can log in.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -28,11 +28,10 @@ pub const MACHINE: &str = "debian";
 pub const DISK: &str = "disk.img";
 pub const GUEST: u64 = 16 * 1024 * 1024 * 1024;
 
-/// Second virtio disk. The guest writes the finish token here. 1 MiB is too small
-/// for the atomic recipe, and `/sys/block/*/size` is in 512-byte sectors.
-pub const MARKER: &str = "marker.img";
-pub const MARKER_BYTES: u64 = 1024 * 1024;
-pub const MAGIC: &str = "vmm-install-ok";
+pub const USER: &str = "debian";
+pub const SSH_PORT: u16 = 2222;
+/// Written into the guest so the host can log in without a password.
+pub const AUTHORIZED: &str = "authorized_keys";
 
 /// Answers the installer loads from `/preseed.cfg` in the text initrd.
 pub fn answers() -> String {
@@ -62,27 +61,39 @@ d-i partman/confirm boolean true
 d-i partman/confirm_nooverwrite boolean true
 d-i apt-setup/cdrom/set-first boolean false
 d-i pkgsel/run_tasksel boolean false
-d-i pkgsel/include string
+d-i pkgsel/include string openssh-server
 d-i grub-installer/bootdev string /dev/vda
 d-i grub-installer/only_debian boolean true
 d-i finish-install/reboot_in_progress note
 d-i cdrom-checker/start boolean false
 d-i cdrom-detect/eject boolean false
-d-i debian-installer/exit/halt boolean true
-d-i debian-installer/exit/poweroff boolean true
+d-i debian-installer/exit/halt boolean false
+d-i debian-installer/exit/poweroff boolean false
 d-i preseed/late_command string {late}
 ",
         late = late_command(),
     )
 }
 
-/// Runs in the installer, with `/target` still mounted. A non-zero exit leaves no token,
-/// so the host will not snapshot a half-installed disk. No `#`: debconf treats that as a comment.
+/// Runs in the installer, with `/target` still mounted. A non-zero exit does not
+/// install the host key, so the installer stays up and the host does not boot the disk.
+/// Success powers off. The host logs in only after that disk boots.
+/// No `#`: debconf treats that as a comment.
 fn late_command() -> String {
-    let sectors = MARKER_BYTES / 512;
+    let home = format!("/target/home/{USER}");
     format!(
-        "test -s /target/etc/debian_version && test -e /target/boot/grub/grub.cfg && for n in a b c d e f g h; do [ \"$(cat /sys/block/vd$n/size 2>/dev/null)\" = {sectors} ] && printf {MAGIC} >/dev/vd$n && sync && exit 0; done; exit 1"
+        "test -s /target/etc/debian_version && test -e /target/boot/grub/grub.cfg && mkdir -p {home}/.ssh && cp /authorized_keys {home}/.ssh/authorized_keys && chmod 700 {home}/.ssh && chmod 600 {home}/.ssh/authorized_keys && chroot /target chown -R {USER}:{USER} /home/{USER}/.ssh && chroot /target systemctl enable ssh && sync && poweroff"
     )
+}
+
+/// OpenSSH public key line. The matching private key stays on the host.
+pub fn authorized_keys(public_key: &str) -> String {
+    let key = public_key.trim();
+    if key.is_empty() {
+        String::new()
+    } else {
+        format!("{key}\n")
+    }
 }
 
 /// Boot parameters from the guide's auto mode. They belong before `---`.
@@ -92,7 +103,7 @@ pub fn boot_args() -> String {
 
 pub struct Prepared {
     pub disk: PathBuf,
-    pub marker: PathBuf,
+    pub key: PathBuf,
 }
 
 /// Writes the answer disk, the boot ISO, and the empty guest disk.
@@ -101,45 +112,28 @@ pub fn prepare(cache: &Path, iso: &Path, support: &Path) -> Result<Prepared> {
         bail!("installer image is missing: {}", iso.display());
     }
     fs::create_dir_all(cache).map_err(|err| anyhow!("cannot create {}: {err}", cache.display()))?;
-    let _ = write_image(&cache.join(FILE), &image()?)?;
-    write_boot(iso, &cache.join(BOOT))?;
+    let key = read_key(&support.join("ssh").join(AUTHORIZED))?;
+    let _ = write_image(&cache.join(FILE), &image(&key)?)?;
+    write_boot(iso, &cache.join(BOOT), &key)?;
     let guest = support.join("machines").join(MACHINE);
     fs::create_dir_all(&guest)
         .map_err(|err| anyhow!("cannot create {}: {err}", guest.display()))?;
     let disk = guest.join(DISK);
-    let disk_existed = disk.is_file();
-    if !disk_existed {
+    if !disk.is_file() {
         sparse(&disk, GUEST)?;
     }
-    let marker = guest.join(MARKER);
-    // A new guest disk must not inherit a finish token from an older install.
-    if !disk_existed {
-        let _ = fs::remove_file(&marker);
-    }
-    ensure_marker(&marker)?;
-    Ok(Prepared { disk, marker })
+    Ok(Prepared { disk, key: support.join("ssh").join(AUTHORIZED) })
 }
 
-/// A finished marker is left alone. An unfinished file of the wrong size would miss the guest's size check.
-fn ensure_marker(path: &Path) -> Result<()> {
-    if path.is_file() {
-        let len = path.metadata()?.len();
-        if len == MARKER_BYTES || marker_done(path)? {
-            return Ok(());
-        }
-    }
-    sparse(path, MARKER_BYTES)
-}
-
-/// True when late_command has written the token at the start of the marker disk.
-pub fn marker_done(path: &Path) -> Result<bool> {
+fn read_key(path: &Path) -> Result<String> {
     if !path.is_file() {
-        return Ok(false);
+        bail!("SSH key is missing: {}", path.display());
     }
-    let mut file = File::open(path)?;
-    let mut buf = [0u8; 32];
-    let n = file.read(&mut buf)?;
-    Ok(buf[..n].starts_with(MAGIC.as_bytes()))
+    let text = fs::read_to_string(path).map_err(|err| anyhow!("cannot read {}: {err}", path.display()))?;
+    if text.trim().is_empty() {
+        bail!("SSH key is empty: {}", path.display());
+    }
+    Ok(text)
 }
 
 fn write_image(dest: &Path, body: &[u8]) -> Result<PathBuf> {
@@ -153,20 +147,20 @@ fn write_image(dest: &Path, body: &[u8]) -> Result<PathBuf> {
 }
 
 /// Copies the verified ISO and applies the guide's boot edit. The signed file is not rewritten.
-fn write_boot(iso: &Path, dest: &Path) -> Result<()> {
-    if already_patched(dest) {
+fn write_boot(iso: &Path, dest: &Path, public_key: &str) -> Result<()> {
+    if already_patched(dest, public_key) {
         return Ok(());
     }
     let tmp = dest.with_extension("partial");
     fs::copy(iso, &tmp).map_err(|err| anyhow!("cannot copy installer: {err}"))?;
     if is_eltorito(&tmp)? {
-        patch_installer(&tmp)?;
+        patch_installer(&tmp, public_key)?;
     }
     fs::rename(&tmp, dest)?;
     Ok(())
 }
 
-fn already_patched(dest: &Path) -> bool {
+fn already_patched(dest: &Path, public_key: &str) -> bool {
     let Ok(mut file) = File::open(dest) else {
         return false;
     };
@@ -183,14 +177,14 @@ fn already_patched(dest: &Path) -> bool {
         return false;
     };
     let mut body = vec![0u8; hit.size as usize];
-    // A menu-only copy is stale once the answers change. Rebuild from the signed ISO.
+    // A menu-only copy is stale once the answers or the SSH key change.
     read_at(&mut file, hit.extent as u64 * SECTOR, &mut body).is_ok()
         && menu_ready(&body, &install)
-        && initrd_has_preseed(&mut file, &install)
+        && initrd_has_preseed(&mut file, &install, public_key)
 }
 
-fn initrd_has_preseed(file: &mut File, install: &str) -> bool {
-    let Ok(extra) = preseed_gzip() else {
+fn initrd_has_preseed(file: &mut File, install: &str, public_key: &str) -> bool {
+    let Ok(extra) = preseed_gzip(public_key) else {
         return false;
     };
     let Ok(hits) = walk_install(file, install) else {
@@ -222,10 +216,10 @@ fn is_eltorito(path: &Path) -> Result<bool> {
 
 /// The GRUB menu is `/boot/grub/grub.cfg`. The EFI stub only sources that file.
 /// Appending the preseed to the text initrd is the initrd method in the guide.
-fn patch_installer(path: &Path) -> Result<()> {
+fn patch_installer(path: &Path, public_key: &str) -> Result<()> {
     let mut file = OpenOptions::new().read(true).write(true).open(path)?;
     let install = install_dir(&mut file)?;
-    append_preseed(&mut file, &install)?;
+    append_preseed(&mut file, &install, public_key)?;
     patch_menu(&mut file, &install)?;
     file.sync_all()?;
     Ok(())
@@ -466,7 +460,7 @@ struct Hit {
     is_dir: bool,
 }
 
-fn append_preseed(file: &mut File, install: &str) -> Result<()> {
+fn append_preseed(file: &mut File, install: &str, public_key: &str) -> Result<()> {
     let hits = walk_install(file, install)?;
     let Some(initrd) = hits
         .iter()
@@ -476,7 +470,7 @@ fn append_preseed(file: &mut File, install: &str) -> Result<()> {
     };
     let old = initrd.size;
     let extent = initrd.extent;
-    let extra = preseed_gzip()?;
+    let extra = preseed_gzip(public_key)?;
     let slack = sector_slack(old);
     if extra.len() as u32 > slack {
         bail!("installer initrd has no room for preseed.cfg");
@@ -504,16 +498,17 @@ fn sector_slack(size: u32) -> u32 {
     }
 }
 
-fn preseed_gzip() -> Result<Vec<u8>> {
+fn preseed_gzip(public_key: &str) -> Result<Vec<u8>> {
     let mut enc = GzEncoder::new(Vec::new(), Compression::new(9));
-    enc.write_all(&cpio_preseed())?;
+    enc.write_all(&cpio_preseed(public_key))?;
     enc.finish()
         .map_err(|err| anyhow!("cannot compress preseed: {err}"))
 }
 
-fn cpio_preseed() -> Vec<u8> {
+fn cpio_preseed(public_key: &str) -> Vec<u8> {
     let body = answers();
     let mut archive = newc("preseed.cfg", body.as_bytes());
+    archive.extend(newc(AUTHORIZED, authorized_keys(public_key).as_bytes()));
     archive.extend(newc("TRAILER!!!", b""));
     archive
 }
@@ -678,15 +673,14 @@ fn sparse(dest: &Path, bytes: u64) -> Result<()> {
     Ok(())
 }
 
-fn image() -> Result<Vec<u8>> {
-    let file = "preseed.cfg";
+fn image(public_key: &str) -> Result<Vec<u8>> {
+    let _ = public_key;
     let text = answers();
-    let body = text.as_bytes();
-    if body.len() > 512 * 8 {
+    if text.len() > 512 * 8 {
         bail!("preseed is too large for the disk");
     }
     let mut disk = vec![0u8; 64 * 1024];
-    write_fat12(&mut disk, LABEL, file, body)?;
+    write_fat12(&mut disk, LABEL, "preseed.cfg", text.as_bytes())?;
     Ok(disk)
 }
 
@@ -822,27 +816,26 @@ mod tests {
 
     #[test]
     fn preseed_disk_contains_the_installer_answers() {
-        let disk = image().unwrap();
+        let disk = image(PUB).unwrap();
         let text = String::from_utf8_lossy(&disk);
         let answers = answers();
         assert!(text.contains("PRESEED"));
         assert!(disk.windows(answers.len()).any(|w| w == answers.as_bytes()));
         assert!(boot_args().contains("auto=true"));
         assert!(answers.contains("partman-auto/disk string /dev/vda"));
-        assert!(answers.contains("debian-installer/exit/poweroff boolean true"));
-        assert!(answers.contains("debian-installer/exit/halt boolean true"));
-        assert!(answers.contains(&format!("= {} ]", MARKER_BYTES / 512)));
-        assert!(answers.contains("printf vmm-install-ok >/dev/vd$n"));
-        assert!(answers.contains(MAGIC));
+        assert!(answers.contains("debian-installer/exit/poweroff boolean false"));
+        assert!(answers.contains("debian-installer/exit/halt boolean false"));
+        assert!(answers.contains("openssh-server"));
+        assert!(answers.contains("cp /authorized_keys"));
+        assert!(answers.contains("systemctl enable ssh && sync && poweroff"));
         assert!(!answers.contains('#'));
         assert_eq!(answers.lines().filter(|line| line.contains("late_command")).count(), 1);
         assert!(!disk.windows(b"PRESEED/".len()).any(|w| w == b"PRESEED/"));
-        let gzip = preseed_gzip().unwrap();
-        assert!(
-            gzip.len() < 800,
-            "preseed gzip is {} bytes and must fit in the initrd sector slack",
-            gzip.len()
-        );
+        let gzip = preseed_gzip(PUB).unwrap();
+        assert!(gzip.len() < 800, "preseed gzip is {} bytes", gzip.len());
+        let mut plain = Vec::new();
+        GzDecoder::new(gzip.as_slice()).read_to_end(&mut plain).unwrap();
+        assert!(plain.windows(PUB.len()).any(|word| word == PUB.as_bytes()));
     }
 
     #[test]
@@ -851,11 +844,12 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(dir.join("cache")).unwrap();
         let iso = dir.join("cache").join("debian-13.7.0-arm64-netinst.iso");
-        let raw = installer_iso();
-        fs::write(&iso, &raw).unwrap();
+        fs::write(&iso, installer_iso()).unwrap();
+        fs::create_dir_all(dir.join("ssh")).unwrap();
+        fs::write(dir.join("ssh").join(AUTHORIZED), PUB).unwrap();
         prepare(&dir.join("cache"), &iso, &dir).unwrap();
         let boot = fs::read(dir.join("cache").join(BOOT)).unwrap();
-        assert_eq!(fs::read(&iso).unwrap(), raw);
+        assert_eq!(fs::read(&iso).unwrap(), installer_iso());
         let menu = &boot[29 * 2048..30 * 2048];
         let text = String::from_utf8_lossy(menu);
         assert!(text.contains("set default=1\n"), "{text}");
@@ -872,6 +866,7 @@ mod tests {
         let mut cpio = Vec::new();
         dec.read_to_end(&mut cpio).unwrap();
         assert!(cpio.windows(answers().len()).any(|w| w == answers().as_bytes()));
+        assert!(cpio.windows(PUB.len()).any(|w| w == PUB.as_bytes()));
         prepare(&dir.join("cache"), &iso, &dir).unwrap();
         assert_eq!(fs::read(dir.join("cache").join(BOOT)).unwrap(), boot);
         let _ = fs::remove_dir_all(&dir);
@@ -922,18 +917,20 @@ menuentry 'Graphical install' {
         fs::create_dir_all(dir.join("cache")).unwrap();
         let iso = dir.join("cache").join("debian.iso");
         fs::write(&iso, b"iso").unwrap();
+        fs::create_dir_all(dir.join("ssh")).unwrap();
+        fs::write(dir.join("ssh").join(AUTHORIZED), PUB).unwrap();
         let prepared = prepare(&dir.join("cache"), &iso, &dir).unwrap();
         assert_eq!(prepared.disk, dir.join("machines/debian").join(DISK));
         assert_eq!(prepared.disk.metadata().unwrap().len(), GUEST);
-        assert_eq!(prepared.marker, dir.join("machines/debian").join(MARKER));
-        assert_eq!(prepared.marker.metadata().unwrap().len(), MARKER_BYTES);
-        assert!(!marker_done(&prepared.marker).unwrap());
+        assert_eq!(prepared.key, dir.join("ssh").join(AUTHORIZED));
         assert!(dir.join("cache").join(FILE).is_file());
         assert_eq!(fs::read(dir.join("cache").join(BOOT)).unwrap(), b"iso");
         prepare(&dir.join("cache"), &iso, &dir).unwrap();
         assert_eq!(prepared.disk.metadata().unwrap().len(), GUEST);
         let _ = fs::remove_dir_all(&dir);
     }
+
+    const PUB: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestKeyForTheInstaller debian@host";
 
     fn initrd_at(_iso: &[u8]) -> usize {
         24 * 2048

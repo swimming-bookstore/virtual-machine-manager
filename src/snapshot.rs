@@ -1,4 +1,4 @@
-//! Frozen Debian disk. The installer powers off after it writes the marker.
+//! Frozen Debian disk. The install is finished when the host can SSH in.
 //! The snapshot is a sparse copy of that stopped disk, so later machines skip the installer.
 
 use std::fs::{self, File};
@@ -9,7 +9,13 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Result};
 
-use crate::preseed::{self, DISK, GUEST, MAGIC, MARKER, MACHINE};
+use crate::preseed::{DISK, GUEST, MACHINE};
+
+#[cfg(test)]
+use crate::preseed;
+
+#[path = "ssh.rs"]
+mod ssh;
 
 const READY: &str = "ready";
 const NVRAM: &str = "nvram.bin";
@@ -27,10 +33,10 @@ pub struct Saved {
 /// Copy the finished guest once. A second call keeps the first snapshot.
 pub fn save(support: &Path) -> Result<Saved> {
     let guest = support.join("machines").join(MACHINE);
-    if !preseed::marker_done(&guest.join(MARKER))? {
-        bail!("install is not finished: {MARKER} has no {MAGIC}");
-    }
     let disk = guest.join(DISK);
+    if !ssh::logged_in(&support.join("ssh"))? {
+        bail!("install is not finished: SSH has not logged in");
+    }
     installed(&disk)?;
     let dest = support.join("snapshots").join(MACHINE);
     if snapshot_ready(&dest)? {
@@ -93,7 +99,7 @@ fn snapshot_ready(dir: &Path) -> Result<bool> {
         return Ok(false);
     }
     let text = fs::read_to_string(&ready).map_err(|err| anyhow!("{}: {err}", ready.display()))?;
-    if !text.starts_with(MAGIC) {
+    if !text.starts_with("ssh-ok") {
         bail!("{} is not a Debian snapshot", dir.display());
     }
     installed(&disk)?;
@@ -121,7 +127,7 @@ fn installed(disk: &Path) -> Result<()> {
 fn write_ready(dest: &Path) -> Result<()> {
     let tmp = dest.with_extension("partial");
     let mut file = File::create(&tmp)?;
-    file.write_all(format!("{MAGIC}\n").as_bytes())?;
+    file.write_all(b"ssh-ok\n")?;
     file.sync_all()?;
     drop(file);
     fs::rename(&tmp, dest)?;
@@ -327,6 +333,8 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("vmm-snap-{}-{}", std::process::id(), std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(dir.join("cache")).unwrap();
+        fs::create_dir_all(dir.join("ssh")).unwrap();
+        fs::write(dir.join("ssh").join("authorized_keys"), b"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestKeyForTheInstaller\n").unwrap();
         let iso = dir.join("cache").join("debian.iso");
         fs::write(&iso, b"iso").unwrap();
         let prepared = preseed::prepare(&dir.join("cache"), &iso, &dir).unwrap();
@@ -338,15 +346,14 @@ mod tests {
 
         mark_installed(&prepared.disk);
         fs::write(prepared.disk.parent().unwrap().join(NVRAM), b"efi-vars").unwrap();
-        let mut marker = OpenOptions::new().write(true).open(&prepared.marker).unwrap();
-        marker.write_all(MAGIC.as_bytes()).unwrap();
-        marker.sync_all().unwrap();
+        assert!(save(&dir).unwrap_err().to_string().contains("SSH has not logged in"));
+        ssh::record_login(&dir.join("ssh")).unwrap();
 
         let saved = save(&dir).unwrap();
         assert_eq!(saved.disk.metadata().unwrap().len(), GUEST);
         assert!(saved.disk.metadata().unwrap().blocks() < 256);
         assert_eq!(fs::read(saved.dir.join(NVRAM)).unwrap(), b"efi-vars");
-        assert!(fs::read_to_string(saved.dir.join(READY)).unwrap().starts_with(MAGIC));
+        assert!(fs::read_to_string(saved.dir.join(READY)).unwrap().starts_with("ssh-ok"));
 
         let mut snap = OpenOptions::new().write(true).open(&saved.disk).unwrap();
         snap.seek(SeekFrom::Start(600)).unwrap();

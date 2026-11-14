@@ -3,6 +3,7 @@
 
 mod preseed;
 mod snapshot;
+mod ssh;
 mod verify;
 
 use std::env;
@@ -43,7 +44,7 @@ struct Event<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     disk: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    marker: Option<String>,
+    key: Option<String>,
 }
 
 fn blank(event: &str) -> Event<'_> {
@@ -56,7 +57,7 @@ fn blank(event: &str) -> Event<'_> {
         total: None,
         path: None,
         disk: None,
-        marker: None,
+        key: None,
     }
 }
 
@@ -388,9 +389,10 @@ fn finish(
     fs::rename(&tmp, cache.join("manifest.json"))?;
     step("verify", "done", "Checksum matches", order);
     step("preseed", "now", preseed::FILE, order);
+    ssh::ensure(&support.join("ssh"))?;
     let prepared = preseed::prepare(cache, dest, support)?;
     step("preseed", "done", preseed::FILE, order);
-    emit!("ready", step: Some("preseed"), state: Some("done"), detail: Some(preseed::boot_args()), received: Some(bytes), total: Some(bytes), path: Some(dest.display().to_string()), disk: Some(prepared.disk.display().to_string()), marker: Some(prepared.marker.display().to_string()));
+    emit!("ready", step: Some("preseed"), state: Some("done"), detail: Some(preseed::boot_args()), received: Some(bytes), total: Some(bytes), path: Some(dest.display().to_string()), disk: Some(prepared.disk.display().to_string()), key: Some(prepared.key.display().to_string()));
     Ok(())
 }
 
