@@ -4,6 +4,7 @@ import Virtualization
 /// The screen after the download. The installer writes `disk.img`; that file is the installed system.
 /// A finished preseed powers the guest off. SSH login, not the installer screen, is the finish check.
 /// This view then snapshots that disk so later machines are clones.
+/// Setup is the next wizard page: the same layout as the download, with a small guest screen where the ISO bar was.
 /// Reopening Quick start boots that disk alone. It does not attach the installer again.
 struct Install: View {
     let iso: String
@@ -20,18 +21,21 @@ struct Install: View {
         _guest = StateObject(wrappedValue: GuestSession(fromSnapshot: installed))
     }
 
+    /// Setup stays the wizard page until the snapshot is saved. A clone, and a finished install, use the large screen.
+    private var setup: Bool { !fromSnapshot && !guest.snapshotReady }
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            VStack(alignment: .leading, spacing: 4) {
-                Text(fromSnapshot || guest.installed ? "Debian" : "Installing Debian").font(.title2.weight(.semibold))
-                Text(guest.headline)
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+        VStack(alignment: .leading, spacing: 18) {
+            header
+            if setup {
+                guestScreen
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 96)
+                stepList
+            } else {
+                guestScreen
+                    .frame(width: 800, height: 500)
             }
-            GuestView(session: guest, capture: fromSnapshot || guest.installed)
-                .frame(width: 800, height: 500)
-                .background(.black, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
             Text(disk)
                 .font(.caption)
                 .foregroundStyle(.tertiary)
@@ -40,6 +44,52 @@ struct Install: View {
             if let error = guest.error {
                 Text(error).font(.callout).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true)
             }
+            actions
+        }
+        .padding(24)
+        .frame(width: setup ? 440 : 848, alignment: .topLeading)
+        .onAppear {
+            // A clone, a login, or a disk the installer already partitioned boots alone.
+            // Attaching boot.iso here is a new install: the preseed writes a new label on /dev/vda.
+            if fromSnapshot || guest.installed {
+                guest.bootDisk(disk)
+            } else {
+                guest.start(iso: iso, disk: disk)
+            }
+        }
+        .onDisappear { guest.stop() }
+    }
+
+    private var header: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(setup ? "Debian setup" : "Debian").font(.title2.weight(.semibold))
+            Text(guest.headline)
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    /// Where the download page draws the ISO bar. The installer has no byte count, so the guest is the progress.
+    private var guestScreen: some View {
+        GuestView(session: guest, capture: fromSnapshot || guest.installed)
+            .background(.black, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+
+    private var stepList: some View {
+        VStack(spacing: 0) {
+            ForEach(guest.setupSteps) { step in
+                setupRow(step).id(step.id + step.state + step.detail)
+                if step.id != guest.setupSteps.last?.id { Divider().padding(.leading, 42) }
+            }
+        }
+        .background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+    }
+
+    private var actions: some View {
+        HStack {
+            Spacer(minLength: 12)
             if guest.stopped {
                 Button(guest.installed ? "Start Debian" : "Start from the guest disk") {
                     guest.startInstalled()
@@ -59,18 +109,38 @@ struct Install: View {
                 }
             }
         }
-        .padding(24)
-        .frame(width: 848, alignment: .topLeading)
-        .onAppear {
-            // A clone, a login, or a disk the installer already partitioned boots alone.
-            // Attaching boot.iso here is a new install: the preseed writes a new label on /dev/vda.
-            if fromSnapshot || guest.installed {
-                guest.bootDisk(disk)
-            } else {
-                guest.start(iso: iso, disk: disk)
+    }
+
+    private func setupRow(_ step: WizardStep) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 10) {
+            Image(systemName: setupIcon(step.state)).foregroundStyle(setupColor(step.state)).frame(width: 18)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(step.title).font(.body.weight(step.state == "now" ? .semibold : .regular))
+                Text(step.detail).font(.caption).foregroundStyle(.secondary)
             }
+            Spacer(minLength: 0)
         }
-        .onDisappear { guest.stop() }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 9)
+        .background(step.state == "now" ? Color.accentColor.opacity(0.08) : Color.clear)
+    }
+
+    private func setupIcon(_ state: String) -> String {
+        switch state {
+        case "done": return "checkmark.circle.fill"
+        case "now": return "circle.inset.filled"
+        case "fail": return "xmark.circle.fill"
+        default: return "circle"
+        }
+    }
+
+    private func setupColor(_ state: String) -> Color {
+        switch state {
+        case "done": return .green
+        case "now": return .accentColor
+        case "fail": return .red
+        default: return Color.secondary.opacity(0.45)
+        }
     }
 
     private func newMachine() {
@@ -98,6 +168,7 @@ final class GuestSession: NSObject, ObservableObject, VZVirtualMachineDelegate {
     @Published var stopped = false
     @Published var snapshotReady = false
     @Published var cloning = false
+    @Published var setupSteps = WizardStep.setup
     let view = InstallScreen()
     private var machine: VZVirtualMachine?
     private var diskURL: URL?
@@ -133,6 +204,8 @@ final class GuestSession: NSObject, ObservableObject, VZVirtualMachineDelegate {
             return
         }
         installing = true
+        setupSteps = WizardStep.setup
+        markSetup("installer", state: "now", detail: "boot.iso")
         headline = "Starting the installer."
         let folder = URL(fileURLWithPath: iso).deletingLastPathComponent()
         let installer = folder.appendingPathComponent("boot.iso")
@@ -215,6 +288,8 @@ final class GuestSession: NSObject, ObservableObject, VZVirtualMachineDelegate {
     private func loginSucceeded() {
         guard installed, checking, !snapshotReady else { return }
         headline = "SSH login succeeded. Saving a snapshot."
+        markSetup("ssh", state: "done", detail: "debian")
+        markSetup("snapshot", state: "now", detail: "snapshots/debian")
         watch?.invalidate()
         saveSnapshot()
     }
@@ -228,12 +303,17 @@ final class GuestSession: NSObject, ObservableObject, VZVirtualMachineDelegate {
             installing = false
             installed = true
             checking = true
+            markSetup("installer", state: "done", detail: nil)
+            markSetup("partition", state: "done", detail: "Guest disk written")
+            markSetup("ssh", state: "now", detail: "port 2222")
             headline = "Installer stopped. Starting Debian to check SSH."
             startInstalled()
             return
         }
         if checking, installed, let disk = diskURL, GuestSSH.loggedIn(beside: disk) {
             headline = "SSH login succeeded. Saving a snapshot."
+            markSetup("ssh", state: "done", detail: "debian")
+            markSetup("snapshot", state: "now", detail: "snapshots/debian")
             saveSnapshot()
             return
         }
@@ -263,8 +343,10 @@ final class GuestSession: NSObject, ObservableObject, VZVirtualMachineDelegate {
                 guard let self else { return }
                 if let err {
                     self.error = err
+                    self.failSetup()
                     self.headline = "Debian shut down, but the snapshot was not saved."
                 } else {
+                    self.markSetup("snapshot", state: "done", detail: "Saved")
                     self.snapshotReady = true
                     self.headline = "Debian is installed and shut down. A snapshot is saved for new machines."
                 }
@@ -284,11 +366,16 @@ final class GuestSession: NSObject, ObservableObject, VZVirtualMachineDelegate {
                     switch result {
                     case .success:
                         self?.stopped = false
-                        self?.headline = installed
-                            ? "Debian is running from the guest disk."
-                            : "The installer starts on its own and writes the guest disk."
+                        if installed {
+                            self?.headline = "Debian is running from the guest disk."
+                        } else {
+                            self?.markSetup("installer", state: "done", detail: nil)
+                            self?.markSetup("partition", state: "now", detail: "Writing /dev/vda")
+                            self?.headline = "The installer starts on its own and writes the guest disk."
+                        }
                     case .failure(let err):
                         self?.stopped = true
+                        if !installed { self?.failSetup() }
                         self?.fail(err.localizedDescription)
                     }
                 }
@@ -303,6 +390,23 @@ final class GuestSession: NSObject, ObservableObject, VZVirtualMachineDelegate {
         error = message
         headline = "The virtual machine did not start."
         started = false
+    }
+
+    private func markSetup(_ id: String, state: String, detail: String?) {
+        guard let index = setupSteps.firstIndex(where: { $0.id == id }) else { return }
+        if let detail, !detail.isEmpty { setupSteps[index].detail = detail }
+        setupSteps[index].state = state
+        if state == "done" || state == "now" {
+            for earlier in setupSteps.indices where earlier < index && setupSteps[earlier].state != "done" && setupSteps[earlier].state != "fail" {
+                setupSteps[earlier].state = "done"
+            }
+        }
+    }
+
+    private func failSetup() {
+        if let index = setupSteps.firstIndex(where: { $0.state == "now" }) ?? setupSteps.firstIndex(where: { $0.state == "wait" }) {
+            setupSteps[index].state = "fail"
+        }
     }
 }
 

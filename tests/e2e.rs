@@ -2118,7 +2118,10 @@ fn quick_start_swift_gates_the_bar_on_a_real_download() {
     assert!(src.contains("if event.step == \"preseed\" { showPreseed() }"));
     assert!(src.contains("wizard.page == 1 ? \"Preseed\""));
     assert!(src.contains("static let preseed"));
-    assert!(include_str!("../Sources/Install.swift").contains("Installing Debian"));
+    assert!(include_str!("../Sources/Install.swift").contains("Debian setup"));
+    assert!(include_str!("../Sources/Install.swift").contains("frame(height: 96)"));
+    assert!(include_str!("../Sources/Install.swift").contains("guest.setupSteps"));
+    assert!(include_str!("../Sources/QuickStart.swift").contains("static let setup"));
     assert!(include_str!("../Sources/Install.swift").contains("guest.start(iso: iso, disk: disk)"));
     assert!(include_str!("../Sources/Install.swift").contains("guest.bootDisk(disk)"));
     assert!(include_str!("../Sources/Install.swift").contains("InstalledDisk.looksInstalled"));

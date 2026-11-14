@@ -20,6 +20,14 @@ struct WizardStep: Identifiable {
         WizardStep(id: "preseed", title: "Prepare preseed disk", detail: "preseed.img", state: "wait"),
     ]
 
+    /// Debian setup is the next page of this wizard, not a different window.
+    static let setup = [
+        WizardStep(id: "installer", title: "Start the installer", detail: "boot.iso", state: "wait"),
+        WizardStep(id: "partition", title: "Write the guest disk", detail: "/dev/vda", state: "wait"),
+        WizardStep(id: "ssh", title: "Log in with the host key", detail: "port 2222", state: "wait"),
+        WizardStep(id: "snapshot", title: "Save a snapshot", detail: "snapshots/debian", state: "wait"),
+    ]
+
     static var isoName: String {
         #if arch(arm64)
         "debian-*-arm64-netinst.iso"
