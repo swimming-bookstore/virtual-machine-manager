@@ -945,7 +945,7 @@ struct Screen {
     started: bool,
     running: bool,
     page: i32,
-    /// Log shows every step. The important rows stay Download ISO, Install guest, and Save snapshot.
+    /// Log shows every step. The important rows stay Download ISO, Install guest, and Create snapshot.
     show_log: bool,
 }
 
@@ -1085,7 +1085,7 @@ impl Screen {
                 },
                 Step {
                     id: "snapshot",
-                    title: "Save a snapshot",
+                    title: "Create snapshot",
                     detail: "snapshots/debian".into(),
                     path: None,
                     state: "wait".into(),
@@ -1252,7 +1252,7 @@ impl Screen {
         self.visible_ids()
     }
 
-    /// Download ISO, Install guest, and Save a snapshot. Log opens the rest, in order.
+    /// Download ISO, Install guest, and Create snapshot. Log opens the rest, in order.
     fn visible_ids(&self) -> Vec<&'static str> {
         const BRIEF: &[&str] = &["download", "partition", "snapshot"];
         const ORDER: &[&str] = &[
@@ -1769,6 +1769,30 @@ fn snapshot_waits_for_ssh_then_clones() {
         one_event(&next.stdout)["disk"],
         dir.join("machines/debian-3/disk.img").display().to_string()
     );
+
+    // A broken ready marker used to refuse the copy. Removing the snapshot must recreate it.
+    std::fs::write(dir.join("snapshots/debian/ready"), b"nope").unwrap();
+    std::fs::write(dir.join("snapshots/debian/disk.img"), b"short").unwrap();
+    let replaced = cli(&["snapshot", "--dir", dir.to_str().unwrap()]);
+    assert!(
+        replaced.status.success(),
+        "{}",
+        String::from_utf8_lossy(&replaced.stdout)
+    );
+    assert!(std::fs::read_to_string(dir.join("snapshots/debian/ready"))
+        .unwrap()
+        .starts_with("ssh-ok"));
+    assert_eq!(
+        std::fs::metadata(dir.join("snapshots/debian/disk.img"))
+            .unwrap()
+            .len(),
+        16 * 1024 * 1024 * 1024
+    );
+    let mut replaced_buf = [0u8; 12];
+    let mut replaced_disk = std::fs::File::open(dir.join("snapshots/debian/disk.img")).unwrap();
+    replaced_disk.seek(SeekFrom::Start(4096)).unwrap();
+    std::io::Read::read_exact(&mut replaced_disk, &mut replaced_buf).unwrap();
+    assert_eq!(&replaced_buf, b"CHANGED!!!!!");
 }
 
 fn one_event(stdout: &[u8]) -> Value {
@@ -2845,7 +2869,7 @@ fn setup_steps() -> Vec<Step> {
         },
         Step {
             id: "snapshot",
-            title: "Save a snapshot",
+            title: "Create snapshot",
             detail: "snapshots/debian".into(),
             path: None,
             state: "wait".into(),
@@ -2955,8 +2979,13 @@ impl Setup {
         }
         let proof = guest_logged_in(disk);
         let snap = snapshot_ready(disk);
+        let snapshot_done = self
+            .steps
+            .iter()
+            .any(|step| step.id == "snapshot" && step.state == "done");
         let mut ran = None;
-        if self.snapshot_ready && !snap {
+        // A done row with the files gone is the same as snapshot_ready still set. Copy again.
+        if (self.snapshot_ready || snapshot_done) && !snap {
             self.snapshot_ready = false;
             self.show_window = false;
             if proof {
@@ -3341,6 +3370,20 @@ fn removing_a_setup_file_reruns_that_step() {
         Some("SSH login succeeded. Saving a snapshot.")
     );
 
+    // The in-memory flag can already be clear while the row still says done.
+    std::fs::write(dir.join("snapshots/debian/disk.img"), b"snap").unwrap();
+    std::fs::write(dir.join("snapshots/debian/ready"), b"ssh-ok\n").unwrap();
+    setup.snapshot_ready = false;
+    setup.mark("snapshot", "done", Some("Saved"));
+    std::fs::remove_file(dir.join("snapshots/debian/disk.img")).unwrap();
+    assert_eq!(setup.note_missing(&disk), Some("snapshot"));
+    assert_eq!(setup.row("snapshot").state, "now");
+    assert!(!setup.snapshot_ready);
+    assert_eq!(
+        setup.headline.as_deref(),
+        Some("SSH login succeeded. Saving a snapshot.")
+    );
+
     std::fs::write(dir.join("snapshots/debian/disk.img"), b"snap").unwrap();
     setup.snapshot_ready = true;
     setup.mark("snapshot", "done", Some("Saved"));
@@ -3401,7 +3444,7 @@ fn quick_start_swift_gates_the_bar_on_a_real_download() {
     assert!(src.contains(".frame(height: 220)"));
     assert!(src.contains(".lineLimit(1)"));
     assert!(src.contains(".truncationMode(.middle)"));
-    assert!(src.contains("Install(iso: iso, disk: disk, embedded: true, steps: $wizard.steps, missingFile: $wizard.missingFile)"));
+    assert!(src.contains("Install(iso: iso, disk: disk, embedded: true, steps: $wizard.steps, missingFile: $wizard.missingFile, slot: installSlot)"));
     assert!(src.contains("Button(\"Open folder\")"));
     assert!(src.contains("support.appendingPathComponent(\"installer/preseed.img\")"));
     assert!(src.contains("support.appendingPathComponent(\"installer/boot.iso\")"));
@@ -3418,6 +3461,9 @@ fn quick_start_swift_gates_the_bar_on_a_real_download() {
     assert!(
         include_str!("../Sources/Install.swift").contains("SupportDir.snapshotReady && written")
     );
+    assert!(include_str!("../Sources/Install.swift")
+        .contains("GuestSession(fromSnapshot: fromSnapshot, diskWritten: written, snapshotSaved: snapshotSaved, loggedIn: loggedIn)"));
+    assert!(!include_str!("../Sources/Install.swift").contains("GuestSession(fromSnapshot: loggedIn"));
     assert!(src.contains("Button(\"Open folder\")"));
     assert!(include_str!("../Sources/Install.swift").contains("SupportDir.open()"));
     assert!(!src.contains("Button(\"Back\""));

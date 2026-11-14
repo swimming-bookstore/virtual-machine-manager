@@ -18,23 +18,27 @@ struct Install: View {
     var embedded = false
     var steps: Binding<[WizardStep]>? = nil
     var missingFile: Binding<String?>? = nil
+    /// Quick start's bar slot. The mounted install publishes its session so that slot does not start another guest.
+    var slot: InstallSlotModel? = nil
     @StateObject private var guest: GuestSession
     @State private var folderError: String?
     @Environment(\.openWindow) private var openWindow
 
-    init(iso: String, disk: String, fromSnapshot: Bool = false, embedded: Bool = false, steps: Binding<[WizardStep]>? = nil, missingFile: Binding<String?>? = nil) {
+    init(iso: String, disk: String, fromSnapshot: Bool = false, embedded: Bool = false, steps: Binding<[WizardStep]>? = nil, missingFile: Binding<String?>? = nil, slot: InstallSlotModel? = nil) {
         self.iso = iso
         self.disk = disk
         self.fromSnapshot = fromSnapshot
         self.embedded = embedded
         self.steps = steps
         self.missingFile = missingFile
+        self.slot = slot
         let loggedIn = fromSnapshot || GuestSSH.loggedIn(beside: URL(fileURLWithPath: disk))
         let written = loggedIn || InstalledDisk.looksInstalled(disk)
         // The installer disk is machines/debian. A snapshot finishes that VM only while this disk is still the installed one.
         // A new empty disk, after the old one was removed, is not that snapshot. Quick start installs again.
+        // loggedIn is not a clone. Passing it as fromSnapshot skipped Create snapshot after the files were removed.
         let snapshotSaved = !fromSnapshot && SupportDir.snapshotReady && written
-        _guest = StateObject(wrappedValue: GuestSession(fromSnapshot: loggedIn, diskWritten: written, snapshotSaved: snapshotSaved))
+        _guest = StateObject(wrappedValue: GuestSession(fromSnapshot: fromSnapshot, diskWritten: written, snapshotSaved: snapshotSaved, loggedIn: loggedIn))
     }
 
     /// Quick start stays the download-sized wizard. A clone is the machine window.
@@ -48,30 +52,14 @@ struct Install: View {
     private var capturePointer: Bool { fromSnapshot }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            header
-            if showsGuest && !embedded {
-                guestTop
-            } else if !setup {
-                guestScreen
-                    .frame(width: 800, height: 500)
-            }
-            if setup && !embedded { stepList }
-            Text(disk)
-                .font(.caption)
-                .foregroundStyle(.tertiary)
-                .textSelection(.enabled)
-                .lineLimit(2)
-            if let error = guest.error {
-                Text(error).font(.callout).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true)
-            }
-            actions
-            if let folderError {
-                Text(folderError).font(.caption).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true)
+        Group {
+            if embedded {
+                // Quick start draws the screen and the steps. This copy only keeps the guest running.
+                Color.clear
+            } else {
+                page
             }
         }
-        .padding(24)
-        .frame(width: setup ? 440 : 848, alignment: .topLeading)
         .task {
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 400_000_000)
@@ -79,6 +67,7 @@ struct Install: View {
             }
         }
         .onAppear {
+            slot?.session = guest
             if let steps {
                 guest.steps = steps
             }
@@ -95,8 +84,36 @@ struct Install: View {
             }
         }
         .onDisappear {
+            if slot?.session === guest { slot?.session = nil }
             guest.stop()
         }
+    }
+
+    private var page: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            header
+            if showsGuest {
+                guestTop
+            } else if !setup {
+                guestScreen
+                    .frame(width: 800, height: 500)
+            }
+            if setup { stepList }
+            Text(disk)
+                .font(.caption)
+                .foregroundStyle(.tertiary)
+                .textSelection(.enabled)
+                .lineLimit(2)
+            if let error = guest.error {
+                Text(error).font(.callout).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true)
+            }
+            actions
+            if let folderError {
+                Text(folderError).font(.caption).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(24)
+        .frame(width: setup ? 440 : 848, alignment: .topLeading)
     }
 
     private var header: some View {
@@ -172,7 +189,11 @@ struct Install: View {
             Image(systemName: setupIcon(step.state)).foregroundStyle(setupColor(step.state)).frame(width: 18)
             VStack(alignment: .leading, spacing: 2) {
                 Text(step.title).font(.body.weight(step.state == "now" ? .semibold : .regular))
-                Text(step.detail).font(.caption).foregroundStyle(.secondary)
+                Text(step.detail)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
             }
             Spacer(minLength: 0)
         }
@@ -217,16 +238,22 @@ struct Install: View {
     }
 }
 
-/// The guest in the slot the download page uses for the ISO bar.
-/// Quick start already keeps one session mounted. This is the same slot, not a second installer.
+/// Holds the guest the mounted install started, so the bar slot can draw that screen.
+final class InstallSlotModel: ObservableObject {
+    @Published var session: GuestSession?
+}
+
+/// The guest screen in the slot the download page uses for the ISO bar.
+/// This is the session Quick start already started. It is not a second installer, and it does not draw the step list.
 struct InstallGuest: View {
-    let iso: String
-    let disk: String
+    @ObservedObject var session: GuestSession
 
     var body: some View {
-        Install(iso: iso, disk: disk)
-            .frame(maxWidth: .infinity)
-            .frame(height: 220)
+        GuestView(session: session, capture: false)
+            .background(.black, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .allowsHitTesting(false)
     }
 }
 
@@ -255,11 +282,12 @@ final class GuestSession: NSObject, ObservableObject, VZVirtualMachineDelegate {
     private var saved = false
     private var watch: Timer?
     private var probing = false
+    private var savingSnapshot = false
     private let fromSnapshotBoot: Bool
 
-    init(fromSnapshot: Bool = false, diskWritten: Bool = false, snapshotSaved: Bool = false) {
+    init(fromSnapshot: Bool = false, diskWritten: Bool = false, snapshotSaved: Bool = false, loggedIn: Bool = false) {
         installed = fromSnapshot || diskWritten || snapshotSaved
-        loggedIn = fromSnapshot || snapshotSaved
+        self.loggedIn = fromSnapshot || snapshotSaved || loggedIn
         fromSnapshotBoot = fromSnapshot
         snapshotReady = snapshotSaved
         saved = snapshotSaved
@@ -476,7 +504,9 @@ final class GuestSession: NSObject, ObservableObject, VZVirtualMachineDelegate {
         }
         let proof = GuestSSH.loggedIn(beside: disk)
         let snap = SupportDir.snapshotReady
-        if snapshotReady && !snap {
+        let snapshotDone = setupSteps.first { $0.id == "snapshot" }?.state == "done"
+        // The row can still say done after the files are gone. Copy the installed disk again.
+        if !savingSnapshot && (snapshotReady || snapshotDone) && !snap {
             snapshotReady = false
             saved = false
             showWindow = false
@@ -507,7 +537,15 @@ final class GuestSession: NSObject, ObservableObject, VZVirtualMachineDelegate {
     }
 
     private func noteStopped() {
-        guard !leaving, !stopped else { return }
+        guard !leaving else { return }
+        // Stopping the guest so the snapshot can be copied is not a failed boot.
+        if savingSnapshot {
+            stopped = true
+            watch?.invalidate()
+            machine = nil
+            return
+        }
+        guard !stopped else { return }
         stopped = true
         watch?.invalidate()
         machine = nil
@@ -542,25 +580,49 @@ final class GuestSession: NSObject, ObservableObject, VZVirtualMachineDelegate {
     }
 
     func saveAgain() {
-        guard let disk = diskURL, GuestSSH.loggedIn(beside: disk) else {
-            error = "SSH has not logged in."
+        guard !savingSnapshot, let disk = diskURL, GuestSSH.loggedIn(beside: disk) else {
+            if !savingSnapshot { error = "SSH has not logged in." }
             return
         }
         saved = false
         error = nil
         headline = "Saving a snapshot."
+        markSetup("snapshot", state: "now", detail: SupportDir.snapshotLocation)
         saveSnapshot()
     }
 
+    /// Copy machines/debian after the guest has stopped. A removed snapshot is copied again.
     private func saveSnapshot() {
         guard !saved, let disk = diskURL, GuestSSH.loggedIn(beside: disk) else { return }
         saved = true
+        savingSnapshot = true
+        error = nil
+        if let machine, !stopped {
+            machine.stop { [weak self] _ in
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    self.stopped = true
+                    self.watch?.invalidate()
+                    self.machine = nil
+                    self.copySnapshot(disk)
+                }
+            }
+            return
+        }
+        copySnapshot(disk)
+    }
+
+    private func copySnapshot(_ disk: URL) {
         let support = disk.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let err = Worker.snapshot(dir: support)
             DispatchQueue.main.async {
                 guard let self else { return }
+                self.savingSnapshot = false
                 if let err {
+                    self.saved = false
+                    self.snapshotReady = false
+                    self.stopped = true
                     self.error = err
                     self.failSetup()
                     self.headline = "Debian shut down, but the snapshot was not saved."
@@ -568,6 +630,7 @@ final class GuestSession: NSObject, ObservableObject, VZVirtualMachineDelegate {
                     self.markSetup("snapshot", state: "done", detail: SupportDir.snapshotLocation)
                     self.showWindow = false
                     self.snapshotReady = true
+                    self.stopped = true
                     self.headline = "Debian is installed and shut down. A snapshot is saved for new machines."
                 }
             }
@@ -631,7 +694,15 @@ final class GuestSession: NSObject, ObservableObject, VZVirtualMachineDelegate {
 
     private func markSetup(_ id: String, state: String, detail: String?) {
         guard let index = setupSteps.firstIndex(where: { $0.id == id }) else { return }
-        if let detail, !detail.isEmpty { setupSteps[index].detail = detail }
+        if let detail, !detail.isEmpty {
+            // The short list shows the file name. A full path belongs in the log.
+            if id == "snapshot", detail.hasPrefix("/") || detail == SupportDir.snapshotLocation {
+                setupSteps[index].path = detail
+                setupSteps[index].detail = "snapshots/debian"
+            } else {
+                setupSteps[index].detail = detail
+            }
+        }
         setupSteps[index].state = state
         if state == "done" || state == "now" {
             for earlier in setupSteps.indices where earlier < index && setupSteps[earlier].state != "done" && setupSteps[earlier].state != "fail" {
@@ -642,7 +713,10 @@ final class GuestSession: NSObject, ObservableObject, VZVirtualMachineDelegate {
             var list = steps.wrappedValue
             for row in setupSteps {
                 guard let at = list.firstIndex(where: { $0.id == row.id }) else { continue }
+                // Keep a path the log already stored. The installer row only knows the short label.
+                let path = row.path ?? list[at].path
                 list[at] = row
+                list[at].path = path
             }
             steps.wrappedValue = list
         }

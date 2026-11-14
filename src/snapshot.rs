@@ -94,18 +94,20 @@ fn saved(dir: &Path) -> Saved {
     }
 }
 
+/// Both files, and a real installed disk. A removed or broken copy is not ready, so save replaces it.
 fn snapshot_ready(dir: &Path) -> Result<bool> {
     let ready = dir.join(READY);
     let disk = dir.join(DISK);
     if !ready.is_file() || !disk.is_file() {
         return Ok(false);
     }
-    let text = fs::read_to_string(&ready).map_err(|err| anyhow!("{}: {err}", ready.display()))?;
+    let Ok(text) = fs::read_to_string(&ready) else {
+        return Ok(false);
+    };
     if !text.starts_with("ssh-ok") {
-        bail!("{} is not a Debian snapshot", dir.display());
+        return Ok(false);
     }
-    installed(&disk)?;
-    Ok(true)
+    Ok(installed(&disk).is_ok())
 }
 
 fn installed(disk: &Path) -> Result<()> {
@@ -415,6 +417,32 @@ mod tests {
         assert!(clone_machine(&dir, Some("../x")).is_err());
         assert!(clone_machine(&dir, Some("")).is_err());
         assert!(clone_machine(&dir, Some("debian")).is_err());
+
+        // Deleting the snapshot, or leaving a broken copy, must not keep the old files.
+        fs::remove_dir_all(dir.join("snapshots").join(MACHINE)).unwrap();
+        let recopied = save(&dir).unwrap();
+        let mut recopied_buf = [0u8; 7];
+        let mut recopied_disk = File::open(&recopied.disk).unwrap();
+        recopied_disk.seek(SeekFrom::Start(600)).unwrap();
+        recopied_disk.read_exact(&mut recopied_buf).unwrap();
+        assert_eq!(&recopied_buf, b"CHANGED");
+        assert_eq!(fs::read(recopied.dir.join(NVRAM)).unwrap(), b"mutated");
+        assert!(fs::read_to_string(recopied.dir.join(READY))
+            .unwrap()
+            .starts_with("ssh-ok"));
+
+        fs::write(recopied.dir.join(READY), b"nope").unwrap();
+        fs::write(&recopied.disk, b"short").unwrap();
+        let replaced = save(&dir).unwrap();
+        assert_eq!(replaced.disk.metadata().unwrap().len(), GUEST);
+        let mut replaced_buf = [0u8; 7];
+        let mut replaced_disk = File::open(&replaced.disk).unwrap();
+        replaced_disk.seek(SeekFrom::Start(600)).unwrap();
+        replaced_disk.read_exact(&mut replaced_buf).unwrap();
+        assert_eq!(&replaced_buf, b"CHANGED");
+        assert!(fs::read_to_string(replaced.dir.join(READY))
+            .unwrap()
+            .starts_with("ssh-ok"));
         let _ = fs::remove_dir_all(&dir);
     }
 

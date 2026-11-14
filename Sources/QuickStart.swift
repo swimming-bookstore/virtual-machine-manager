@@ -31,7 +31,7 @@ struct WizardStep: Identifiable {
         WizardStep(id: "installer", title: "Start the installer", detail: "boot.iso", state: "wait"),
         WizardStep(id: "partition", title: "Install guest", detail: "disk.img", state: "wait"),
         WizardStep(id: "ssh", title: "Log in with the host key", detail: "guest port 22", state: "wait"),
-        WizardStep(id: "snapshot", title: "Save a snapshot", detail: SupportDir.snapshotLocation, state: "wait"),
+        WizardStep(id: "snapshot", title: "Create snapshot", detail: "snapshots/debian", state: "wait"),
     ]
 
     static var isoName: String {
@@ -59,7 +59,7 @@ struct WorkerEvent: Decodable {
 
 final class Wizard: ObservableObject {
     @Published var steps = WizardStep.initial + WizardStep.preseed + WizardStep.setup
-    /// The short list is Download ISO, Install guest, and Save snapshot. Log opens the rest, in order.
+    /// The short list is Download ISO, Install guest, and Create snapshot. Log opens the rest, in order.
     @Published var showLog = false
     @Published var received = 0.0
     @Published var total = 0.0
@@ -255,7 +255,10 @@ final class Wizard: ObservableObject {
         case "sshkey": return "id_ed25519"
         case "preseed": return "preseed.img"
         case "disk": return "disk.img"
-        case "patch": return "boot.iso"
+        case "patch", "installer": return "boot.iso"
+        case "partition": return "disk.img"
+        case "ssh": return "guest port 22"
+        case "snapshot": return "snapshots/debian"
         default: return ""
         }
     }
@@ -284,7 +287,7 @@ final class Wizard: ObservableObject {
         supportSource = nil
         buffer.removeAll()
         steps = WizardStep.initial + WizardStep.preseed + WizardStep.setup
-        showAll = false
+        showLog = false
         received = 0
         total = 0
         downloading = false
@@ -577,27 +580,28 @@ enum WorkerPath {
 
 struct QuickStart: View {
     @StateObject private var wizard = Wizard()
+    @StateObject private var installSlot = InstallSlotModel()
     @State private var folderError: String?
 
     var body: some View {
-        // One page. Install stays mounted under the list so the guest is not stopped to show a step.
-        // The top slot is the download bar until the guest starts, then that guest.
-        ZStack(alignment: .topLeading) {
-            if let iso = wizard.readyPath, let disk = wizard.diskPath, wizard.error == nil {
-                Install(iso: iso, disk: disk, embedded: true, steps: $wizard.steps, missingFile: $wizard.missingFile)
-                    .opacity(0)
-                    .allowsHitTesting(false)
-                    .accessibilityHidden(true)
-                    .frame(width: 0, height: 0)
-                    .clipped()
+        // One page. Install stays mounted so the guest is not stopped to show a step.
+        // A zero-size mount never appears, so the install guest row and the screen never start.
+        // The top slot draws that same guest. The step list stays under it.
+        download
+            .background {
+                if let iso = wizard.readyPath, let disk = wizard.diskPath, wizard.error == nil {
+                    Install(iso: iso, disk: disk, embedded: true, steps: $wizard.steps, missingFile: $wizard.missingFile, slot: installSlot)
+                        .opacity(0)
+                        .allowsHitTesting(false)
+                        .accessibilityHidden(true)
+                }
             }
-            download
-        }
         .onAppear { wizard.start() }
         .task {
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 400_000_000)
                 wizard.cacheWentAway()
+                installSlot.session?.noteMissingFiles()
             }
         }
     }
@@ -627,7 +631,7 @@ struct QuickStart: View {
             .buttonStyle(.plain)
             .font(.caption)
             .foregroundStyle(.secondary)
-            if let error = wizard.error {
+            if let error = wizard.error ?? installSlot.session?.error {
                 Text(error).font(.callout).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true)
             }
             HStack {
@@ -635,6 +639,8 @@ struct QuickStart: View {
                 Spacer(minLength: 12)
                 if wizard.error != nil || wizard.cancelled {
                     Button("Try again", action: wizard.retry).buttonStyle(.borderedProminent)
+                } else if let session = installSlot.session, session.error != nil, session.installed, !session.snapshotReady, let disk = wizard.diskPath, GuestSSH.loggedIn(beside: URL(fileURLWithPath: disk)) {
+                    Button("Save snapshot") { session.saveAgain() }.buttonStyle(.bordered)
                 } else if wizard.readyPath == nil {
                     Button("Cancel", role: .cancel, action: wizard.cancel).buttonStyle(.bordered)
                 }
@@ -650,7 +656,7 @@ struct QuickStart: View {
 
     private var stepList: some View {
         VStack(spacing: 0) {
-            let shown = wizard.visibleSteps
+            let shown = wizard.visibleSteps.map(displayed)
             ForEach(shown) { step in
                 row(step).id(step.id + step.state + step.detail)
                 if step.id != shown.last?.id { Divider().padding(.leading, 42) }
@@ -659,11 +665,32 @@ struct QuickStart: View {
         .background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
     }
 
-    /// Download bar, then the guest once install starts. Same switch on the setup page.
+    /// One install row in the short list. It follows the guest from the installer through the SSH check.
+    /// The log still lists those steps on their own rows.
+    private func displayed(_ step: WizardStep) -> WizardStep {
+        guard !wizard.showLog, step.id == "partition" else { return step }
+        let phase = ["installer", "partition", "ssh"]
+        if let current = wizard.steps.last(where: { phase.contains($0.id) && ($0.state == "now" || $0.state == "fail") }) {
+            var shown = step
+            shown.state = current.state
+            shown.detail = current.id == "partition" ? current.detail : current.title
+            return shown
+        }
+        if wizard.steps.contains(where: { $0.id == "ssh" && $0.state == "done" }) {
+            var shown = step
+            shown.state = "done"
+            shown.detail = "Installed"
+            return shown
+        }
+        return step
+    }
+
+    /// Download bar, then the guest once install starts. The step list stays under this slot.
     @ViewBuilder private var top: some View {
-        if let iso = wizard.readyPath, let disk = wizard.diskPath, wizard.error == nil, !SupportDir.snapshotReady {
-            InstallGuest(iso: iso, disk: disk)
-                .frame(height: 160)
+        if wizard.readyPath != nil, wizard.diskPath != nil, wizard.error == nil, !SupportDir.snapshotReady, let session = installSlot.session {
+            InstallGuest(session: session)
+                .frame(maxWidth: .infinity)
+                .frame(height: 220)
         } else {
             progress
         }
