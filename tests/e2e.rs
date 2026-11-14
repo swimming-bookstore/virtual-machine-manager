@@ -1658,6 +1658,13 @@ fn deleting_the_debian_disk_clears_the_window_and_starts_again() {
     assert!(disk.is_file(), "prepare must write the guest disk again");
     assert_eq!(screen.disk_path.as_deref(), Some(disk.to_str().unwrap()));
     assert!(screen.installing());
+    assert!(
+        !std::fs::read_dir(dir.join("ssh"))
+            .unwrap()
+            .flatten()
+            .any(|item| item.file_name() == "logged-in"),
+        "a new empty disk must not inherit the previous login"
+    );
 }
 
 #[test]
@@ -2014,6 +2021,95 @@ fn a_cached_iso_does_not_show_the_download_bar() {
     assert_eq!(screen.row("preseed").state, "done");
 }
 
+/// Reopen is a new process. The ISO is cached, so the worker is fast, then the window
+/// builds Install again. A disk the installer already wrote must boot alone.
+#[test]
+fn reopening_quick_start_boots_the_installed_disk() {
+    let (base, _) = serve(SUMS, SIGN, ISO, KEY, false, false, false);
+    let dir = dir();
+    let (status, events) = wait(spawn(&base, &dir));
+    assert_eq!(status, 0, "{events:?}");
+    let disk = dir.join("machines/debian/disk.img");
+    let mut file = std::fs::OpenOptions::new().write(true).open(&disk).unwrap();
+    use std::io::{Seek, SeekFrom, Write};
+    file.seek(SeekFrom::Start(510)).unwrap();
+    file.write_all(&[0x55, 0xaa]).unwrap();
+    drop(file);
+
+    let (status, again) = wait(spawn(&base, &dir));
+    assert_eq!(status, 0, "{again:?}");
+    let screen = finish(&again, status);
+    assert!(screen.installing());
+    assert_eq!(screen.disk_path.as_deref(), Some(disk.to_str().unwrap()));
+    let boot = reopen_boot(screen.disk_path.as_deref().unwrap());
+    assert_eq!(boot.headline.as_deref(), Some("Starting Debian."));
+    assert!(boot.installed);
+    assert!(!boot.attaches_installer, "{boot:?}");
+
+    std::fs::remove_file(&disk).unwrap();
+    std::fs::write(dir.join("ssh/logged-in"), b"debian ok\n").unwrap();
+    let (status, fresh) = wait(spawn(&base, &dir));
+    assert_eq!(status, 0, "{fresh:?}");
+    assert!(
+        !dir.join("ssh/logged-in").exists(),
+        "recreating disk.img must drop the login that belonged to the deleted disk"
+    );
+    let boot = reopen_boot(dir.join("machines/debian/disk.img").to_str().unwrap());
+    assert!(!boot.installed);
+    assert!(boot.attaches_installer);
+    assert_eq!(boot.headline.as_deref(), Some("Starting the installer."));
+}
+
+/// Same choice as Install.onAppear after Quick start emits ready.
+fn reopen_boot(disk: &str) -> Reopen {
+    let url = std::path::Path::new(disk);
+    let logged_in = guest_logged_in(url);
+    let looks = disk_looks_installed(url);
+    let installed = logged_in || looks;
+    Reopen {
+        installed,
+        attaches_installer: !installed,
+        headline: Some(if installed {
+            "Starting Debian.".into()
+        } else {
+            "Starting the installer.".into()
+        }),
+    }
+}
+
+fn guest_logged_in(disk: &std::path::Path) -> bool {
+    let beside = disk.parent().unwrap().join("logged-in");
+    let shared = disk
+        .parent()
+        .and_then(|dir| dir.parent())
+        .and_then(|dir| dir.parent())
+        .unwrap()
+        .join("ssh/logged-in");
+    [beside, shared].into_iter().any(|path| {
+        std::fs::read_to_string(path)
+            .ok()
+            .is_some_and(|text| text.starts_with("debian") && text.contains("ok"))
+    })
+}
+
+fn disk_looks_installed(disk: &std::path::Path) -> bool {
+    let mut file = match std::fs::File::open(disk) {
+        Ok(file) => file,
+        Err(_) => return false,
+    };
+    let mut sector = [0u8; 512];
+    std::io::Read::read_exact(&mut file, &mut sector).is_ok()
+        && sector[510] == 0x55
+        && sector[511] == 0xaa
+}
+
+#[derive(Debug)]
+struct Reopen {
+    installed: bool,
+    attaches_installer: bool,
+    headline: Option<String>,
+}
+
 #[test]
 fn quick_start_swift_gates_the_bar_on_a_real_download() {
     let src = include_str!("../Sources/QuickStart.swift");
@@ -2024,6 +2120,9 @@ fn quick_start_swift_gates_the_bar_on_a_real_download() {
     assert!(src.contains("static let preseed"));
     assert!(include_str!("../Sources/Install.swift").contains("Installing Debian"));
     assert!(include_str!("../Sources/Install.swift").contains("guest.start(iso: iso, disk: disk)"));
+    assert!(include_str!("../Sources/Install.swift").contains("guest.bootDisk(disk)"));
+    assert!(include_str!("../Sources/Install.swift").contains("InstalledDisk.looksInstalled"));
+    assert!(include_str!("../Sources/Guest.swift").contains("func forget(beside disk: URL)"));
     assert!(include_str!("../Sources/Install.swift").contains("SSH login succeeded. Saving a snapshot."));
     assert!(include_str!("../Sources/Install.swift").contains("New virtual machine"));
     assert!(include_str!("../Sources/Guest.swift").contains("GuestSSH"));

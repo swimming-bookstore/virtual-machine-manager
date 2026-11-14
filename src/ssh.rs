@@ -42,12 +42,29 @@ pub fn ensure(dir: &Path) -> Result<Keys> {
 }
 
 /// True only after a login with the host key has been recorded.
+/// The proof may sit in `ssh/` or beside the disk that was reached.
 pub fn logged_in(dir: &Path) -> Result<bool> {
-    let proof = dir.join(PROOF);
+    proof_ok(&dir.join(PROOF))
+}
+
+pub fn logged_in_beside(disk: &Path) -> Result<bool> {
+    let Some(guest) = disk.parent() else {
+        return Ok(false);
+    };
+    if proof_ok(&guest.join(PROOF))? {
+        return Ok(true);
+    }
+    let Some(support) = guest.parent().and_then(|dir| dir.parent()) else {
+        return Ok(false);
+    };
+    proof_ok(&support.join("ssh").join(PROOF))
+}
+
+fn proof_ok(proof: &Path) -> Result<bool> {
     if !proof.is_file() {
         return Ok(false);
     }
-    let text = fs::read_to_string(&proof).map_err(|err| anyhow!("{}: {err}", proof.display()))?;
+    let text = fs::read_to_string(proof).map_err(|err| anyhow!("{}: {err}", proof.display()))?;
     Ok(text.starts_with(USER) && text.contains("ok"))
 }
 
@@ -62,6 +79,16 @@ pub fn probe(dir: &Path, host: &str) -> Result<bool> {
     }
     write_new(&dir.join(PROOF), format!("{USER} ok\n").as_bytes())?;
     Ok(true)
+}
+
+/// Same login, stored next to the disk so a later open can tell this disk from a new empty one.
+pub fn record_login_beside(disk: &Path) -> Result<()> {
+    let Some(guest) = disk.parent() else {
+        bail!("guest disk has no directory");
+    };
+    fs::create_dir_all(guest)?;
+    write_new(&guest.join(PROOF), format!("{USER} ok\n").as_bytes())?;
+    Ok(())
 }
 
 /// Keep trying until the guest answers or the wait runs out.

@@ -174,9 +174,12 @@ final class Wizard: ObservableObject {
     }
 
     /// `disk.img` is the installed system. Removing it is not a finished install.
+    /// The login proof is not that disk. Leave it and the next empty disk looks finished.
     private func diskMissing() -> Bool {
         guard let diskPath else { return false }
-        return !FileManager.default.fileExists(atPath: diskPath)
+        let gone = !FileManager.default.fileExists(atPath: diskPath)
+        if gone { GuestSSH.forget(beside: URL(fileURLWithPath: diskPath)) }
+        return gone
     }
 
     private func watch(_ path: String) {

@@ -34,10 +34,12 @@ pub struct Saved {
 pub fn save(support: &Path) -> Result<Saved> {
     let guest = support.join("machines").join(MACHINE);
     let disk = guest.join(DISK);
-    if !ssh::logged_in(&support.join("ssh"))? {
+    if !ssh::logged_in(&support.join("ssh"))? && !ssh::logged_in_beside(&disk)? {
         bail!("install is not finished: SSH has not logged in");
     }
     installed(&disk)?;
+    // The next Quick start reads this file beside the disk, not only the app-wide proof.
+    ssh::record_login_beside(&disk)?;
     let dest = support.join("snapshots").join(MACHINE);
     if snapshot_ready(&dest)? {
         return Ok(saved(&dest));

@@ -70,16 +70,32 @@ enum Guest {
 }
 
 /// The host key. The install is finished only after this key logs in.
+/// The proof sits beside the disk it reached. One app-wide file would still say "ok" after that disk was deleted.
 enum GuestSSH {
     static func dir(beside disk: URL) -> URL {
         disk.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
             .appendingPathComponent("ssh", isDirectory: true)
     }
 
+    static func proof(beside disk: URL) -> URL {
+        disk.deletingLastPathComponent().appendingPathComponent("logged-in")
+    }
+
     static func loggedIn(beside disk: URL) -> Bool {
-        let proof = dir(beside: disk).appendingPathComponent("logged-in")
-        guard let text = try? String(contentsOf: proof, encoding: .utf8) else { return false }
-        return text.hasPrefix(Guest.user) && text.contains("ok")
+        for url in [proof(beside: disk), dir(beside: disk).appendingPathComponent("logged-in")] {
+            if let text = try? String(contentsOf: url, encoding: .utf8),
+               text.hasPrefix(Guest.user) && text.contains("ok") {
+                return true
+            }
+        }
+        return false
+    }
+
+    /// The disk is gone, so the old login is not a finished install.
+    static func forget(beside disk: URL) {
+        for url in [proof(beside: disk), dir(beside: disk).appendingPathComponent("logged-in")] {
+            try? FileManager.default.removeItem(at: url)
+        }
     }
 
     /// One attempt. A closed port is not a finished install.
@@ -106,8 +122,20 @@ enum GuestSSH {
         guard (try? process.run()) != nil else { return false }
         process.waitUntilExit()
         guard process.terminationStatus == 0 else { return false }
-        let proof = folder.appendingPathComponent("logged-in")
-        try? "\(Guest.user) ok\n".write(to: proof, atomically: true, encoding: .utf8)
+        let line = "\(Guest.user) ok\n"
+        try? line.write(to: proof(beside: disk), atomically: true, encoding: .utf8)
+        try? line.write(to: folder.appendingPathComponent("logged-in"), atomically: true, encoding: .utf8)
         return true
+    }
+}
+
+/// A disk the installer already wrote. An empty sparse file is not that disk.
+enum InstalledDisk {
+    static func looksInstalled(_ path: String) -> Bool {
+        let url = URL(fileURLWithPath: path)
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return false }
+        defer { try? handle.close() }
+        guard let sector = try? handle.read(upToCount: 512), sector.count == 512 else { return false }
+        return sector[510] == 0x55 && sector[511] == 0xaa
     }
 }

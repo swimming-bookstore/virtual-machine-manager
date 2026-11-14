@@ -4,6 +4,7 @@ import Virtualization
 /// The screen after the download. The installer writes `disk.img`; that file is the installed system.
 /// A finished preseed powers the guest off. SSH login, not the installer screen, is the finish check.
 /// This view then snapshots that disk so later machines are clones.
+/// Reopening Quick start boots that disk alone. It does not attach the installer again.
 struct Install: View {
     let iso: String
     let disk: String
@@ -15,7 +16,8 @@ struct Install: View {
         self.iso = iso
         self.disk = disk
         self.fromSnapshot = fromSnapshot
-        _guest = StateObject(wrappedValue: GuestSession(fromSnapshot: fromSnapshot))
+        let installed = fromSnapshot || GuestSSH.loggedIn(beside: URL(fileURLWithPath: disk)) || InstalledDisk.looksInstalled(disk)
+        _guest = StateObject(wrappedValue: GuestSession(fromSnapshot: installed))
     }
 
     var body: some View {
@@ -60,7 +62,9 @@ struct Install: View {
         .padding(24)
         .frame(width: 848, alignment: .topLeading)
         .onAppear {
-            if fromSnapshot {
+            // A clone, a login, or a disk the installer already partitioned boots alone.
+            // Attaching boot.iso here is a new install: the preseed writes a new label on /dev/vda.
+            if fromSnapshot || guest.installed {
                 guest.bootDisk(disk)
             } else {
                 guest.start(iso: iso, disk: disk)
@@ -117,8 +121,8 @@ final class GuestSession: NSObject, ObservableObject, VZVirtualMachineDelegate {
         error = nil
         stopped = false
         diskURL = URL(fileURLWithPath: disk)
-        // Reopening Quick start must not boot the installer over a disk SSH already reached.
-        if GuestSSH.loggedIn(beside: diskURL!) {
+        // Reopening Quick start must not boot the installer over a disk that already has a system.
+        if GuestSSH.loggedIn(beside: diskURL!) || InstalledDisk.looksInstalled(disk) {
             installed = true
             installing = false
             checking = true

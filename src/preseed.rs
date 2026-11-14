@@ -107,6 +107,7 @@ pub struct Prepared {
 }
 
 /// Writes the answer disk, the boot ISO, and the empty guest disk.
+/// A missing disk is a new install. The previous login does not apply to the empty file written here.
 pub fn prepare(cache: &Path, iso: &Path, support: &Path) -> Result<Prepared> {
     if !iso.is_file() {
         bail!("installer image is missing: {}", iso.display());
@@ -120,9 +121,16 @@ pub fn prepare(cache: &Path, iso: &Path, support: &Path) -> Result<Prepared> {
         .map_err(|err| anyhow!("cannot create {}: {err}", guest.display()))?;
     let disk = guest.join(DISK);
     if !disk.is_file() {
+        forget_login(support, &guest);
         sparse(&disk, GUEST)?;
     }
     Ok(Prepared { disk, key: support.join("ssh").join(AUTHORIZED) })
+}
+
+/// `ssh/logged-in` is one file for the app. Deleting `disk.img` does not remove it.
+fn forget_login(support: &Path, guest: &Path) {
+    let _ = fs::remove_file(support.join("ssh").join("logged-in"));
+    let _ = fs::remove_file(guest.join("logged-in"));
 }
 
 fn read_key(path: &Path) -> Result<String> {
