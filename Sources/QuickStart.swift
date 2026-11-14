@@ -77,6 +77,7 @@ final class Wizard: ObservableObject {
     private var buffer = Data()
     private var source: DispatchSourceFileSystemObject?
     private var diskSource: DispatchSourceFileSystemObject?
+    private var supportSource: DispatchSourceFileSystemObject?
 
     var fraction: Double { total > 0 ? min(received / total, 1) : 0 }
     var percent: Int { Int((fraction * 100).rounded()) }
@@ -134,6 +135,7 @@ final class Wizard: ObservableObject {
             self.process = process
             try? FileManager.default.createDirectory(at: CacheFolder.url, withIntermediateDirectories: true)
             watch(CacheFolder.url.path)
+            watchSupport()
         } catch {
             self.error = "Could not start the worker. \(error.localizedDescription)"
             headline = "Could not start"
@@ -151,6 +153,7 @@ final class Wizard: ObservableObject {
     deinit {
         source?.cancel()
         diskSource?.cancel()
+        supportSource?.cancel()
         output?.readabilityHandler = nil
     }
 
@@ -205,13 +208,13 @@ final class Wizard: ObservableObject {
                 && has(support.appendingPathComponent("ssh/id_ed25519.pub"))
                 && has(support.appendingPathComponent("ssh/authorized_keys"))
         case "preseed":
-            return has(cache.appendingPathComponent("preseed.img"))
+            return has(support.appendingPathComponent("preseed.img"))
         case "disk":
             let disk = diskPath.map { URL(fileURLWithPath: $0) }
                 ?? support.appendingPathComponent("machines/debian/disk.img")
             return has(disk)
         case "patch":
-            return has(cache.appendingPathComponent("boot.iso"))
+            return has(support.appendingPathComponent("boot.iso"))
         default:
             return true
         }
@@ -269,6 +272,8 @@ final class Wizard: ObservableObject {
         source = nil
         diskSource?.cancel()
         diskSource = nil
+        supportSource?.cancel()
+        supportSource = nil
         buffer.removeAll()
         steps = WizardStep.initial
         page = 0
@@ -309,6 +314,21 @@ final class Wizard: ObservableObject {
         src.setCancelHandler { close(fd) }
         src.resume()
         diskSource = src
+    }
+
+    /// preseed.img and boot.iso sit beside the cache. Deleting them does not write the cache folder.
+    private func watchSupport() {
+        supportSource?.cancel()
+        supportSource = nil
+        let support = CacheFolder.url.deletingLastPathComponent()
+        try? FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
+        let fd = open(support.path, O_EVTONLY)
+        guard fd >= 0 else { return }
+        let src = DispatchSource.makeFileSystemObjectSource(fileDescriptor: fd, eventMask: [.write, .delete, .rename], queue: .main)
+        src.setEventHandler { [weak self] in self?.cacheWentAway() }
+        src.setCancelHandler { close(fd) }
+        src.resume()
+        supportSource = src
     }
 
     private func reap(_ done: Process?) {
@@ -368,6 +388,7 @@ final class Wizard: ObservableObject {
                 }
                 if let path = event.path { watch((path as NSString).deletingLastPathComponent) }
                 if let disk = event.disk { watchDisk(disk) }
+                watchSupport()
             }
             follow()
         case "error":
@@ -485,7 +506,7 @@ private func openFolder(_ folder: URL, name: String) -> String? {
 enum SupportDir {
     static var url: URL { CacheFolder.url.deletingLastPathComponent() }
 
-    /// Host key, cache, guest disk, and snapshot. Prepare and setup are not only the cache.
+    /// Host key, preseed, boot copy, cache, guest disk, and snapshot. Prepare and setup are not the download cache.
     static func open() -> String? {
         openFolder(url, name: "folder")
     }

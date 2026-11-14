@@ -337,9 +337,9 @@ final class GuestSession: NSObject, ObservableObject, VZVirtualMachineDelegate {
         setupSteps = WizardStep.setup
         markSetup("installer", state: "now", detail: "boot.iso")
         headline = "Starting the installer."
-        let folder = URL(fileURLWithPath: iso).deletingLastPathComponent()
-        let installer = folder.appendingPathComponent("boot.iso")
-        let preseed = folder.appendingPathComponent("preseed.img")
+        let support = URL(fileURLWithPath: iso).deletingLastPathComponent().deletingLastPathComponent()
+        let installer = support.appendingPathComponent("boot.iso")
+        let preseed = support.appendingPathComponent("preseed.img")
         boot {
             try Guest.boot(iso: installer, preseed: preseed, disk: diskURL!)
         }

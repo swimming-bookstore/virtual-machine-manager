@@ -350,7 +350,7 @@ mod tests {
         .unwrap();
         let iso = dir.join("cache").join("debian.iso");
         fs::write(&iso, b"iso").unwrap();
-        let prepared = preseed::prepare(&dir.join("cache"), &iso, &dir).unwrap().0;
+        let prepared = preseed::prepare(&iso, &dir).unwrap().0;
         assert!(save(&dir)
             .unwrap_err()
             .to_string()

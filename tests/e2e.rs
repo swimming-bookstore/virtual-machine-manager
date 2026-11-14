@@ -646,8 +646,10 @@ fn quick_start_checks_the_signature_before_the_iso() {
     assert_eq!(setup.buttons(), ["Open folder", "Back", "Show installer"]);
     assert_eq!(setup.row("installer").state, "now");
     assert!(!setup.captures_pointer());
-    assert!(dir.join("cache/preseed.img").is_file());
-    assert!(dir.join("cache/boot.iso").is_file());
+    assert!(dir.join("preseed.img").is_file());
+    assert!(dir.join("boot.iso").is_file());
+    assert!(!dir.join("cache/preseed.img").exists());
+    assert!(!dir.join("cache/boot.iso").exists());
     assert_eq!(
         std::fs::metadata(dir.join("machines/debian/disk.img"))
             .unwrap()
@@ -1318,7 +1320,7 @@ impl Screen {
                     && has(&support.join("ssh/id_ed25519.pub"))
                     && has(&support.join("ssh/authorized_keys"))
             }
-            "preseed" => has(&cache.join("preseed.img")),
+            "preseed" => has(&support.join("preseed.img")),
             "disk" => {
                 let disk = self
                     .disk_path
@@ -1327,7 +1329,7 @@ impl Screen {
                     .unwrap_or_else(|| support.join("machines/debian/disk.img"));
                 has(&disk)
             }
-            "patch" => has(&cache.join("boot.iso")),
+            "patch" => has(&support.join("boot.iso")),
             _ => true,
         }
     }
@@ -2200,12 +2202,12 @@ fn a_removed_file_reruns_from_the_step_that_wrote_it() {
         ("cache/SHA512SUMS", "sums"),
         ("cache/SHA512SUMS.sign", "sign"),
         ("cache/manifest.json", "verify"),
-        ("cache/preseed.img", "preseed"),
+        ("preseed.img", "preseed"),
         ("ssh/id_ed25519", "sshkey"),
         ("ssh/id_ed25519.pub", "sshkey"),
         ("ssh/authorized_keys", "sshkey"),
         ("machines/debian/disk.img", "disk"),
-        ("cache/boot.iso", "patch"),
+        ("boot.iso", "patch"),
     ];
     for (rel, step) in files {
         let path = dir.join(rel);
@@ -2230,7 +2232,7 @@ fn a_removed_file_reruns_from_the_step_that_wrote_it() {
         "nvram and the lock are not wizard steps"
     );
 
-    std::fs::remove_file(cache.join("preseed.img")).unwrap();
+    std::fs::remove_file(dir.join("preseed.img")).unwrap();
     assert!(screen.cache_went_away(&cache));
     assert_eq!(screen.resume_from.as_deref(), Some("preseed"));
     assert_eq!(screen.row("verify").state, "done");
@@ -2246,7 +2248,8 @@ fn a_removed_file_reruns_from_the_step_that_wrote_it() {
         log_of(&world).is_empty(),
         "preseed.img does not download again"
     );
-    assert!(cache.join("preseed.img").is_file());
+    assert!(dir.join("preseed.img").is_file());
+    assert!(!cache.join("preseed.img").exists());
     assert!(events
         .iter()
         .any(|event| event["step"] == "preseed" && event["state"] == "now"));
@@ -2263,7 +2266,7 @@ fn a_removed_file_reruns_from_the_step_that_wrote_it() {
     assert_eq!(screen.row("patch").detail, "boot.iso");
     assert!(screen.installing());
 
-    std::fs::remove_file(cache.join("boot.iso")).unwrap();
+    std::fs::remove_file(dir.join("boot.iso")).unwrap();
     assert!(screen.cache_went_away(&cache));
     assert_eq!(screen.resume_from.as_deref(), Some("patch"));
     assert_eq!(screen.row("preseed").state, "done");
@@ -2272,7 +2275,7 @@ fn a_removed_file_reruns_from_the_step_that_wrote_it() {
     let (status, events) = wait(spawn_from(&base, &dir, Some("patch")));
     assert_eq!(status, 0, "{events:?}");
     assert!(log_of(&world).is_empty());
-    assert!(cache.join("boot.iso").is_file());
+    assert!(dir.join("boot.iso").is_file());
     assert!(events.iter().all(|event| event["step"] != "preseed"));
     for event in &events {
         screen.apply(event);
@@ -2306,7 +2309,8 @@ fn a_removed_file_reruns_from_the_step_that_wrote_it() {
     screen.worker_exited(status);
     assert_eq!(screen.row("sums").state, "done");
     assert_eq!(screen.row("preseed").state, "done");
-    assert!(cache.join("preseed.img").is_file());
+    assert!(dir.join("preseed.img").is_file());
+    assert!(!cache.join("preseed.img").exists());
 }
 
 #[test]
@@ -3276,7 +3280,9 @@ fn quick_start_swift_gates_the_bar_on_a_real_download() {
     assert!(include_str!("../Sources/Install.swift").contains("Button(\"Next\", action: onForward)"));
     assert!(include_str!("../Sources/Install.swift").contains("let shown = guest.setupSteps"));
     assert!(src.contains("args += [\"--from\", resume]"));
-    assert!(src.contains("preseed.img"));
+    assert!(src.contains("support.appendingPathComponent(\"preseed.img\")"));
+    assert!(src.contains("support.appendingPathComponent(\"boot.iso\")"));
+    assert!(include_str!("../Sources/Install.swift").contains("deletingLastPathComponent().deletingLastPathComponent()"));
     assert!(src.contains("firstMissing"));
     assert!(include_str!("../Sources/Install.swift").contains("func noteMissingFiles"));
     assert!(

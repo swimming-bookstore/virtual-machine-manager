@@ -404,14 +404,14 @@ fn require_earlier(cache: &Path, support: &Path, arch: &str, start: &str) -> Res
                 need(&support.join("ssh").join("id_ed25519.pub"))?;
                 need(&support.join("ssh").join(preseed::AUTHORIZED))?;
             }
-            "preseed" => need(&cache.join(preseed::FILE))?,
+            "preseed" => need(&support.join(preseed::FILE))?,
             "disk" => need(
                 &support
                     .join("machines")
                     .join(preseed::MACHINE)
                     .join(preseed::DISK),
             )?,
-            "patch" => need(&cache.join(preseed::BOOT))?,
+            "patch" => need(&support.join(preseed::BOOT))?,
             other => bail!("unknown step {other}"),
         }
     }
@@ -547,7 +547,7 @@ fn run(dir: &Path, from: Option<&str>, order: &Sender<OrderMsg>) -> Result<()> {
     }
     if reaches(start, "preseed") {
         step("preseed", "now", preseed::FILE, order);
-        preseed::write_preseed(&cache, dir)?;
+        preseed::write_preseed(dir)?;
         step("preseed", "done", preseed::FILE, order);
     }
     if reaches(start, "disk") {
@@ -555,7 +555,7 @@ fn run(dir: &Path, from: Option<&str>, order: &Sender<OrderMsg>) -> Result<()> {
         preseed::write_guest_disk(dir)?;
         step("disk", "done", preseed::DISK, order);
     }
-    preseed::prepare_installer(&cache, &dest, dir)?;
+    preseed::prepare_installer(&dest, dir)?;
     step("patch", "now", preseed::BOOT, order);
     step("patch", "done", preseed::BOOT, order);
     let prepared = preseed::Prepared {
@@ -583,7 +583,7 @@ struct Cli {
 enum Command {
     /// Download the Debian 13 installer and check its signature.
     Download {
-        /// Cache parent. The installer is written to PATH/cache. Defaults to the app support directory.
+        /// Support directory. Downloads go in PATH/cache. preseed.img and boot.iso stay beside that cache. Defaults to the app support directory.
         #[arg(long, value_name = "PATH")]
         dir: Option<PathBuf>,
         /// Run again from this step. Earlier steps already have their files and are not repeated.
