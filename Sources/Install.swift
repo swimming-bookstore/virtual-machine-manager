@@ -153,7 +153,7 @@ final class GuestSession: NSObject, ObservableObject, VZVirtualMachineDelegate {
     }
 
     /// The installer powers off when the preseed check passes. The next start is the disk it wrote.
-/// A black installer screen is not finished. SSH after this boot is.
+    /// A black installer screen is not finished. SSH after this boot is.
     func startInstalled() {
         guard let disk = diskURL else { return }
         error = nil
@@ -198,7 +198,6 @@ final class GuestSession: NSObject, ObservableObject, VZVirtualMachineDelegate {
     private func checkSSH() {
         guard installed, checking, !snapshotReady, !probing, let disk = diskURL, machine?.state == .running else { return }
         probing = true
-        let disk = disk
         DispatchQueue.global(qos: .utility).async { [weak self] in
             let ok = GuestSSH.probe(beside: disk)
             DispatchQueue.main.async {
