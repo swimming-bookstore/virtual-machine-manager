@@ -2042,16 +2042,18 @@ fn reopening_quick_start_boots_the_installed_disk() {
     assert!(screen.installing());
     assert_eq!(screen.disk_path.as_deref(), Some(disk.to_str().unwrap()));
     let boot = reopen_boot(screen.disk_path.as_deref().unwrap());
-    assert_eq!(boot.headline.as_deref(), Some("Starting the installer."));
-    assert!(!boot.installed, "a partition table is not an SSH login");
-    assert!(boot.attaches_installer, "{boot:?}");
-    assert!(!boot.captures_pointer);
+    assert_eq!(boot.headline.as_deref(), Some("Debian is already installed. Checking SSH."));
+    assert!(boot.installed);
+    assert!(!boot.attaches_installer, "{boot:?}");
+    assert!(!boot.captures_pointer, "a written disk boots in the popup with no pointer");
+    assert!(boot.checks_ssh);
 
     std::fs::write(disk.parent().unwrap().join("logged-in"), b"debian ok\n").unwrap();
     let boot = reopen_boot(disk.to_str().unwrap());
-    assert_eq!(boot.headline.as_deref(), Some("Starting Debian."));
+    assert_eq!(boot.headline.as_deref(), Some("Debian is already installed. Checking SSH."));
     assert!(boot.installed);
     assert!(!boot.attaches_installer, "{boot:?}");
+    assert!(boot.checks_ssh);
     assert!(!boot.captures_pointer, "quick start checks SSH in the popup and does not capture");
 
     std::fs::remove_file(&disk).unwrap();
@@ -2066,20 +2068,23 @@ fn reopening_quick_start_boots_the_installed_disk() {
     assert!(!boot.installed);
     assert!(boot.attaches_installer);
     assert!(!boot.captures_pointer);
+    assert!(!boot.checks_ssh);
     assert_eq!(boot.headline.as_deref(), Some("Starting the installer."));
 }
 
 /// Same choice as Install.onAppear after Quick start emits ready.
-/// A partition table is not a finished login, so that reopen still attaches the installer and does not capture the pointer.
+/// A partition table boots the disk alone and still checks SSH. It does not attach the installer or a pointer.
 fn reopen_boot(disk: &str) -> Reopen {
     let url = std::path::Path::new(disk);
     let logged_in = guest_logged_in(url);
+    let written = logged_in || disk_looks_installed(url);
     Reopen {
-        installed: logged_in,
-        attaches_installer: !logged_in,
+        installed: written,
+        attaches_installer: !written,
         captures_pointer: false,
-        headline: Some(if logged_in {
-            "Starting Debian.".into()
+        checks_ssh: written,
+        headline: Some(if written {
+            "Debian is already installed. Checking SSH.".into()
         } else {
             "Starting the installer.".into()
         }),
@@ -2101,11 +2106,23 @@ fn guest_logged_in(disk: &std::path::Path) -> bool {
     })
 }
 
+fn disk_looks_installed(disk: &std::path::Path) -> bool {
+    let mut file = match std::fs::File::open(disk) {
+        Ok(file) => file,
+        Err(_) => return false,
+    };
+    let mut sector = [0u8; 512];
+    std::io::Read::read_exact(&mut file, &mut sector).is_ok()
+        && sector[510] == 0x55
+        && sector[511] == 0xaa
+}
+
 #[derive(Debug)]
 struct Reopen {
     installed: bool,
     attaches_installer: bool,
     captures_pointer: bool,
+    checks_ssh: bool,
     headline: Option<String>,
 }
 
@@ -2125,7 +2142,8 @@ fn quick_start_swift_gates_the_bar_on_a_real_download() {
     assert!(include_str!("../Sources/Install.swift").contains("private var capturePointer: Bool { fromSnapshot }"));
     assert!(include_str!("../Sources/Install.swift").contains("pointer: false"));
     assert!(include_str!("../Sources/Guest.swift").contains("pointer: Bool = false"));
-    assert!(!include_str!("../Sources/Install.swift").contains("InstalledDisk.looksInstalled"));
+    assert!(include_str!("../Sources/Install.swift").contains("InstalledDisk.looksInstalled"));
+    assert!(include_str!("../Sources/Guest.swift").contains("func looksInstalled"));
     assert!(include_str!("../Sources/Install.swift").contains("guest.setupSteps"));
     assert!(include_str!("../Sources/QuickStart.swift").contains("static let setup"));
     assert!(include_str!("../Sources/Install.swift").contains("guest.start(iso: iso, disk: disk)"));

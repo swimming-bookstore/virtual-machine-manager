@@ -5,7 +5,7 @@ import Virtualization
 /// A finished preseed powers the guest off. SSH login, not the installer screen, is the finish check.
 /// This view then snapshots that disk so later machines are clones.
 /// Setup is the next wizard page: the same steps as the download page, with a small guest popup instead of the ISO bar.
-/// Reopening Quick start boots that disk alone, then checks SSH. It does not attach the installer again.
+/// Reopening Quick start boots a written disk alone, then checks SSH. It does not attach the installer or a pointer.
 /// A partition table is not a finished login. Quick start never attaches a pointer, so the popup cannot capture the cursor.
 struct Install: View {
     let iso: String
@@ -19,7 +19,8 @@ struct Install: View {
         self.disk = disk
         self.fromSnapshot = fromSnapshot
         let loggedIn = fromSnapshot || GuestSSH.loggedIn(beside: URL(fileURLWithPath: disk))
-        _guest = StateObject(wrappedValue: GuestSession(fromSnapshot: loggedIn))
+        let written = loggedIn || InstalledDisk.looksInstalled(disk)
+        _guest = StateObject(wrappedValue: GuestSession(fromSnapshot: loggedIn, diskWritten: written))
     }
 
     /// Quick start stays the download-sized wizard. A clone is the machine window.
@@ -51,9 +52,9 @@ struct Install: View {
         .padding(24)
         .frame(width: setup ? 440 : 848, alignment: .topLeading)
         .onAppear {
-            // A clone, or a disk SSH already reached, boots alone. A partition table is not that login.
+            // A clone, a login, or a disk the installer already partitioned boots alone.
             // Quick start still does not attach a pointer, so the popup cannot capture the host cursor.
-            if fromSnapshot || guest.loggedIn {
+            if fromSnapshot || guest.installed {
                 guest.bootDisk(disk, pointer: fromSnapshot)
             } else {
                 guest.start(iso: iso, disk: disk)
@@ -209,11 +210,11 @@ final class GuestSession: NSObject, ObservableObject, VZVirtualMachineDelegate {
     private var probing = false
     private let fromSnapshotBoot: Bool
 
-    init(fromSnapshot: Bool = false) {
-        installed = fromSnapshot
+    init(fromSnapshot: Bool = false, diskWritten: Bool = false) {
+        installed = fromSnapshot || diskWritten
         loggedIn = fromSnapshot
         fromSnapshotBoot = fromSnapshot
-        headline = fromSnapshot ? "Starting Debian." : "Starting the installer."
+        headline = fromSnapshot ? "Starting Debian." : (diskWritten ? "Debian is already installed. Checking SSH." : "Starting the installer.")
         super.init()
     }
 
@@ -223,11 +224,11 @@ final class GuestSession: NSObject, ObservableObject, VZVirtualMachineDelegate {
         error = nil
         stopped = false
         diskURL = URL(fileURLWithPath: disk)
-        // Reopening Quick start must not boot the installer over a disk SSH already reached.
-        // A partition table is partman in progress. That boot is still the installer, and must not capture the pointer.
-        if GuestSSH.loggedIn(beside: diskURL!) {
+        // Reopening Quick start must not boot the installer over a disk that already has a partition table.
+        // That table is not a finished login. The disk boots alone, with no pointer, and SSH is still required.
+        if GuestSSH.loggedIn(beside: diskURL!) || InstalledDisk.looksInstalled(disk) {
             installed = true
-            loggedIn = true
+            loggedIn = GuestSSH.loggedIn(beside: diskURL!)
             installing = false
             checking = true
             headline = "Debian is already installed. Checking SSH."
@@ -413,7 +414,8 @@ final class GuestSession: NSObject, ObservableObject, VZVirtualMachineDelegate {
                         self?.stopped = false
                         if installed {
                             // The already-installed boot is waiting on SSH. Do not replace that with a boot headline.
-                            if self?.checking == true {
+                            // A clone is a machine the user is running, so it keeps the running headline.
+                            if self?.checking == true && self?.fromSnapshotBoot == false {
                                 self?.headline = "Debian is already installed. Checking SSH."
                                 self?.markSetup("ssh", state: "now", detail: "guest port 22")
                             } else {

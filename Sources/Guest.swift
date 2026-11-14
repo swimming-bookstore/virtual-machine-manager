@@ -198,3 +198,15 @@ enum GuestSSH {
         return process.terminationStatus == 0
     }
 }
+
+/// A disk the installer already wrote. An empty sparse file is not that disk.
+/// A partition table is not an SSH login. It only means the next boot is the disk alone.
+enum InstalledDisk {
+    static func looksInstalled(_ path: String) -> Bool {
+        let url = URL(fileURLWithPath: path)
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return false }
+        defer { try? handle.close() }
+        guard let sector = try? handle.read(upToCount: 512), sector.count == 512 else { return false }
+        return sector[510] == 0x55 && sector[511] == 0xaa
+    }
+}
