@@ -60,6 +60,7 @@ final class Wizard: ObservableObject {
     private var output: FileHandle?
     private var buffer = Data()
     private var source: DispatchSourceFileSystemObject?
+    private var diskSource: DispatchSourceFileSystemObject?
 
     var fraction: Double { total > 0 ? min(received / total, 1) : 0 }
     var percent: Int { Int((fraction * 100).rounded()) }
@@ -126,15 +127,16 @@ final class Wizard: ObservableObject {
 
     deinit {
         source?.cancel()
+        diskSource?.cancel()
         output?.readabilityHandler = nil
     }
 
-    /// Clear the ticks when the finished ISO or the opened cache folder is gone.
+    /// Clear the ticks when the finished ISO, the guest disk, or the opened cache folder is gone.
     func cacheWentAway() {
         let finished = readyPath != nil || steps.contains { $0.state == "done" }
         guard finished else { return }
         if readyPath == nil && process?.isRunning == true { return }
-        guard imageMissing() else { return }
+        guard imageMissing() || diskMissing() else { return }
         if process?.isRunning == true { process?.terminate() }
         reap(process)
         reset()
@@ -144,6 +146,8 @@ final class Wizard: ObservableObject {
     private func reset() {
         source?.cancel()
         source = nil
+        diskSource?.cancel()
+        diskSource = nil
         buffer.removeAll()
         steps = WizardStep.initial
         page = 0
@@ -169,6 +173,12 @@ final class Wizard: ObservableObject {
         return !items.contains { $0.pathExtension == "iso" }
     }
 
+    /// `disk.img` is the installed system. Removing it is not a finished install.
+    private func diskMissing() -> Bool {
+        guard let diskPath else { return false }
+        return !FileManager.default.fileExists(atPath: diskPath)
+    }
+
     private func watch(_ path: String) {
         source?.cancel()
         source = nil
@@ -179,6 +189,20 @@ final class Wizard: ObservableObject {
         src.setCancelHandler { close(fd) }
         src.resume()
         source = src
+    }
+
+    /// Finder deleting disk.img does not write the cache folder. Watch the machine folder too.
+    private func watchDisk(_ path: String) {
+        diskSource?.cancel()
+        diskSource = nil
+        let folder = (path as NSString).deletingLastPathComponent
+        let fd = open(folder, O_EVTONLY)
+        guard fd >= 0 else { return }
+        let src = DispatchSource.makeFileSystemObjectSource(fileDescriptor: fd, eventMask: [.write, .delete, .rename], queue: .main)
+        src.setEventHandler { [weak self] in self?.cacheWentAway() }
+        src.setCancelHandler { close(fd) }
+        src.resume()
+        diskSource = src
     }
 
     private func reap(_ done: Process?) {
@@ -235,6 +259,7 @@ final class Wizard: ObservableObject {
                     received = total
                 }
                 if let path = event.path { watch((path as NSString).deletingLastPathComponent) }
+                if let disk = event.disk { watchDisk(disk) }
             }
         case "error":
             error = event.detail ?? "Download failed."

@@ -1004,13 +1004,22 @@ impl Screen {
     fn cache_went_away(&mut self, cache: &Path) -> bool {
         let finished =
             self.ready_path.is_some() || self.steps.iter().any(|step| step.state == "done");
-        if !finished || (self.ready_path.is_none() && self.running) || !self.image_missing(cache) {
+        if !finished
+            || (self.ready_path.is_none() && self.running)
+            || !(self.image_missing(cache) || self.disk_missing())
+        {
             return false;
         }
         self.running = false;
         self.reset();
         self.start();
         true
+    }
+
+    fn disk_missing(&self) -> bool {
+        self.disk_path
+            .as_ref()
+            .is_some_and(|path| !Path::new(path).is_file())
     }
 
     fn image_missing(&self, cache: &Path) -> bool {
@@ -1619,6 +1628,36 @@ fn deleting_the_finished_iso_clears_the_window_and_starts_again() {
         "do not clear ticks while the download is still running"
     );
     assert!(running.steps.iter().any(|step| step.state == "done"));
+}
+
+#[test]
+fn deleting_the_debian_disk_clears_the_window_and_starts_again() {
+    let (base, world) = serve(SUMS, SIGN, ISO, KEY, false, false, false);
+    let (status, events, dir) = run(&base);
+    assert_eq!(status, 0, "{events:?}");
+    let cache = dir.join("cache");
+    let disk = dir.join("machines/debian/disk.img");
+    let mut screen = finish(&events, status);
+    assert!(screen.installing());
+    assert!(!screen.cache_went_away(&cache));
+    std::fs::remove_file(&disk).unwrap();
+    assert!(
+        screen.cache_went_away(&cache),
+        "removing machines/debian/disk.img is not a finished install"
+    );
+    assert!(screen.steps.iter().all(|step| step.state == "wait"));
+    assert!(screen.ready_path.is_none());
+    assert!(screen.disk_path.is_none());
+    assert!(!screen.installing());
+    assert_eq!(screen.buttons(), ["Open cache folder", "Cancel"]);
+    assert!(screen.running);
+    let _ = log_of(&world);
+    let (status, events) = wait(spawn(&base, &dir));
+    assert_eq!(status, 0, "{events:?}");
+    let screen = finish(&events, status);
+    assert!(disk.is_file(), "prepare must write the guest disk again");
+    assert_eq!(screen.disk_path.as_deref(), Some(disk.to_str().unwrap()));
+    assert!(screen.installing());
 }
 
 #[test]
