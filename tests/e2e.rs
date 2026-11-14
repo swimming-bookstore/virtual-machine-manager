@@ -2123,7 +2123,9 @@ fn quick_start_swift_gates_the_bar_on_a_real_download() {
     assert!(include_str!("../Sources/Install.swift").contains("guest.setupSteps"));
     assert!(include_str!("../Sources/QuickStart.swift").contains("static let setup"));
     assert!(include_str!("../Sources/Install.swift").contains("guest.start(iso: iso, disk: disk)"));
-    assert!(include_str!("../Sources/Install.swift").contains("guest.bootDisk(disk)"));
+    assert!(include_str!("../Sources/Install.swift").contains("Debian is already installed. Checking SSH."));
+    assert!(include_str!("../Sources/Install.swift").contains("checking = true"));
+    assert!(include_str!("../Sources/Guest.swift").contains("VZNATNetworkDeviceAttachment(forwardingRules: rules)"));
     assert!(include_str!("../Sources/Install.swift").contains("InstalledDisk.looksInstalled"));
     assert!(include_str!("../Sources/Guest.swift").contains("func forget(beside disk: URL)"));
     assert!(include_str!("../Sources/Install.swift").contains("SSH login succeeded. Saving a snapshot."));

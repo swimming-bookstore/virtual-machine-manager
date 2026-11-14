@@ -5,7 +5,7 @@ import Virtualization
 /// A finished preseed powers the guest off. SSH login, not the installer screen, is the finish check.
 /// This view then snapshots that disk so later machines are clones.
 /// Setup is the next wizard page: the same layout as the download, with a small guest screen where the ISO bar was.
-/// Reopening Quick start boots that disk alone. It does not attach the installer again.
+/// Reopening Quick start boots that disk alone, then checks SSH. It does not attach the installer again.
 struct Install: View {
     let iso: String
     let disk: String
@@ -50,7 +50,7 @@ struct Install: View {
         .frame(width: setup ? 440 : 848, alignment: .topLeading)
         .onAppear {
             // A clone, a login, or a disk the installer already partitioned boots alone.
-            // Attaching boot.iso here is a new install: the preseed writes a new label on /dev/vda.
+            // That boot still has to log in. A partition table is not the finish check.
             if fromSnapshot || guest.installed {
                 guest.bootDisk(disk)
             } else {
@@ -179,9 +179,11 @@ final class GuestSession: NSObject, ObservableObject, VZVirtualMachineDelegate {
     private var saved = false
     private var watch: Timer?
     private var probing = false
+    private let fromSnapshotBoot: Bool
 
     init(fromSnapshot: Bool = false) {
         installed = fromSnapshot
+        fromSnapshotBoot = fromSnapshot
         headline = fromSnapshot ? "Starting Debian." : "Starting the installer."
         super.init()
     }
@@ -221,10 +223,15 @@ final class GuestSession: NSObject, ObservableObject, VZVirtualMachineDelegate {
         started = true
         installed = true
         installing = false
+        // A partition table is not a finished install. SSH is. The probe only runs while this is set.
+        checking = true
         diskURL = URL(fileURLWithPath: path)
         stopped = false
         error = nil
-        headline = "Starting Debian."
+        headline = fromSnapshotBoot ? "Starting Debian." : "Debian is already installed. Checking SSH."
+        markSetup("installer", state: "done", detail: nil)
+        markSetup("partition", state: "done", detail: "Guest disk written")
+        markSetup("ssh", state: "now", detail: "port 2222")
         boot { try Guest.boot(disk: diskURL!) }
         watchSSH()
     }
@@ -367,7 +374,13 @@ final class GuestSession: NSObject, ObservableObject, VZVirtualMachineDelegate {
                     case .success:
                         self?.stopped = false
                         if installed {
-                            self?.headline = "Debian is running from the guest disk."
+                            // The already-installed boot is waiting on SSH. Do not replace that with a boot headline.
+                            if self?.checking == true {
+                                self?.headline = "Debian is already installed. Checking SSH."
+                                self?.markSetup("ssh", state: "now", detail: "port 2222")
+                            } else {
+                                self?.headline = "Debian is running from the guest disk."
+                            }
                         } else {
                             self?.markSetup("installer", state: "done", detail: nil)
                             self?.markSetup("partition", state: "now", detail: "Writing /dev/vda")
