@@ -2042,9 +2042,17 @@ fn reopening_quick_start_boots_the_installed_disk() {
     assert!(screen.installing());
     assert_eq!(screen.disk_path.as_deref(), Some(disk.to_str().unwrap()));
     let boot = reopen_boot(screen.disk_path.as_deref().unwrap());
+    assert_eq!(boot.headline.as_deref(), Some("Starting the installer."));
+    assert!(!boot.installed, "a partition table is not an SSH login");
+    assert!(boot.attaches_installer, "{boot:?}");
+    assert!(!boot.captures_pointer);
+
+    std::fs::write(disk.parent().unwrap().join("logged-in"), b"debian ok\n").unwrap();
+    let boot = reopen_boot(disk.to_str().unwrap());
     assert_eq!(boot.headline.as_deref(), Some("Starting Debian."));
     assert!(boot.installed);
     assert!(!boot.attaches_installer, "{boot:?}");
+    assert!(!boot.captures_pointer, "quick start checks SSH in the popup and does not capture");
 
     std::fs::remove_file(&disk).unwrap();
     std::fs::write(dir.join("ssh/logged-in"), b"debian ok\n").unwrap();
@@ -2057,19 +2065,20 @@ fn reopening_quick_start_boots_the_installed_disk() {
     let boot = reopen_boot(dir.join("machines/debian/disk.img").to_str().unwrap());
     assert!(!boot.installed);
     assert!(boot.attaches_installer);
+    assert!(!boot.captures_pointer);
     assert_eq!(boot.headline.as_deref(), Some("Starting the installer."));
 }
 
 /// Same choice as Install.onAppear after Quick start emits ready.
+/// A partition table is not a finished login, so that reopen still attaches the installer and does not capture the pointer.
 fn reopen_boot(disk: &str) -> Reopen {
     let url = std::path::Path::new(disk);
     let logged_in = guest_logged_in(url);
-    let looks = disk_looks_installed(url);
-    let installed = logged_in || looks;
     Reopen {
-        installed,
-        attaches_installer: !installed,
-        headline: Some(if installed {
+        installed: logged_in,
+        attaches_installer: !logged_in,
+        captures_pointer: false,
+        headline: Some(if logged_in {
             "Starting Debian.".into()
         } else {
             "Starting the installer.".into()
@@ -2092,21 +2101,11 @@ fn guest_logged_in(disk: &std::path::Path) -> bool {
     })
 }
 
-fn disk_looks_installed(disk: &std::path::Path) -> bool {
-    let mut file = match std::fs::File::open(disk) {
-        Ok(file) => file,
-        Err(_) => return false,
-    };
-    let mut sector = [0u8; 512];
-    std::io::Read::read_exact(&mut file, &mut sector).is_ok()
-        && sector[510] == 0x55
-        && sector[511] == 0xaa
-}
-
 #[derive(Debug)]
 struct Reopen {
     installed: bool,
     attaches_installer: bool,
+    captures_pointer: bool,
     headline: Option<String>,
 }
 
@@ -2119,8 +2118,14 @@ fn quick_start_swift_gates_the_bar_on_a_real_download() {
     assert!(src.contains("wizard.page == 1 ? \"Preseed\""));
     assert!(src.contains("static let preseed"));
     assert!(include_str!("../Sources/Install.swift").contains("Debian setup"));
-    assert!(include_str!("../Sources/Install.swift").contains("frame(width: 800, height: 500)"));
+    assert!(include_str!("../Sources/Install.swift").contains("Show installer"));
+    assert!(include_str!("../Sources/Install.swift").contains(".popover(isPresented: $guest.showPopup"));
+    assert!(include_str!("../Sources/Install.swift").contains("frame(width: setup ? 440 : 848"));
     assert!(!include_str!("../Sources/Install.swift").contains("frame(height: 96)"));
+    assert!(include_str!("../Sources/Install.swift").contains("private var capturePointer: Bool { fromSnapshot }"));
+    assert!(include_str!("../Sources/Install.swift").contains("pointer: false"));
+    assert!(include_str!("../Sources/Guest.swift").contains("pointer: Bool = false"));
+    assert!(!include_str!("../Sources/Install.swift").contains("InstalledDisk.looksInstalled"));
     assert!(include_str!("../Sources/Install.swift").contains("guest.setupSteps"));
     assert!(include_str!("../Sources/QuickStart.swift").contains("static let setup"));
     assert!(include_str!("../Sources/Install.swift").contains("guest.start(iso: iso, disk: disk)"));
@@ -2129,7 +2134,6 @@ fn quick_start_swift_gates_the_bar_on_a_real_download() {
     assert!(include_str!("../Sources/Guest.swift").contains("VZNATNetworkDeviceAttachment()"));
     assert!(!include_str!("../Sources/Guest.swift").contains("VZNATNetworkDeviceForwardingRules"));
     assert!(include_str!("../Sources/Guest.swift").contains("192.168.64."));
-    assert!(include_str!("../Sources/Install.swift").contains("InstalledDisk.looksInstalled"));
     assert!(include_str!("../Sources/Guest.swift").contains("func forget(beside disk: URL)"));
     assert!(include_str!("../Sources/Install.swift").contains("SSH login succeeded. Saving a snapshot."));
     assert!(include_str!("../Sources/Install.swift").contains("New virtual machine"));

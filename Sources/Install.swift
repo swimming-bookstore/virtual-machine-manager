@@ -4,8 +4,9 @@ import Virtualization
 /// The screen after the download. The installer writes `disk.img`; that file is the installed system.
 /// A finished preseed powers the guest off. SSH login, not the installer screen, is the finish check.
 /// This view then snapshots that disk so later machines are clones.
-/// Setup is the next wizard page: the same steps as the download page, on a window large enough to read the guest.
+/// Setup is the next wizard page: the same steps as the download page, with a small guest popup instead of the ISO bar.
 /// Reopening Quick start boots that disk alone, then checks SSH. It does not attach the installer again.
+/// A partition table is not a finished login. Quick start never attaches a pointer, so the popup cannot capture the cursor.
 struct Install: View {
     let iso: String
     let disk: String
@@ -17,25 +18,26 @@ struct Install: View {
         self.iso = iso
         self.disk = disk
         self.fromSnapshot = fromSnapshot
-        let installed = fromSnapshot || GuestSSH.loggedIn(beside: URL(fileURLWithPath: disk)) || InstalledDisk.looksInstalled(disk)
-        _guest = StateObject(wrappedValue: GuestSession(fromSnapshot: installed))
+        let loggedIn = fromSnapshot || GuestSSH.loggedIn(beside: URL(fileURLWithPath: disk))
+        _guest = StateObject(wrappedValue: GuestSession(fromSnapshot: loggedIn))
     }
 
-    /// Setup stays the wizard page until the snapshot is saved. A clone, and a finished install, use the large screen.
-    private var setup: Bool { !fromSnapshot && !guest.snapshotReady }
+    /// Quick start stays the download-sized wizard. A clone is the machine window.
+    private var setup: Bool { !fromSnapshot }
+
+    /// A clone captures. Quick start does not, even after SSH, because that view is only a popup.
+    private var capturePointer: Bool { fromSnapshot }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
             header
             if setup {
-                guestScreen
-                    .frame(width: 800, height: 500)
-                stepList
-                    .frame(width: 800)
+                popupButton
             } else {
                 guestScreen
                     .frame(width: 800, height: 500)
             }
+            if setup { stepList }
             Text(disk)
                 .font(.caption)
                 .foregroundStyle(.tertiary)
@@ -47,17 +49,20 @@ struct Install: View {
             actions
         }
         .padding(24)
-        .frame(width: 848, alignment: .topLeading)
+        .frame(width: setup ? 440 : 848, alignment: .topLeading)
         .onAppear {
-            // A clone, a login, or a disk the installer already partitioned boots alone.
-            // That boot still has to log in. A partition table is not the finish check.
-            if fromSnapshot || guest.installed {
-                guest.bootDisk(disk)
+            // A clone, or a disk SSH already reached, boots alone. A partition table is not that login.
+            // Quick start still does not attach a pointer, so the popup cannot capture the host cursor.
+            if fromSnapshot || guest.loggedIn {
+                guest.bootDisk(disk, pointer: fromSnapshot)
             } else {
                 guest.start(iso: iso, disk: disk)
             }
         }
-        .onDisappear { guest.stop() }
+        .onDisappear {
+            guest.showPopup = false
+            guest.stop()
+        }
     }
 
     private var header: some View {
@@ -70,11 +75,31 @@ struct Install: View {
         }
     }
 
-    /// The guest, where the download page draws the ISO bar. Setup uses the same size as a running machine so the installer can be read.
+    /// The guest, where the download page draws the ISO bar. Setup opens it in a popup instead of growing this window.
     private var guestScreen: some View {
-        GuestView(session: guest, capture: fromSnapshot || guest.installed)
+        GuestView(session: guest, capture: capturePointer)
             .background(.black, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
             .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+
+    /// Same slot as the ISO progress. The installer stays in a small popup so this page keeps the download width.
+    private var popupButton: some View {
+        Button(guest.showPopup ? "Hide installer" : "Show installer") {
+            guest.showPopup.toggle()
+        }
+        .buttonStyle(.bordered)
+        .popover(isPresented: $guest.showPopup, arrowEdge: .bottom) {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Installer").font(.headline)
+                Text(guest.headline)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                guestScreen
+                    .frame(width: 640, height: 400)
+            }
+            .padding(16)
+        }
     }
 
     private var stepList: some View {
@@ -165,9 +190,12 @@ final class GuestSession: NSObject, ObservableObject, VZVirtualMachineDelegate {
     @Published var headline: String
     @Published var error: String?
     @Published var installed: Bool
+    /// SSH has logged in. Quick start uses that to boot the disk alone. It still does not capture.
+    @Published var loggedIn: Bool
     @Published var stopped = false
     @Published var snapshotReady = false
     @Published var cloning = false
+    @Published var showPopup = false
     @Published var setupSteps = WizardStep.setup
     let view = InstallScreen()
     private var machine: VZVirtualMachine?
@@ -183,6 +211,7 @@ final class GuestSession: NSObject, ObservableObject, VZVirtualMachineDelegate {
 
     init(fromSnapshot: Bool = false) {
         installed = fromSnapshot
+        loggedIn = fromSnapshot
         fromSnapshotBoot = fromSnapshot
         headline = fromSnapshot ? "Starting Debian." : "Starting the installer."
         super.init()
@@ -194,14 +223,16 @@ final class GuestSession: NSObject, ObservableObject, VZVirtualMachineDelegate {
         error = nil
         stopped = false
         diskURL = URL(fileURLWithPath: disk)
-        // Reopening Quick start must not boot the installer over a disk that already has a system.
-        if GuestSSH.loggedIn(beside: diskURL!) || InstalledDisk.looksInstalled(disk) {
+        // Reopening Quick start must not boot the installer over a disk SSH already reached.
+        // A partition table is partman in progress. That boot is still the installer, and must not capture the pointer.
+        if GuestSSH.loggedIn(beside: diskURL!) {
             installed = true
+            loggedIn = true
             installing = false
             checking = true
             headline = "Debian is already installed. Checking SSH."
             stopped = false
-            boot { try Guest.boot(disk: diskURL!) }
+            boot { try Guest.boot(disk: diskURL!, pointer: false) }
             watchSSH()
             return
         }
@@ -218,10 +249,11 @@ final class GuestSession: NSObject, ObservableObject, VZVirtualMachineDelegate {
         }
     }
 
-    func bootDisk(_ path: String) {
+    func bootDisk(_ path: String, pointer: Bool) {
         guard !started else { return }
         started = true
         installed = true
+        loggedIn = GuestSSH.loggedIn(beside: URL(fileURLWithPath: path)) || fromSnapshotBoot
         installing = false
         // A partition table is not a finished install. SSH is. The probe only runs while this is set.
         checking = true
@@ -232,7 +264,7 @@ final class GuestSession: NSObject, ObservableObject, VZVirtualMachineDelegate {
         markSetup("installer", state: "done", detail: nil)
         markSetup("partition", state: "done", detail: "Guest disk written")
         markSetup("ssh", state: "now", detail: "guest port 22")
-        boot { try Guest.boot(disk: diskURL!) }
+        boot { try Guest.boot(disk: diskURL!, pointer: pointer) }
         watchSSH()
     }
 
@@ -245,9 +277,11 @@ final class GuestSession: NSObject, ObservableObject, VZVirtualMachineDelegate {
         installed = true
         installing = false
         checking = true
+        loggedIn = GuestSSH.loggedIn(beside: disk)
         watch?.invalidate()
         machine = nil
-        boot { try Guest.boot(disk: disk) }
+        // This boot only checks SSH. A pointer here is what captures the cursor in the popup.
+        boot { try Guest.boot(disk: disk, pointer: false) }
         watchSSH()
     }
 
@@ -294,6 +328,8 @@ final class GuestSession: NSObject, ObservableObject, VZVirtualMachineDelegate {
 
     private func loginSucceeded() {
         guard installed, checking, !snapshotReady else { return }
+        loggedIn = true
+        showPopup = false
         headline = "SSH login succeeded. Saving a snapshot."
         markSetup("ssh", state: "done", detail: "debian")
         markSetup("snapshot", state: "now", detail: "snapshots/debian")
@@ -318,6 +354,8 @@ final class GuestSession: NSObject, ObservableObject, VZVirtualMachineDelegate {
             return
         }
         if checking, installed, let disk = diskURL, GuestSSH.loggedIn(beside: disk) {
+            loggedIn = true
+            showPopup = false
             headline = "SSH login succeeded. Saving a snapshot."
             markSetup("ssh", state: "done", detail: "debian")
             markSetup("snapshot", state: "now", detail: "snapshots/debian")

@@ -13,8 +13,8 @@ enum Guest {
         return try machine(disk: disk, extra: [iso, preseed], pointer: false)
     }
 
-    static func boot(disk: URL) throws -> VZVirtualMachine {
-        return try machine(disk: disk, extra: [], pointer: true)
+    static func boot(disk: URL, pointer: Bool = false) throws -> VZVirtualMachine {
+        return try machine(disk: disk, extra: [], pointer: pointer)
     }
 
     /// Locally administered MAC, stable for this disk, so the DHCP lease can be found again.
@@ -43,7 +43,8 @@ enum Guest {
         graphics.scanouts = [VZVirtioGraphicsScanoutConfiguration(widthInPixels: 1280, heightInPixels: 800)]
         config.graphicsDevices = [graphics]
         config.keyboards = [VZUSBKeyboardConfiguration()]
-        // The preseed install needs no pointer. Attaching one makes the view capture the host cursor.
+        // Attaching a pointer makes the guest view capture the host cursor.
+        // Quick start never does that. Only a clone the user is running gets one.
         config.pointingDevices = pointer ? [VZUSBScreenCoordinatePointingDeviceConfiguration()] : []
         config.networkDevices = [network(disk: disk)]
         try config.validate()
@@ -195,16 +196,5 @@ enum GuestSSH {
         guard (try? process.run()) != nil else { return false }
         process.waitUntilExit()
         return process.terminationStatus == 0
-    }
-}
-
-/// A disk the installer already wrote. An empty sparse file is not that disk.
-enum InstalledDisk {
-    static func looksInstalled(_ path: String) -> Bool {
-        let url = URL(fileURLWithPath: path)
-        guard let handle = try? FileHandle(forReadingFrom: url) else { return false }
-        defer { try? handle.close() }
-        guard let sector = try? handle.read(upToCount: 512), sector.count == 512 else { return false }
-        return sector[510] == 0x55 && sector[511] == 0xaa
     }
 }
