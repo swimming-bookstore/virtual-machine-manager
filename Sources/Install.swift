@@ -7,6 +7,7 @@ import Virtualization
 /// Setup is the next wizard page: the same steps as the download page, with a small installer thumbnail instead of the ISO bar.
 /// The button beside that thumbnail opens the guest in a new window. That window does not capture the mouse or the keyboard.
 /// Reopening Quick start boots a written disk alone, then checks SSH. It does not attach the installer or a pointer.
+/// A saved snapshot is the finished install. Reopening that disk does not start the installer virtual machine.
 /// A partition table is not a finished login. Quick start never attaches a pointer, so neither view can capture the cursor.
 struct Install: View {
     let iso: String
@@ -21,7 +22,10 @@ struct Install: View {
         self.fromSnapshot = fromSnapshot
         let loggedIn = fromSnapshot || GuestSSH.loggedIn(beside: URL(fileURLWithPath: disk))
         let written = loggedIn || InstalledDisk.looksInstalled(disk)
-        _guest = StateObject(wrappedValue: GuestSession(fromSnapshot: loggedIn, diskWritten: written))
+        // The installer disk is machines/debian. Once snapshots/debian/ready exists, that VM is finished.
+        // Quick start must not start it again. New machines are clones, opened with fromSnapshot.
+        let snapshotSaved = !fromSnapshot && SupportDir.snapshotReady
+        _guest = StateObject(wrappedValue: GuestSession(fromSnapshot: loggedIn, diskWritten: written, snapshotSaved: snapshotSaved))
     }
 
     /// Quick start stays the download-sized wizard. A clone is the machine window.
@@ -64,9 +68,12 @@ struct Install: View {
             }
         }
         .onAppear {
+            // A saved snapshot means the installer already shut down. Leave that VM stopped.
             // A clone, a login, or a disk the installer already partitioned boots alone.
             // Quick start still does not attach a pointer, so the installer window cannot capture the host cursor.
-            if fromSnapshot || guest.installed {
+            if guest.snapshotReady && !fromSnapshot {
+                guest.holdFinished(disk)
+            } else if fromSnapshot || guest.installed {
                 guest.bootDisk(disk, pointer: fromSnapshot)
             } else {
                 guest.start(iso: iso, disk: disk)
@@ -222,12 +229,48 @@ final class GuestSession: NSObject, ObservableObject, VZVirtualMachineDelegate {
     private var probing = false
     private let fromSnapshotBoot: Bool
 
-    init(fromSnapshot: Bool = false, diskWritten: Bool = false) {
-        installed = fromSnapshot || diskWritten
-        loggedIn = fromSnapshot
+    init(fromSnapshot: Bool = false, diskWritten: Bool = false, snapshotSaved: Bool = false) {
+        installed = fromSnapshot || diskWritten || snapshotSaved
+        loggedIn = fromSnapshot || snapshotSaved
         fromSnapshotBoot = fromSnapshot
-        headline = fromSnapshot ? "Starting Debian." : (diskWritten ? "Debian is already installed. Checking SSH." : "Starting the installer.")
+        snapshotReady = snapshotSaved
+        saved = snapshotSaved
+        headline = if snapshotSaved && !fromSnapshot {
+            "Debian is installed and shut down. A snapshot is saved for new machines."
+        } else if fromSnapshot {
+            "Starting Debian."
+        } else if diskWritten {
+            "Debian is already installed. Checking SSH."
+        } else {
+            "Starting the installer."
+        }
         super.init()
+        if snapshotSaved && !fromSnapshot {
+            stopped = true
+            markSetup("installer", state: "done", detail: nil)
+            markSetup("partition", state: "done", detail: "Guest disk written")
+            markSetup("ssh", state: "done", detail: "debian")
+            markSetup("snapshot", state: "done", detail: "Saved")
+        }
+    }
+
+    /// Quick start came back after the snapshot. Do not start the installer virtual machine.
+    func holdFinished(_ path: String) {
+        diskURL = URL(fileURLWithPath: path)
+        installing = false
+        checking = false
+        stopped = true
+        installed = true
+        loggedIn = true
+        snapshotReady = true
+        saved = true
+        started = true
+        error = nil
+        headline = "Debian is installed and shut down. A snapshot is saved for new machines."
+        markSetup("installer", state: "done", detail: nil)
+        markSetup("partition", state: "done", detail: "Guest disk written")
+        markSetup("ssh", state: "done", detail: "debian")
+        markSetup("snapshot", state: "done", detail: "Saved")
     }
 
     func start(iso: String, disk: String) {
@@ -236,6 +279,11 @@ final class GuestSession: NSObject, ObservableObject, VZVirtualMachineDelegate {
         error = nil
         stopped = false
         diskURL = URL(fileURLWithPath: disk)
+        // The snapshot is already saved. Reopening must not start the installer virtual machine.
+        if snapshotReady {
+            holdFinished(disk)
+            return
+        }
         // Reopening Quick start must not boot the installer over a disk that already has a partition table.
         // That table is not a finished login. The disk boots alone, with no pointer, and SSH is still required.
         if GuestSSH.loggedIn(beside: diskURL!) || InstalledDisk.looksInstalled(disk) {
@@ -271,6 +319,11 @@ final class GuestSession: NSObject, ObservableObject, VZVirtualMachineDelegate {
         diskURL = URL(fileURLWithPath: path)
         stopped = false
         error = nil
+        // The snapshot is already saved. Reopening must not start the installer virtual machine.
+        if !fromSnapshotBoot && SupportDir.snapshotReady {
+            holdFinished(path)
+            return
+        }
         headline = fromSnapshotBoot ? "Starting Debian." : "Debian is already installed. Checking SSH."
         markSetup("installer", state: "done", detail: nil)
         markSetup("partition", state: "done", detail: "Guest disk written")
@@ -282,6 +335,11 @@ final class GuestSession: NSObject, ObservableObject, VZVirtualMachineDelegate {
     /// A black installer screen is not finished. SSH after this boot is.
     func startInstalled() {
         guard let disk = diskURL else { return }
+        // The installer already finished and the snapshot is saved. Do not start it again.
+        if !fromSnapshotBoot && SupportDir.snapshotReady {
+            holdFinished(disk.path)
+            return
+        }
         error = nil
         stopped = false
         installed = true

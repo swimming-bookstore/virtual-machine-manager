@@ -2023,6 +2023,7 @@ fn a_cached_iso_does_not_show_the_download_bar() {
 
 /// Reopen is a new process. The ISO is cached, so the worker is fast, then the window
 /// builds Install again. A disk the installer already wrote must boot alone.
+/// A saved snapshot is the finished installer. Reopening that disk does not start it.
 #[test]
 fn reopening_quick_start_boots_the_installed_disk() {
     let (base, _) = serve(SUMS, SIGN, ISO, KEY, false, false, false);
@@ -2055,8 +2056,24 @@ fn reopening_quick_start_boots_the_installed_disk() {
     assert!(!boot.attaches_installer, "{boot:?}");
     assert!(boot.checks_ssh);
     assert!(!boot.captures_pointer, "quick start checks SSH in the popup and does not capture");
+    assert!(!boot.snapshot_saved);
+    assert!(boot.starts_vm);
+
+    std::fs::create_dir_all(dir.join("snapshots/debian")).unwrap();
+    std::fs::write(dir.join("snapshots/debian/ready"), b"ssh-ok\n").unwrap();
+    let boot = reopen_boot(disk.to_str().unwrap());
+    assert!(boot.snapshot_saved, "{boot:?}");
+    assert!(!boot.starts_vm, "a saved snapshot must not start the installer virtual machine");
+    assert!(!boot.attaches_installer);
+    assert!(!boot.captures_pointer);
+    assert!(!boot.checks_ssh);
+    assert_eq!(
+        boot.headline.as_deref(),
+        Some("Debian is installed and shut down. A snapshot is saved for new machines.")
+    );
 
     std::fs::remove_file(&disk).unwrap();
+    std::fs::remove_file(dir.join("snapshots/debian/ready")).unwrap();
     std::fs::write(dir.join("ssh/logged-in"), b"debian ok\n").unwrap();
     let (status, fresh) = wait(spawn(&base, &dir));
     assert_eq!(status, 0, "{fresh:?}");
@@ -2069,26 +2086,48 @@ fn reopening_quick_start_boots_the_installed_disk() {
     assert!(boot.attaches_installer);
     assert!(!boot.captures_pointer);
     assert!(!boot.checks_ssh);
+    assert!(boot.starts_vm);
+    assert!(!boot.snapshot_saved);
     assert_eq!(boot.headline.as_deref(), Some("Starting the installer."));
 }
 
 /// Same choice as Install.onAppear after Quick start emits ready.
 /// A partition table boots the disk alone and still checks SSH. It does not attach the installer or a pointer.
+/// snapshots/debian/ready means that installer already shut down. Reopening does not start it.
 fn reopen_boot(disk: &str) -> Reopen {
     let url = std::path::Path::new(disk);
     let logged_in = guest_logged_in(url);
     let written = logged_in || disk_looks_installed(url);
+    let snapshot_saved = snapshot_ready(url);
+    let starts_vm = !snapshot_saved;
+    let attaches_installer = starts_vm && !written;
     Reopen {
-        installed: written,
-        attaches_installer: !written,
+        installed: written || snapshot_saved,
+        attaches_installer,
         captures_pointer: false,
-        checks_ssh: written,
-        headline: Some(if written {
+        checks_ssh: starts_vm && written,
+        starts_vm,
+        snapshot_saved,
+        headline: Some(if snapshot_saved {
+            "Debian is installed and shut down. A snapshot is saved for new machines.".into()
+        } else if written {
             "Debian is already installed. Checking SSH.".into()
         } else {
             "Starting the installer.".into()
         }),
     }
+}
+
+fn snapshot_ready(disk: &std::path::Path) -> bool {
+    disk.parent()
+        .and_then(|dir| dir.parent())
+        .and_then(|dir| dir.parent())
+        .is_some_and(|support| {
+            let ready = support.join("snapshots/debian/ready");
+            std::fs::read_to_string(ready)
+                .ok()
+                .is_some_and(|text| text.starts_with("ssh-ok"))
+        })
 }
 
 fn guest_logged_in(disk: &std::path::Path) -> bool {
@@ -2123,6 +2162,8 @@ struct Reopen {
     attaches_installer: bool,
     captures_pointer: bool,
     checks_ssh: bool,
+    starts_vm: bool,
+    snapshot_saved: bool,
     headline: Option<String>,
 }
 
@@ -2152,7 +2193,9 @@ fn quick_start_swift_gates_the_bar_on_a_real_download() {
     assert!(include_str!("../Sources/Install.swift").contains("guest.setupSteps"));
     assert!(include_str!("../Sources/QuickStart.swift").contains("static let setup"));
     assert!(include_str!("../Sources/Install.swift").contains("guest.start(iso: iso, disk: disk)"));
-    assert!(include_str!("../Sources/Install.swift").contains("Debian is already installed. Checking SSH."));
+    assert!(include_str!("../Sources/Install.swift").contains("Debian is installed and shut down. A snapshot is saved for new machines."));
+    assert!(include_str!("../Sources/Install.swift").contains("func holdFinished"));
+    assert!(include_str!("../Sources/Install.swift").contains("SupportDir.snapshotReady"));
     assert!(include_str!("../Sources/Install.swift").contains("checking = true"));
     assert!(include_str!("../Sources/Guest.swift").contains("VZNATNetworkDeviceAttachment()"));
     assert!(!include_str!("../Sources/Guest.swift").contains("VZNATNetworkDeviceForwardingRules"));
