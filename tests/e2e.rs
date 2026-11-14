@@ -312,6 +312,26 @@ fn dir() -> PathBuf {
     dir
 }
 
+fn cli(args: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_virtual-machine-worker"))
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn clap_parses_download_and_rejects_unknown_args() {
+    let help = cli(&["download", "--help"]);
+    assert!(help.status.success());
+    let text = String::from_utf8_lossy(&help.stdout);
+    assert!(text.contains("--dir"));
+
+    let unknown = cli(&["download", "--nope"]);
+    assert!(!unknown.status.success());
+    assert!(unknown.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&unknown.stderr).contains("unexpected argument"));
+}
+
 fn spawn(base: &str, dir: &Path) -> std::process::Child {
     Command::new(env!("CARGO_BIN_EXE_virtual-machine-worker"))
         .args(["download", "--dir", dir.to_str().unwrap()])

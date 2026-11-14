@@ -11,6 +11,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Result};
+use clap::{Parser, Subcommand};
 use serde::Serialize;
 
 const STEPS: [&str; 6] = ["key", "sums", "sign", "check", "download", "verify"];
@@ -377,49 +378,33 @@ fn finish(
     Ok(())
 }
 
-fn usage() -> &'static str {
-    "usage: virtual-machine-worker download [--dir PATH]\n\nDownloads the Debian 13 installer. SHA512SUMS.sign must verify with the downloaded OpenPGP keyring. A missing signature is a failure.\n"
+#[derive(Parser)]
+#[command(
+    name = "virtual-machine-worker",
+    about = "Downloads the Debian 13 installer. SHA512SUMS.sign must verify with the downloaded OpenPGP keyring. A missing signature is a failure."
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
 }
 
-fn parse_dir(args: &[String]) -> Result<PathBuf> {
-    let mut dir = support_dir();
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--dir" => {
-                dir = PathBuf::from(
-                    args.get(i + 1)
-                        .ok_or_else(|| anyhow!("download --dir needs a path"))?,
-                );
-                i += 2;
-            }
-            "-h" | "--help" => bail!("{}", usage()),
-            other => bail!("unknown argument {other}\n{}", usage()),
-        }
-    }
-    Ok(dir)
+#[derive(Subcommand)]
+enum Command {
+    /// Download the Debian 13 installer and check its signature.
+    Download {
+        /// Cache parent. The installer is written to PATH/cache. Defaults to the app support directory.
+        #[arg(long, value_name = "PATH")]
+        dir: Option<PathBuf>,
+    },
 }
 
 fn main() {
-    let args: Vec<String> = env::args().skip(1).collect();
-    let rest = match args.first().map(String::as_str) {
-        Some("download") => &args[1..],
-        Some("-h" | "--help" | "help") => {
-            print!("{}", usage());
-            return;
-        }
-        Some(other) if other.starts_with('-') => args.as_slice(),
-        Some(other) => {
-            let (tx, _rx) = mpsc::channel();
-            fail(anyhow!("unknown command {other}\n{}", usage()), &tx);
-        }
-        None => &args[..],
-    };
+    let cli = Cli::try_parse().unwrap_or_else(|err| err.exit());
+    let Command::Download { dir } = cli.command;
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || order_loop(rx));
-    match parse_dir(rest).and_then(|dir| run(&dir, &tx)) {
-        Ok(()) => {}
-        Err(err) => fail(err, &tx),
+    if let Err(err) = run(dir.as_deref().unwrap_or(&support_dir()), &tx) {
+        fail(err, &tx);
     }
 }
 
