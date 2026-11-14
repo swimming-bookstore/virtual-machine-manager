@@ -3,6 +3,7 @@
 
 use std::time::Duration;
 
+use anyhow::{anyhow, bail, Result};
 use pgp::composed::{Deserializable, DetachedSignature, SignedPublicKey};
 use pgp::types::KeyDetails;
 use sha2::{Digest, Sha512};
@@ -34,7 +35,7 @@ pub fn agent() -> ureq::Agent {
         .build()
 }
 
-pub fn current_dir(arch: &str) -> Result<String, String> {
+pub fn current_dir(arch: &str) -> Result<String> {
     arch_ok(arch)?;
     Ok(format!(
         "https://cdimage.debian.org/debian-cd/current/{arch}/iso-cd"
@@ -45,13 +46,13 @@ pub fn image_url(version: &str, arch: &str, name: &str) -> String {
     format!("https://cdimage.debian.org/debian-cd/{version}/{arch}/iso-cd/{name}")
 }
 
-pub fn fetch_key(agent: &ureq::Agent) -> Result<Vec<u8>, String> {
+pub fn fetch_key(agent: &ureq::Agent) -> Result<Vec<u8>> {
     let url = key_url();
     let body = fetch(agent, url)?;
     if std::str::from_utf8(&body).is_ok_and(|text| text.contains("BEGIN PGP PUBLIC KEY BLOCK")) {
         Ok(body)
     } else {
-        Err(format!("OpenPGP key was not found at {url}"))
+        bail!("OpenPGP key was not found at {url}")
     }
 }
 
@@ -87,47 +88,42 @@ pub fn status_msg(url: &str, code: u16, resp: ureq::Response) -> String {
     format!("{url} returned {code} {body}")
 }
 
-pub fn fetch(agent: &ureq::Agent, url: &str) -> Result<Vec<u8>, String> {
+pub fn fetch(agent: &ureq::Agent, url: &str) -> Result<Vec<u8>> {
     let url = locate(url);
     let resp = match agent.get(&url).call() {
         Ok(resp) => resp,
-        Err(ureq::Error::Status(404, _)) => return Err(format!("{url} was not found")),
-        Err(ureq::Error::Status(code, resp)) => return Err(status_msg(&url, code, resp)),
-        Err(err) => return Err(format!("{url}: {err}")),
+        Err(ureq::Error::Status(404, _)) => bail!("{url} was not found"),
+        Err(ureq::Error::Status(code, resp)) => bail!("{}", status_msg(&url, code, resp)),
+        Err(err) => bail!("{url}: {err}"),
     };
     if resp.status() != 200 {
-        return Err(format!("{url} returned {}", resp.status()));
+        bail!("{url} returned {}", resp.status());
     }
     let mut body = Vec::new();
     let mut reader = resp.into_reader();
     let mut buf = [0u8; 16 * 1024];
     loop {
         let n =
-            std::io::Read::read(&mut reader, &mut buf).map_err(|err| format!("{url}: {err}"))?;
+            std::io::Read::read(&mut reader, &mut buf).map_err(|err| anyhow!("{url}: {err}"))?;
         if n == 0 {
             break;
         }
         if body.len() + n > 2_000_000 {
-            return Err(format!("{url} is unexpectedly large"));
+            bail!("{url} is unexpectedly large");
         }
         body.extend_from_slice(&buf[..n]);
     }
     if body.is_empty() {
-        return Err(format!("{url} was empty"));
+        bail!("{url} was empty");
     }
     Ok(body)
 }
 
 /// Checks the downloaded key, then the signature, then reads the installer name.
-pub fn published(
-    arch: &str,
-    key: &[u8],
-    sums: &[u8],
-    signature: &[u8],
-) -> Result<Published, String> {
+pub fn published(arch: &str, key: &[u8], sums: &[u8], signature: &[u8]) -> Result<Published> {
     arch_ok(arch)?;
     verify(&debian_key(key)?, signature, sums)?;
-    let text = std::str::from_utf8(sums).map_err(|err| err.to_string())?;
+    let text = std::str::from_utf8(sums)?;
     let name = installer_name(text, arch)?;
     Ok(Published {
         sha512: digest_for(text, &name)?,
@@ -136,49 +132,47 @@ pub fn published(
     })
 }
 
-pub fn debian_key(armor: &[u8]) -> Result<SignedPublicKey, String> {
-    let text = std::str::from_utf8(armor).map_err(|_| format!("{KEY_FILE} is not a text key"))?;
+pub fn debian_key(armor: &[u8]) -> Result<SignedPublicKey> {
+    let text = std::str::from_utf8(armor).map_err(|_| anyhow!("{KEY_FILE} is not a text key"))?;
     if !text.contains("BEGIN PGP PUBLIC KEY BLOCK") {
-        return Err(format!("{KEY_FILE} is not a PGP public key"));
+        bail!("{KEY_FILE} is not a PGP public key");
     }
     let (key, _) =
-        SignedPublicKey::from_string(text).map_err(|err| format!("{KEY_FILE}: {err}"))?;
+        SignedPublicKey::from_string(text).map_err(|err| anyhow!("{KEY_FILE}: {err}"))?;
     let got = key.fingerprint().to_string().to_ascii_lowercase();
     let want = fingerprint();
     if got != want {
-        return Err(format!(
-            "{KEY_FILE} fingerprint {got} does not match {want}"
-        ));
+        bail!("{KEY_FILE} fingerprint {got} does not match {want}");
     }
     Ok(key)
 }
 
-fn verify(key: &SignedPublicKey, signature: &[u8], content: &[u8]) -> Result<(), String> {
+fn verify(key: &SignedPublicKey, signature: &[u8], content: &[u8]) -> Result<()> {
     parse_signature(signature)?
         .verify(key, content)
-        .map_err(|err| format!("SHA512SUMS was not signed by the Debian CD key ({err})"))
+        .map_err(|err| anyhow!("SHA512SUMS was not signed by the Debian CD key ({err})"))
 }
 
-fn parse_signature(bytes: &[u8]) -> Result<DetachedSignature, String> {
+fn parse_signature(bytes: &[u8]) -> Result<DetachedSignature> {
     if let Ok(text) = std::str::from_utf8(bytes) {
         if text.contains("BEGIN PGP") {
             return DetachedSignature::from_string(text)
                 .map(|(signature, _)| signature)
-                .map_err(|err| format!("signature: {err}"));
+                .map_err(|err| anyhow!("signature: {err}"));
         }
     }
-    DetachedSignature::from_bytes(bytes).map_err(|err| format!("signature: {err}"))
+    DetachedSignature::from_bytes(bytes).map_err(|err| anyhow!("signature: {err}"))
 }
 
-fn arch_ok(arch: &str) -> Result<(), String> {
+fn arch_ok(arch: &str) -> Result<()> {
     if arch == "amd64" || arch == "arm64" {
         Ok(())
     } else {
-        Err(format!("{arch} is not a Debian installer architecture"))
+        bail!("{arch} is not a Debian installer architecture")
     }
 }
 
-fn installer_name(sums: &str, arch: &str) -> Result<String, String> {
+fn installer_name(sums: &str, arch: &str) -> Result<String> {
     let suffix = format!("-{arch}-netinst.iso");
     let mut found = None;
     for (_, file) in rows(sums) {
@@ -189,48 +183,46 @@ fn installer_name(sums: &str, arch: &str) -> Result<String, String> {
             continue;
         }
         if found.is_some() {
-            return Err(format!(
-                "more than one Debian {arch} installer in the checksum file"
-            ));
+            bail!("more than one Debian {arch} installer in the checksum file");
         }
         found = Some(file.to_string());
     }
-    found.ok_or_else(|| format!("the checksum file has no Debian {arch} installer image"))
+    found.ok_or_else(|| anyhow!("the checksum file has no Debian {arch} installer image"))
 }
 
-fn version_of(name: &str, arch: &str) -> Result<String, String> {
+fn version_of(name: &str, arch: &str) -> Result<String> {
     let rest = name
         .strip_prefix("debian-")
-        .ok_or_else(|| format!("unexpected image name {name}"))?;
+        .ok_or_else(|| anyhow!("unexpected image name {name}"))?;
     let version = rest.split('-').next().unwrap_or("");
     if version.is_empty()
         || !version.chars().all(|c| c.is_ascii_digit() || c == '.')
         || version.starts_with('.')
         || version.ends_with('.')
     {
-        return Err(format!("unexpected Debian version in {name}"));
+        bail!("unexpected Debian version in {name}");
     }
     if name != format!("debian-{version}-{arch}-netinst.iso") {
-        return Err(format!("unexpected Debian image name {name}"));
+        bail!("unexpected Debian image name {name}");
     }
     Ok(version.to_string())
 }
 
-fn digest_for(sums: &str, name: &str) -> Result<String, String> {
+fn digest_for(sums: &str, name: &str) -> Result<String> {
     let mut found = None;
     for (hash, file) in rows(sums) {
         if file != name {
             continue;
         }
         if hash.len() != 128 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return Err(format!("checksum file has a bad digest for {name}"));
+            bail!("checksum file has a bad digest for {name}");
         }
         if found.is_some() {
-            return Err(format!("{name} is listed twice in the checksum file"));
+            bail!("{name} is listed twice in the checksum file");
         }
         found = Some(hash.to_ascii_lowercase());
     }
-    found.ok_or_else(|| format!("{name} is not in the checksum file"))
+    found.ok_or_else(|| anyhow!("{name} is not in the checksum file"))
 }
 
 fn rows(sums: &str) -> impl Iterator<Item = (&str, &str)> {
@@ -247,11 +239,8 @@ fn rows(sums: &str) -> impl Iterator<Item = (&str, &str)> {
     })
 }
 
-pub fn hash_file(
-    path: &std::path::Path,
-    on_progress: &mut dyn FnMut(u64, u64),
-) -> Result<String, String> {
-    let mut file = std::fs::File::open(path).map_err(|err| err.to_string())?;
+pub fn hash_file(path: &std::path::Path, on_progress: &mut dyn FnMut(u64, u64)) -> Result<String> {
+    let mut file = std::fs::File::open(path)?;
     let total = file.metadata().map(|meta| meta.len()).unwrap_or(0);
     let mut hasher = Sha512::new();
     let mut buf = vec![0u8; 1024 * 1024];
@@ -259,7 +248,7 @@ pub fn hash_file(
     on_progress(0, total);
     loop {
         let n = std::io::Read::read(&mut file, &mut buf)
-            .map_err(|err| format!("verify read: {err}"))?;
+            .map_err(|err| anyhow!("verify read: {err}"))?;
         if n == 0 {
             break;
         }
@@ -286,7 +275,10 @@ mod tests {
             key_url(),
             "https://www.debian.org/CD/key-DA87E80D6294BE9B.txt"
         );
-        assert_eq!(&fingerprint()[fingerprint().len() - 16..], "da87e80d6294be9b");
+        assert_eq!(
+            &fingerprint()[fingerprint().len() - 16..],
+            "da87e80d6294be9b"
+        );
     }
 
     #[test]

@@ -10,12 +10,13 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
+use anyhow::{anyhow, bail, Result};
 use serde::Serialize;
 
 const STEPS: [&str; 6] = ["key", "sums", "sign", "check", "download", "verify"];
 
 enum OrderMsg {
-    Set(&'static str, &'static str, Sender<Result<(), String>>),
+    Set(&'static str, &'static str, Sender<Result<()>>),
     Current(Sender<Option<&'static str>>),
 }
 
@@ -64,31 +65,28 @@ macro_rules! emit {
     }};
 }
 
-fn fail(detail: String, order: &Sender<OrderMsg>) -> ! {
+fn fail(err: anyhow::Error, order: &Sender<OrderMsg>) -> ! {
     let (tx, rx) = mpsc::channel();
     let _ = order.send(OrderMsg::Current(tx));
     let step = rx.recv().ok().flatten();
-    emit!("error", step: step, state: Some("fail"), detail: Some(detail));
+    emit!("error", step: step, state: Some("fail"), detail: Some(err.to_string()));
     std::process::exit(1);
 }
 
 /// A step may run only after every earlier step has finished, and a finished step cannot start again.
-fn check_order(order: &mut [&'static str; 6], id: &str, state: &str) -> Result<(), String> {
+fn check_order(order: &mut [&'static str; 6], id: &str, state: &str) -> Result<()> {
     let Some(index) = STEPS.iter().position(|item| *item == id) else {
-        return Err(format!("unknown step {id}"));
+        bail!("unknown step {id}");
     };
     let later = (index + 1..STEPS.len()).find(|&i| order[i] == "now" || order[i] == "done");
     match state {
         "now" if order[index] == "now" => Ok(()),
         "now" => {
             if let Some(earlier) = (0..index).find(|&i| order[i] != "done") {
-                return Err(format!("{id} started before {} finished", STEPS[earlier]));
+                bail!("{id} started before {} finished", STEPS[earlier]);
             }
             if let Some(later) = later {
-                return Err(format!(
-                    "{id} started while {} is {}",
-                    STEPS[later], order[later]
-                ));
+                bail!("{id} started while {} is {}", STEPS[later], order[later]);
             }
             order[index] = "now";
             Ok(())
@@ -97,16 +95,17 @@ fn check_order(order: &mut [&'static str; 6], id: &str, state: &str) -> Result<(
             order[index] = "done";
             Ok(())
         }
-        "done" => Err(format!("{id} finished without running")),
+        "done" => bail!("{id} finished without running"),
         "wait" if order[index] != "now" => {
-            Err(format!("{id} went back to waiting without running"))
+            bail!("{id} went back to waiting without running")
         }
         "wait" => {
             if let Some(later) = later {
-                return Err(format!(
+                bail!(
                     "cannot reset {id} while {} is {}",
-                    STEPS[later], order[later]
-                ));
+                    STEPS[later],
+                    order[later]
+                );
             }
             order[index] = "wait";
             Ok(())
@@ -115,7 +114,7 @@ fn check_order(order: &mut [&'static str; 6], id: &str, state: &str) -> Result<(
             order[index] = "fail";
             Ok(())
         }
-        other => Err(format!("unknown state {other}")),
+        other => bail!("unknown state {other}"),
     }
 }
 
@@ -140,9 +139,12 @@ fn order_loop(rx: Receiver<OrderMsg>) {
 fn step(id: &'static str, state: &'static str, detail: &str, order: &Sender<OrderMsg>) {
     let (tx, rx) = mpsc::channel();
     if order.send(OrderMsg::Set(id, state, tx)).is_err() {
-        fail("step order closed".to_string(), order);
+        fail(anyhow!("step order closed"), order);
     }
-    if let Err(err) = rx.recv().unwrap_or_else(|_| Err("step order closed".into())) {
+    if let Err(err) = rx
+        .recv()
+        .unwrap_or_else(|_| Err(anyhow!("step order closed")))
+    {
         fail(err, order);
     }
     emit!("step", step: Some(id), state: Some(state), detail: Some(detail.to_string()));
@@ -165,11 +167,11 @@ fn support_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("virtual-machine-manager"))
 }
 
-fn guest_arch() -> Result<&'static str, String> {
+fn guest_arch() -> Result<&'static str> {
     match env::consts::ARCH {
         "aarch64" => Ok("arm64"),
         "x86_64" => Ok("amd64"),
-        other => Err(format!("{other} has no Debian installer image. This Mac needs the arm64 or amd64 installer that matches its processor.")),
+        other => bail!("{other} has no Debian installer image. This Mac needs the arm64 or amd64 installer that matches its processor."),
     }
 }
 
@@ -229,7 +231,7 @@ fn total_size(resp: &ureq::Response, status: u16, already: u64) -> u64 {
         .unwrap_or(0)
 }
 
-fn download(agent: &ureq::Agent, url: &str, partial: &Path) -> Result<u64, String> {
+fn download(agent: &ureq::Agent, url: &str, partial: &Path) -> Result<u64> {
     let url = verify::locate(url);
     let have = partial.metadata().map(|m| m.len()).unwrap_or(0);
     let mut progress = Progress::new("download");
@@ -245,23 +247,17 @@ fn download(agent: &ureq::Agent, url: &str, partial: &Path) -> Result<u64, Strin
             progress.tick(have, have, true);
             return Ok(have);
         }
-        Err(ureq::Error::Status(code, resp)) => return Err(verify::status_msg(&url, code, resp)),
-        Err(err) => return Err(format!("{url}: {err}")),
+        Err(ureq::Error::Status(code, resp)) => bail!("{}", verify::status_msg(&url, code, resp)),
+        Err(err) => bail!("{url}: {err}"),
     };
     let status = resp.status();
     let total = total_size(&resp, status, have);
     let (mut file, mut received) = if status == 206 && have > 0 {
-        (
-            OpenOptions::new()
-                .append(true)
-                .open(partial)
-                .map_err(|err| err.to_string())?,
-            have,
-        )
+        (OpenOptions::new().append(true).open(partial)?, have)
     } else if status == 200 {
-        (File::create(partial).map_err(|err| err.to_string())?, 0)
+        (File::create(partial)?, 0)
     } else {
-        return Err(format!("{url} returned {status}"));
+        bail!("{url} returned {status}");
     };
     let mut reader = resp.into_reader();
     let mut buf = vec![0u8; 256 * 1024];
@@ -269,46 +265,40 @@ fn download(agent: &ureq::Agent, url: &str, partial: &Path) -> Result<u64, Strin
     loop {
         let n = reader
             .read(&mut buf)
-            .map_err(|err| format!("download read: {err}"))?;
+            .map_err(|err| anyhow!("download read: {err}"))?;
         if n == 0 {
             break;
         }
         file.write_all(&buf[..n])
-            .map_err(|err| format!("download write: {err}"))?;
+            .map_err(|err| anyhow!("download write: {err}"))?;
         received += n as u64;
         progress.tick(received, total, false);
     }
-    file.sync_all().map_err(|err| err.to_string())?;
+    file.sync_all()?;
     progress.tick(received, total.max(received), true);
     if total > 0 && received != total {
-        return Err(format!(
-            "download stopped at {} of {}",
-            gib(received),
-            gib(total)
-        ));
+        bail!("download stopped at {} of {}", gib(received), gib(total));
     }
     Ok(received)
 }
 
-fn hold_lock(cache: &Path) -> Result<File, String> {
+fn hold_lock(cache: &Path) -> Result<File> {
     let file = OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(false)
-        .open(cache.join("download.lock"))
-        .map_err(|err| err.to_string())?;
+        .open(cache.join("download.lock"))?;
     file.try_lock().map_err(|_| {
-        "a download is already running. Close the other Quick start window and try again."
-            .to_string()
+        anyhow!("a download is already running. Close the other Quick start window and try again.")
     })?;
     Ok(file)
 }
 
-fn run(dir: &Path, order: &Sender<OrderMsg>) -> Result<(), String> {
+fn run(dir: &Path, order: &Sender<OrderMsg>) -> Result<()> {
     let arch = guest_arch()?;
     let cache = dir.join("cache");
     fs::create_dir_all(&cache)
-        .map_err(|err| format!("cannot create {}: {err}", cache.display()))?;
+        .map_err(|err| anyhow!("cannot create {}: {err}", cache.display()))?;
     let _lock = hold_lock(&cache)?;
     let agent = verify::agent();
     let base = verify::current_dir(arch)?;
@@ -317,17 +307,17 @@ fn run(dir: &Path, order: &Sender<OrderMsg>) -> Result<(), String> {
     step("key", "now", key_name, order);
     let key = verify::fetch_key(&agent)?;
     verify::debian_key(&key)?;
-    fs::write(cache.join(key_name), &key).map_err(|err| err.to_string())?;
+    fs::write(cache.join(key_name), &key)?;
     step("key", "done", key_name, order);
 
     step("sums", "now", "SHA512SUMS", order);
     let sums = verify::fetch(&agent, &format!("{base}/SHA512SUMS"))?;
-    fs::write(cache.join("SHA512SUMS"), &sums).map_err(|err| err.to_string())?;
+    fs::write(cache.join("SHA512SUMS"), &sums)?;
     step("sums", "done", "SHA512SUMS", order);
 
     step("sign", "now", "SHA512SUMS.sign", order);
     let signature = verify::fetch(&agent, &format!("{base}/SHA512SUMS.sign"))?;
-    fs::write(cache.join("SHA512SUMS.sign"), &signature).map_err(|err| err.to_string())?;
+    fs::write(cache.join("SHA512SUMS.sign"), &signature)?;
     step("sign", "done", "SHA512SUMS.sign", order);
 
     step("check", "now", "SHA512SUMS.sign", order);
@@ -341,7 +331,7 @@ fn run(dir: &Path, order: &Sender<OrderMsg>) -> Result<(), String> {
     step("download", "now", &published.name, order);
     if !dest.is_file() {
         download(&agent, &url, &partial)?;
-        fs::rename(&partial, &dest).map_err(|err| err.to_string())?;
+        fs::rename(&partial, &dest)?;
     }
     step("download", "done", &published.name, order);
 
@@ -352,17 +342,24 @@ fn run(dir: &Path, order: &Sender<OrderMsg>) -> Result<(), String> {
     progress.tick(size, size, true);
     if got != published.sha512 {
         let _ = fs::remove_file(&dest);
-        return Err(format!(
+        bail!(
             "the download did not match SHA512SUMS for {}",
             published.name
-        ));
+        );
     }
     finish(&url, &published, &dest, order)
 }
 
-fn finish(url: &str, published: &verify::Published, dest: &Path, order: &Sender<OrderMsg>) -> Result<(), String> {
-    let bytes = dest.metadata().map_err(|err| err.to_string())?.len();
-    let cache = dest.parent().ok_or("image path has no directory")?;
+fn finish(
+    url: &str,
+    published: &verify::Published,
+    dest: &Path,
+    order: &Sender<OrderMsg>,
+) -> Result<()> {
+    let bytes = dest.metadata()?.len();
+    let cache = dest
+        .parent()
+        .ok_or_else(|| anyhow!("image path has no directory"))?;
     let manifest = serde_json::json!({
         "url": url,
         "sha512": published.sha512,
@@ -373,12 +370,8 @@ fn finish(url: &str, published: &verify::Published, dest: &Path, order: &Sender<
         "signature": "verified:SHA512SUMS.sign",
     });
     let tmp = cache.join("manifest.json.partial");
-    fs::write(
-        &tmp,
-        serde_json::to_string_pretty(&manifest).map_err(|err| err.to_string())? + "\n",
-    )
-    .map_err(|err| err.to_string())?;
-    fs::rename(&tmp, cache.join("manifest.json")).map_err(|err| err.to_string())?;
+    fs::write(&tmp, serde_json::to_string_pretty(&manifest)? + "\n")?;
+    fs::rename(&tmp, cache.join("manifest.json"))?;
     step("verify", "done", "Checksum matches", order);
     emit!("ready", step: Some("verify"), state: Some("done"), detail: Some("Checksum matches".to_string()), received: Some(bytes), total: Some(bytes), path: Some(dest.display().to_string()));
     Ok(())
@@ -388,17 +381,20 @@ fn usage() -> &'static str {
     "usage: virtual-machine-worker download [--dir PATH]\n\nDownloads the Debian 13 installer. SHA512SUMS.sign must verify with the downloaded OpenPGP keyring. A missing signature is a failure.\n"
 }
 
-fn parse_dir(args: &[String]) -> Result<PathBuf, String> {
+fn parse_dir(args: &[String]) -> Result<PathBuf> {
     let mut dir = support_dir();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--dir" => {
-                dir = PathBuf::from(args.get(i + 1).ok_or("download --dir needs a path")?);
+                dir = PathBuf::from(
+                    args.get(i + 1)
+                        .ok_or_else(|| anyhow!("download --dir needs a path"))?,
+                );
                 i += 2;
             }
-            "-h" | "--help" => return Err(usage().to_string()),
-            other => return Err(format!("unknown argument {other}\n{}", usage())),
+            "-h" | "--help" => bail!("{}", usage()),
+            other => bail!("unknown argument {other}\n{}", usage()),
         }
     }
     Ok(dir)
@@ -415,7 +411,7 @@ fn main() {
         Some(other) if other.starts_with('-') => args.as_slice(),
         Some(other) => {
             let (tx, _rx) = mpsc::channel();
-            fail(format!("unknown command {other}\n{}", usage()), &tx);
+            fail(anyhow!("unknown command {other}\n{}", usage()), &tx);
         }
         None => &args[..],
     };
@@ -431,7 +427,7 @@ fn main() {
 mod tests {
     use super::check_order;
 
-    fn run_seq(seq: &[(&str, &str)]) -> Result<(), String> {
+    fn run_seq(seq: &[(&str, &str)]) -> anyhow::Result<()> {
         let mut order = ["wait"; 6];
         for (id, state) in seq {
             check_order(&mut order, id, state)?;
