@@ -4,9 +4,10 @@ import Virtualization
 /// The screen after the download. The installer writes `disk.img`; that file is the installed system.
 /// A finished preseed powers the guest off. SSH login, not the installer screen, is the finish check.
 /// This view then snapshots that disk so later machines are clones.
-/// Setup is the next wizard page: the same steps as the download page, with a small guest popup instead of the ISO bar.
+/// Setup is the next wizard page: the same steps as the download page, with a small installer thumbnail instead of the ISO bar.
+/// The button beside that thumbnail opens the guest in a new window. That window does not capture the mouse or the keyboard.
 /// Reopening Quick start boots a written disk alone, then checks SSH. It does not attach the installer or a pointer.
-/// A partition table is not a finished login. Quick start never attaches a pointer, so the popup cannot capture the cursor.
+/// A partition table is not a finished login. Quick start never attaches a pointer, so neither view can capture the cursor.
 struct Install: View {
     let iso: String
     let disk: String
@@ -26,7 +27,7 @@ struct Install: View {
     /// Quick start stays the download-sized wizard. A clone is the machine window.
     private var setup: Bool { !fromSnapshot }
 
-    /// A clone captures. Quick start does not, even after SSH, because that view is only a popup.
+    /// A clone captures. Quick start does not, including the installer window opened from the thumbnail.
     private var capturePointer: Bool { fromSnapshot }
 
     var body: some View {
@@ -51,9 +52,20 @@ struct Install: View {
         }
         .padding(24)
         .frame(width: setup ? 440 : 848, alignment: .topLeading)
+        .background {
+            // A Window in the view body is a separate window. Closing it does not stop the guest.
+            if setup {
+                InstallerWindow(guest: guest, presented: $guest.showWindow) {
+                    GuestMirror(session: guest)
+                        .frame(width: 800, height: 500)
+                        .background(.black, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                }
+            }
+        }
         .onAppear {
             // A clone, a login, or a disk the installer already partitioned boots alone.
-            // Quick start still does not attach a pointer, so the popup cannot capture the host cursor.
+            // Quick start still does not attach a pointer, so the installer window cannot capture the host cursor.
             if fromSnapshot || guest.installed {
                 guest.bootDisk(disk, pointer: fromSnapshot)
             } else {
@@ -61,7 +73,7 @@ struct Install: View {
             }
         }
         .onDisappear {
-            guest.showPopup = false
+            guest.showWindow = false
             guest.stop()
         }
     }
@@ -76,31 +88,31 @@ struct Install: View {
         }
     }
 
-    /// The guest, where the download page draws the ISO bar. Setup opens it in a popup instead of growing this window.
+    /// The guest, where the download page draws the ISO bar. Setup opens it in its own window.
     private var guestScreen: some View {
         GuestView(session: guest, capture: capturePointer)
             .background(.black, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
             .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
     }
 
-    /// Same slot as the ISO progress. The installer stays in a small popup so this page keeps the download width.
+    /// Same slot as the ISO progress. A small live thumbnail, and a button that opens the guest in a new window.
+    /// That window does not capture the pointer or the keyboard. Quick start never attaches a pointer either.
+    /// The guest view can only be in one place, so the thumbnail holds it until the window opens.
     private var popupButton: some View {
-        Button(guest.showPopup ? "Hide installer" : "Show installer") {
-            guest.showPopup.toggle()
-        }
-        .buttonStyle(.bordered)
-        .popover(isPresented: $guest.showPopup, arrowEdge: .bottom) {
-            VStack(alignment: .leading, spacing: 8) {
-                Text("Installer").font(.headline)
-                Text(guest.headline)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+        HStack(alignment: .center, spacing: 12) {
+            Group {
                 guestScreen
-                    .frame(width: 640, height: 400)
             }
-            .padding(16)
+            .frame(width: 160, height: 100)
+            .background(.black, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .allowsHitTesting(false)
+            Spacer(minLength: 0)
+            Button("Show installer") { guest.showWindow = true }
+                .buttonStyle(.bordered)
+                .disabled(guest.showWindow)
         }
+        .frame(height: 100)
     }
 
     private var stepList: some View {
@@ -196,7 +208,7 @@ final class GuestSession: NSObject, ObservableObject, VZVirtualMachineDelegate {
     @Published var stopped = false
     @Published var snapshotReady = false
     @Published var cloning = false
-    @Published var showPopup = false
+    @Published var showWindow = false
     @Published var setupSteps = WizardStep.setup
     let view = InstallScreen()
     private var machine: VZVirtualMachine?
@@ -234,7 +246,6 @@ final class GuestSession: NSObject, ObservableObject, VZVirtualMachineDelegate {
             headline = "Debian is already installed. Checking SSH."
             stopped = false
             boot { try Guest.boot(disk: diskURL!, pointer: false) }
-            watchSSH()
             return
         }
         installing = true
@@ -244,7 +255,6 @@ final class GuestSession: NSObject, ObservableObject, VZVirtualMachineDelegate {
         let folder = URL(fileURLWithPath: iso).deletingLastPathComponent()
         let installer = folder.appendingPathComponent("boot.iso")
         let preseed = folder.appendingPathComponent("preseed.img")
-        watchSSH()
         boot {
             try Guest.boot(iso: installer, preseed: preseed, disk: diskURL!)
         }
@@ -266,7 +276,6 @@ final class GuestSession: NSObject, ObservableObject, VZVirtualMachineDelegate {
         markSetup("partition", state: "done", detail: "Guest disk written")
         markSetup("ssh", state: "now", detail: "guest port 22")
         boot { try Guest.boot(disk: diskURL!, pointer: pointer) }
-        watchSSH()
     }
 
     /// The installer powers off when the preseed check passes. The next start is the disk it wrote.
@@ -283,7 +292,6 @@ final class GuestSession: NSObject, ObservableObject, VZVirtualMachineDelegate {
         machine = nil
         // This boot only checks SSH. A pointer here is what captures the cursor in the popup.
         boot { try Guest.boot(disk: disk, pointer: false) }
-        watchSSH()
     }
 
     func stop() {
@@ -309,16 +317,21 @@ final class GuestSession: NSObject, ObservableObject, VZVirtualMachineDelegate {
     /// A black installer screen is not finished. SSH after the installed disk boots is.
     private func watchSSH() {
         watch?.invalidate()
+        // The first probe must not wait for VZVirtualMachine.state == .running.
+        // start() reports success before that state changes, and a stopped guest never reaches it.
+        checkSSH()
         watch = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
             self?.checkSSH()
         }
     }
 
     private func checkSSH() {
-        guard installed, checking, !snapshotReady, !probing, let disk = diskURL, machine?.state == .running else { return }
+        guard installed, checking, !snapshotReady, !probing, let disk = diskURL else { return }
+        // A stopped machine cannot answer. Wait, but do not require .running: that state lags start().
+        if stopped && machine == nil { return }
         probing = true
         DispatchQueue.global(qos: .utility).async { [weak self] in
-            let ok = GuestSSH.probe(beside: disk)
+            let ok = GuestSSH.probe(beside: disk) { self?.leaving == true }
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.probing = false
@@ -330,7 +343,7 @@ final class GuestSession: NSObject, ObservableObject, VZVirtualMachineDelegate {
     private func loginSucceeded() {
         guard installed, checking, !snapshotReady else { return }
         loggedIn = true
-        showPopup = false
+        showWindow = false
         headline = "SSH login succeeded. Saving a snapshot."
         markSetup("ssh", state: "done", detail: "debian")
         markSetup("snapshot", state: "now", detail: "snapshots/debian")
@@ -356,7 +369,7 @@ final class GuestSession: NSObject, ObservableObject, VZVirtualMachineDelegate {
         }
         if checking, installed, let disk = diskURL, GuestSSH.loggedIn(beside: disk) {
             loggedIn = true
-            showPopup = false
+            showWindow = false
             headline = "SSH login succeeded. Saving a snapshot."
             markSetup("ssh", state: "done", detail: "debian")
             markSetup("snapshot", state: "now", detail: "snapshots/debian")
@@ -400,11 +413,19 @@ final class GuestSession: NSObject, ObservableObject, VZVirtualMachineDelegate {
         }
     }
 
+    func attach(_ screen: InstallScreen) {
+        screen.capture = false
+        if screen.virtualMachine !== machine {
+            screen.virtualMachine = machine
+        }
+    }
+
     private func boot(_ make: () throws -> VZVirtualMachine) {
         do {
             let machine = try make()
             machine.delegate = self
             view.virtualMachine = machine
+            view.capture = false
             self.machine = machine
             let installed = installed
             machine.start { [weak self] result in
@@ -421,6 +442,8 @@ final class GuestSession: NSObject, ObservableObject, VZVirtualMachineDelegate {
                             } else {
                                 self?.headline = "Debian is running from the guest disk."
                             }
+                            // start() can report success before state becomes .running. Probe from here.
+                            self?.watchSSH()
                         } else {
                             self?.markSetup("installer", state: "done", detail: nil)
                             self?.markSetup("partition", state: "now", detail: "Writing /dev/vda")
@@ -463,6 +486,102 @@ final class GuestSession: NSObject, ObservableObject, VZVirtualMachineDelegate {
     }
 }
 
+/// Opens the guest in its own window. The wizard stays the download size.
+/// The view is not in the wizard while this window is open, so the thumbnail mirrors it.
+private struct InstallerWindow<Content: View>: NSViewRepresentable {
+    let guest: GuestSession
+    @Binding var presented: Bool
+    @ViewBuilder var content: () -> Content
+
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView(frame: .zero)
+        context.coordinator.sync(presented, host: view)
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        context.coordinator.sync(presented, host: nsView)
+    }
+
+    static func dismantleNSView(_ nsView: NSView, coordinator: Coordinator) {
+        coordinator.close()
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator(guest: guest, content: content) }
+
+    final class Coordinator {
+        let guest: GuestSession
+        let content: () -> Content
+        var panel: NSPanel?
+
+        init(guest: GuestSession, content: @escaping () -> Content) {
+            self.guest = guest
+            self.content = content
+        }
+
+        func sync(_ presented: Bool, host: NSView) {
+            if presented {
+                open(near: host.window)
+            } else {
+                close()
+            }
+        }
+
+        func open(near parent: NSWindow?) {
+            if let panel {
+                panel.orderFront(nil)
+                return
+            }
+            let host = NSHostingView(rootView: content().padding(16))
+            host.frame = NSRect(x: 0, y: 0, width: 832, height: 532)
+            let panel = NSPanel(
+                contentRect: host.frame,
+                styleMask: [.titled, .closable, .miniaturizable],
+                backing: .buffered,
+                defer: false
+            )
+            panel.title = "Installer"
+            panel.isReleasedWhenClosed = false
+            panel.hidesOnDeactivate = false
+            panel.contentView = host
+            // A non-activating panel does not become key, so it cannot take the keyboard.
+            // The guest view also ignores the pointer. Quick start never attaches one.
+            panel.styleMask.insert(.nonactivatingPanel)
+            panel.becomesKeyOnlyIfNeeded = true
+            panel.level = .floating
+            if let parent {
+                var origin = parent.frame.origin
+                origin.x += parent.frame.width + 16
+                panel.setFrameOrigin(origin)
+            }
+            panel.makeFirstResponder(nil)
+            let delegate = PanelClose(guest: guest)
+            panel.delegate = delegate
+            objc_setAssociatedObject(panel, &panelCloseKey, delegate, .OBJC_ASSOCIATION_RETAIN)
+            panel.orderFront(nil)
+            self.panel = panel
+        }
+
+        func close() {
+            panel?.close()
+            panel = nil
+        }
+    }
+}
+
+private var panelCloseKey = 0
+
+private final class PanelClose: NSObject, NSWindowDelegate {
+    let guest: GuestSession
+    init(guest: GuestSession) { self.guest = guest }
+    func windowWillClose(_ notification: Notification) {
+        DispatchQueue.main.async { self.guest.showWindow = false }
+    }
+    func windowDidBecomeKey(_ notification: Notification) {
+        (notification.object as? NSWindow)?.makeFirstResponder(nil)
+    }
+}
+
 struct GuestView: NSViewRepresentable {
     let session: GuestSession
     var capture: Bool
@@ -474,6 +593,26 @@ struct GuestView: NSViewRepresentable {
 
     func updateNSView(_ nsView: InstallScreen, context: Context) {
         nsView.capture = capture
+    }
+}
+
+/// Second view of the same guest, used only by the installer window.
+/// The thumbnail keeps the first view, so opening the window does not blank it.
+/// Second view of the same guest. The thumbnail keeps the first view, so opening the window does not blank it.
+/// Neither view captures. The window is a non-activating panel, so it also does not take the keyboard.
+struct GuestMirror: NSViewRepresentable {
+    let session: GuestSession
+
+    func makeNSView(context: Context) -> InstallScreen {
+        let screen = InstallScreen()
+        screen.capture = false
+        session.attach(screen)
+        return screen
+    }
+
+    func updateNSView(_ nsView: InstallScreen, context: Context) {
+        nsView.capture = false
+        session.attach(nsView)
     }
 }
 
@@ -540,6 +679,10 @@ final class InstallScreen: VZVirtualMachineView {
     override func mouseDragged(with event: NSEvent) { if capture { super.mouseDragged(with: event) } }
     override func rightMouseDown(with event: NSEvent) { if capture { super.rightMouseDown(with: event) } }
     override func scrollWheel(with event: NSEvent) { if capture { super.scrollWheel(with: event) } }
+
+    override func keyDown(with event: NSEvent) { if capture { super.keyDown(with: event) } }
+    override func keyUp(with event: NSEvent) { if capture { super.keyUp(with: event) } }
+    override func flagsChanged(with event: NSEvent) { if capture { super.flagsChanged(with: event) } }
 
     private func applyCapture() {
         capturesSystemKeys = capture

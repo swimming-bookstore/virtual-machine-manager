@@ -2136,7 +2136,12 @@ fn quick_start_swift_gates_the_bar_on_a_real_download() {
     assert!(src.contains("static let preseed"));
     assert!(include_str!("../Sources/Install.swift").contains("Debian setup"));
     assert!(include_str!("../Sources/Install.swift").contains("Show installer"));
-    assert!(include_str!("../Sources/Install.swift").contains(".popover(isPresented: $guest.showPopup"));
+    assert!(include_str!("../Sources/Install.swift").contains("GuestMirror"));
+    assert!(include_str!("../Sources/Install.swift").contains("func attach(_ screen: InstallScreen)"));
+    assert!(include_str!("../Sources/Install.swift").contains(".nonactivatingPanel"));
+    assert!(include_str!("../Sources/Install.swift").contains("becomesKeyOnlyIfNeeded = true"));
+    assert!(include_str!("../Sources/Install.swift").contains("frame(width: 160, height: 100)"));
+    assert!(!include_str!("../Sources/Install.swift").contains(".popover(isPresented:"));
     assert!(include_str!("../Sources/Install.swift").contains("frame(width: setup ? 440 : 848"));
     assert!(!include_str!("../Sources/Install.swift").contains("frame(height: 96)"));
     assert!(include_str!("../Sources/Install.swift").contains("private var capturePointer: Bool { fromSnapshot }"));
@@ -2152,6 +2157,11 @@ fn quick_start_swift_gates_the_bar_on_a_real_download() {
     assert!(include_str!("../Sources/Guest.swift").contains("VZNATNetworkDeviceAttachment()"));
     assert!(!include_str!("../Sources/Guest.swift").contains("VZNATNetworkDeviceForwardingRules"));
     assert!(include_str!("../Sources/Guest.swift").contains("192.168.64."));
+    assert!(include_str!("../Sources/Guest.swift").contains("for n in 2...254"));
+    assert!(include_str!("../Sources/Guest.swift").contains("ConnectTimeout=1"));
+    assert!(include_str!("../Sources/Guest.swift").contains("terminationHandler"));
+    assert!(include_str!("../Sources/Install.swift").contains("self?.watchSSH()"));
+    assert!(!include_str!("../Sources/Install.swift").contains("machine?.state == .running"));
     assert!(include_str!("../Sources/Guest.swift").contains("func forget(beside disk: URL)"));
     assert!(include_str!("../Sources/Install.swift").contains("SSH login succeeded. Saving a snapshot."));
     assert!(include_str!("../Sources/Install.swift").contains("New virtual machine"));

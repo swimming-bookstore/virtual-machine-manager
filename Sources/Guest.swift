@@ -111,12 +111,14 @@ enum GuestSSH {
     }
 
     /// One attempt. A closed port is not a finished install.
-    static func probe(beside disk: URL) -> Bool {
+    /// `cancel` is set when the window closes so a full subnet scan cannot keep the UI on "Checking SSH".
+    static func probe(beside disk: URL, cancel: @escaping () -> Bool = { false }) -> Bool {
         if loggedIn(beside: disk) { return true }
         let folder = dir(beside: disk)
         let key = folder.appendingPathComponent("id_ed25519")
         guard FileManager.default.isReadableFile(atPath: key.path) else { return false }
         for host in hosts(matching: Guest.macString(for: disk)) {
+            if cancel() { return false }
             if login(key: key, host: host) {
                 let line = "\(Guest.user) ok\n"
                 try? line.write(to: proof(beside: disk), atomically: true, encoding: .utf8)
@@ -127,7 +129,8 @@ enum GuestSSH {
         return false
     }
 
-    /// ARP first, then the usual DHCP addresses. 192.168.64.1 is the host gateway, not the guest.
+    /// ARP first, then every guest address in the NAT subnet. 192.168.64.1 is the host gateway, not the guest.
+    /// DHCP is not limited to .2–.8, so stopping there leaves a running guest stuck on the SSH check.
     private static func hosts(matching mac: String) -> [String] {
         let want = normalizeMAC(mac)
         var matched: [String] = []
@@ -140,7 +143,7 @@ enum GuestSSH {
             }
         }
         var hosts = matched + others
-        for n in 2...8 {
+        for n in 2...254 {
             hosts.append("192.168.64.\(n)")
         }
         var seen = Set<String>()
@@ -194,7 +197,13 @@ enum GuestSSH {
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice
         guard (try? process.run()) != nil else { return false }
-        process.waitUntilExit()
+        let finished = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in finished.signal() }
+        if finished.wait(timeout: .now() + 3) == .timedOut {
+            process.terminate()
+            _ = finished.wait(timeout: .now() + 1)
+            return false
+        }
         return process.terminationStatus == 0
     }
 }
