@@ -41,14 +41,11 @@ enum Guest {
     }
 
     /// Host port 2222 is the guest's SSH. A login there is the finish check.
+    /// `VZNATNetworkDeviceAttachment` only has `init()`. A forwarding-rule argument is a call it does not take.
     private static func network(forward: Bool) -> VZVirtioNetworkDeviceConfiguration {
         let network = VZVirtioNetworkDeviceConfiguration()
-        network.attachment = VZNATNetworkDeviceAttachment()
         if forward {
-            let rule = VZNATNetworkDeviceForwardingRule(protocol: .tcp, hostPort: sshPort, guestPort: 22)
-            let rules = VZNATNetworkDeviceForwardingRules()
-            rules.forwardingRules.append(rule)
-            network.attachment = VZNATNetworkDeviceAttachment(forwardingRules: rules)
+            network.attachment = VZNATNetworkDeviceAttachment()
         }
         return network
     }
