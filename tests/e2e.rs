@@ -544,6 +544,12 @@ fn quick_start_checks_the_signature_before_the_iso() {
     assert_eq!(screen.row("patch").detail, "boot.iso");
     assert!(screen.installing());
     assert_eq!(screen.buttons(), [] as [&str; 0]);
+    let setup = open_setup(&screen, &dir);
+    assert_eq!(setup.title, "Debian setup");
+    assert!(setup.shows_installer());
+    assert_eq!(setup.buttons(), ["Show installer"]);
+    assert_eq!(setup.row("installer").state, "now");
+    assert!(!setup.captures_pointer());
     assert!(dir.join("cache/preseed.img").is_file());
     assert!(dir.join("cache/boot.iso").is_file());
     assert_eq!(
@@ -580,7 +586,11 @@ fn quick_start_checks_the_signature_before_the_iso() {
     assert!(cached.installing());
     assert_eq!(cached.page, 1);
     assert_eq!(cached.row("preseed").state, "done");
+    assert_eq!(cached.row("patch").detail, "Already patched");
     assert_eq!(cached.buttons(), [] as [&str; 0]);
+    let setup = open_setup(&cached, &dir);
+    assert!(setup.shows_installer());
+    assert_eq!(setup.row("installer").state, "now");
 }
 
 #[test]
@@ -752,6 +762,7 @@ fn a_second_download_is_refused_while_the_lock_is_held() {
 }
 
 /// Quick start window. Same rules as Sources/QuickStart.swift.
+#[derive(Debug)]
 struct Step {
     id: &'static str,
     title: &'static str,
@@ -1263,6 +1274,10 @@ fn snapshot_waits_for_ssh_then_clones() {
         installed.headline.as_deref(),
         Some("Debian is installed and shut down. A snapshot is saved for new machines.")
     );
+    assert_eq!(installed.buttons(), ["New virtual machine"]);
+    assert!(!installed.shows_installer, "a saved snapshot hides the thumbnail");
+    assert_eq!(installed.row("snapshot").state, "done");
+    assert_eq!(installed.row("ssh").detail, "debian");
 
     let mut src = std::fs::OpenOptions::new().write(true).open(&disk).unwrap();
     src.seek(SeekFrom::Start(4096)).unwrap();
@@ -1321,6 +1336,12 @@ fn snapshot_waits_for_ssh_then_clones() {
     assert_eq!(welcome.disk.as_deref(), event["disk"].as_str());
     assert!(welcome.error.is_none());
     assert!(welcome.can_clone);
+    let machine = open_clone(event["disk"].as_str().unwrap());
+    assert_eq!(machine.title, "Debian");
+    assert!(machine.captures_pointer());
+    assert!(!machine.shows_installer());
+    assert_eq!(machine.headline.as_deref(), Some("Starting Debian."));
+    assert_eq!(machine.buttons(), [] as [&str; 0]);
 
     let next = cli(&["clone", "--dir", dir.to_str().unwrap()]);
     assert!(next.status.success(), "{}", String::from_utf8_lossy(&next.stdout));
@@ -1336,29 +1357,68 @@ fn one_event(stdout: &[u8]) -> Value {
     serde_json::from_str(line).unwrap_or_else(|_| panic!("bad event {text}"))
 }
 
-/// Same snapshot outcome as Install.swift `saveSnapshot`.
+/// Same snapshot outcome as Install.swift `saveSnapshot`, then the setup rows that page paints.
 struct Installed {
     error: Option<String>,
     headline: Option<String>,
     snapshot_ready: bool,
+    steps: Vec<Step>,
+    stopped: bool,
+    shows_installer: bool,
+    cloning: bool,
 }
 
 fn finish_install(stdout: &[u8]) -> Installed {
     let err = worker_error(stdout);
+    let mut page = setup_page(false);
     if let Some(err) = err {
-        Installed {
-            headline: Some("Debian shut down, but the snapshot was not saved.".into()),
-            error: Some(err),
-            snapshot_ready: false,
-        }
+        page.fail_current();
+        page.headline = Some("Debian shut down, but the snapshot was not saved.".into());
+        page.error = Some(err);
+        page.snapshot_ready = false;
     } else {
-        Installed {
-            headline: Some(
-                "Debian is installed and shut down. A snapshot is saved for new machines.".into(),
-            ),
-            error: None,
-            snapshot_ready: true,
+        page.mark("ssh", "done", Some("debian"));
+        page.mark("snapshot", "done", Some("Saved"));
+        page.headline = Some(
+            "Debian is installed and shut down. A snapshot is saved for new machines.".into(),
+        );
+        page.error = None;
+        page.snapshot_ready = true;
+        page.show_window = false;
+    }
+    page.stopped = true;
+    let shows_installer = page.shows_installer();
+    Installed {
+        error: page.error,
+        headline: page.headline,
+        snapshot_ready: page.snapshot_ready,
+        steps: page.steps,
+        stopped: page.stopped,
+        shows_installer,
+        cloning: false,
+    }
+}
+
+impl Installed {
+    fn row(&self, id: &str) -> &Step {
+        self.steps.iter().find(|step| step.id == id).unwrap()
+    }
+
+    fn buttons(&self) -> Vec<&'static str> {
+        if !self.stopped {
+            return vec![];
         }
+        let mut buttons = Vec::new();
+        if !self.snapshot_ready {
+            buttons.push("Start Debian");
+        } else {
+            buttons.push("New virtual machine");
+        }
+        if self.error.is_some() && !self.snapshot_ready {
+            buttons.push("Save snapshot");
+        }
+        let _ = self.cloning;
+        buttons
     }
 }
 
@@ -2110,6 +2170,305 @@ fn reopening_quick_start_boots_the_installed_disk() {
     assert!(boot.starts_vm);
     assert!(!boot.snapshot_saved);
     assert_eq!(boot.headline.as_deref(), Some("Starting the installer."));
+}
+
+/// Debian setup, the page Quick start shows once the worker is ready.
+/// Same rules as Install.swift. The worker is not asked to boot a virtual machine.
+#[derive(Debug)]
+struct Setup {
+    title: &'static str,
+    headline: Option<String>,
+    error: Option<String>,
+    steps: Vec<Step>,
+    installed: bool,
+    logged_in: bool,
+    stopped: bool,
+    snapshot_ready: bool,
+    from_snapshot: bool,
+    show_window: bool,
+    started: bool,
+    checking: bool,
+}
+
+fn setup_steps() -> Vec<Step> {
+    vec![
+        Step {
+            id: "installer",
+            title: "Start the installer",
+            detail: "boot.iso".into(),
+            state: "wait".into(),
+        },
+        Step {
+            id: "partition",
+            title: "Write the guest disk",
+            detail: "/dev/vda".into(),
+            state: "wait".into(),
+        },
+        Step {
+            id: "ssh",
+            title: "Log in with the host key",
+            detail: "guest port 22".into(),
+            state: "wait".into(),
+        },
+        Step {
+            id: "snapshot",
+            title: "Save a snapshot",
+            detail: "snapshots/debian".into(),
+            state: "wait".into(),
+        },
+    ]
+}
+
+fn setup_page(from_snapshot: bool) -> Setup {
+    Setup {
+        title: if from_snapshot { "Debian" } else { "Debian setup" },
+        headline: None,
+        error: None,
+        steps: setup_steps(),
+        installed: from_snapshot,
+        logged_in: from_snapshot,
+        stopped: false,
+        snapshot_ready: false,
+        from_snapshot,
+        show_window: false,
+        started: false,
+        checking: false,
+    }
+}
+
+impl Setup {
+    fn row(&self, id: &str) -> &Step {
+        self.steps.iter().find(|step| step.id == id).unwrap()
+    }
+
+    fn shows_installer(&self) -> bool {
+        !self.from_snapshot && !self.snapshot_ready
+    }
+
+    fn captures_pointer(&self) -> bool {
+        self.from_snapshot
+    }
+
+    fn mark(&mut self, id: &str, state: &str, detail: Option<&str>) {
+        let Some(index) = self.steps.iter().position(|step| step.id == id) else {
+            return;
+        };
+        if let Some(detail) = detail.filter(|text| !text.is_empty()) {
+            self.steps[index].detail = detail.to_string();
+        }
+        self.steps[index].state = state.to_string();
+        if state == "done" || state == "now" {
+            for earlier in 0..index {
+                if self.steps[earlier].state != "done" && self.steps[earlier].state != "fail" {
+                    self.steps[earlier].state = "done".into();
+                }
+            }
+        }
+    }
+
+    fn fail_current(&mut self) {
+        let index = self
+            .steps
+            .iter()
+            .position(|step| step.state == "now")
+            .or_else(|| self.steps.iter().position(|step| step.state == "wait"));
+        if let Some(index) = index {
+            self.steps[index].state = "fail".into();
+        }
+    }
+
+    fn hold_finished(&mut self, _disk: &str) {
+        self.started = true;
+        self.stopped = true;
+        self.installed = true;
+        self.logged_in = true;
+        self.snapshot_ready = true;
+        self.checking = false;
+        self.show_window = false;
+        self.error = None;
+        self.headline = Some(
+            "Debian is installed and shut down. A snapshot is saved for new machines.".into(),
+        );
+        self.mark("installer", "done", None);
+        self.mark("partition", "done", Some("Guest disk written"));
+        self.mark("ssh", "done", Some("debian"));
+        self.mark("snapshot", "done", Some("Saved"));
+    }
+
+    /// Install.onAppear. A saved snapshot does not start. A written disk boots alone.
+    fn appear(&mut self, iso: &str, disk: &str) {
+        if self.snapshot_ready && !self.from_snapshot {
+            self.hold_finished(disk);
+        } else if self.from_snapshot || self.installed {
+            self.boot_disk(disk, self.from_snapshot);
+        } else {
+            self.start(iso, disk);
+        }
+    }
+
+    fn start(&mut self, _iso: &str, disk: &str) {
+        if self.started {
+            return;
+        }
+        self.started = true;
+        self.error = None;
+        self.stopped = false;
+        if self.snapshot_ready {
+            self.hold_finished(disk);
+            return;
+        }
+        if guest_logged_in(Path::new(disk)) || disk_looks_installed(Path::new(disk)) {
+            self.installed = true;
+            self.logged_in = guest_logged_in(Path::new(disk));
+            self.checking = true;
+            self.headline = Some("Debian is already installed. Checking SSH.".into());
+            return;
+        }
+        self.steps = setup_steps();
+        self.mark("installer", "now", Some("boot.iso"));
+        self.headline = Some("Starting the installer.".into());
+    }
+
+    fn boot_disk(&mut self, disk: &str, pointer: bool) {
+        if self.started {
+            return;
+        }
+        self.started = true;
+        self.installed = true;
+        self.logged_in = guest_logged_in(Path::new(disk)) || self.from_snapshot;
+        self.checking = true;
+        self.stopped = false;
+        self.error = None;
+        if !self.from_snapshot && snapshot_ready(Path::new(disk)) {
+            self.hold_finished(disk);
+            return;
+        }
+        let _ = pointer;
+        self.headline = Some(if self.from_snapshot {
+            "Starting Debian.".into()
+        } else {
+            "Debian is already installed. Checking SSH.".into()
+        });
+        self.mark("installer", "done", None);
+        self.mark("partition", "done", Some("Guest disk written"));
+        self.mark("ssh", "now", Some("guest port 22"));
+    }
+
+    fn buttons(&self) -> Vec<&'static str> {
+        let mut buttons = Vec::new();
+        if self.shows_installer() {
+            buttons.push("Show installer");
+        }
+        if self.stopped {
+            if !self.snapshot_ready {
+                buttons.push(if self.installed {
+                    "Start Debian"
+                } else {
+                    "Start from the guest disk"
+                });
+            }
+            if self.snapshot_ready {
+                buttons.push("New virtual machine");
+            }
+            if self.error.is_some() && self.installed && !self.snapshot_ready {
+                buttons.push("Save snapshot");
+            }
+            if self.error.is_some() && !self.installed && !self.from_snapshot {
+                buttons.push("Try again");
+            }
+        }
+        buttons
+    }
+}
+
+fn open_setup(screen: &Screen, dir: &Path) -> Setup {
+    assert!(screen.installing());
+    let disk = screen.disk_path.as_deref().unwrap();
+    let written = guest_logged_in(Path::new(disk)) || disk_looks_installed(Path::new(disk));
+    let saved = snapshot_ready(Path::new(disk));
+    let mut page = setup_page(false);
+    page.installed = written || saved;
+    page.logged_in = guest_logged_in(Path::new(disk)) || saved;
+    page.snapshot_ready = saved;
+    if saved {
+        page.stopped = true;
+        page.headline = Some(
+            "Debian is installed and shut down. A snapshot is saved for new machines.".into(),
+        );
+        page.mark("installer", "done", None);
+        page.mark("partition", "done", Some("Guest disk written"));
+        page.mark("ssh", "done", Some("debian"));
+        page.mark("snapshot", "done", Some("Saved"));
+    } else {
+        page.headline = Some(if written {
+            "Debian is already installed. Checking SSH.".into()
+        } else {
+            "Starting the installer.".into()
+        });
+    }
+    page.appear(screen.ready_path.as_deref().unwrap(), disk);
+    let _ = dir;
+    page
+}
+
+fn open_clone(disk: &str) -> Setup {
+    let mut page = setup_page(true);
+    page.snapshot_ready = false;
+    page.headline = Some("Starting Debian.".into());
+    page.appear("", disk);
+    page
+}
+
+#[test]
+fn the_setup_page_hides_the_installer_once_the_snapshot_is_saved() {
+    let (base, _) = serve(SUMS, SIGN, ISO, KEY, false, false, false);
+    let (status, events, dir) = run(&base);
+    assert_eq!(status, 0, "{events:?}");
+    let screen = finish(&events, status);
+    let mut setup = open_setup(&screen, &dir);
+    assert_eq!(setup.title, "Debian setup");
+    assert!(setup.shows_installer());
+    assert!(!setup.captures_pointer());
+    assert_eq!(setup.buttons(), ["Show installer"]);
+    assert_eq!(setup.row("installer").state, "now");
+    assert_eq!(setup.row("partition").state, "wait");
+    setup.show_window = true;
+    assert_eq!(setup.buttons(), ["Show installer"]);
+
+    let disk = dir.join("machines/debian/disk.img");
+    let mut file = std::fs::OpenOptions::new().write(true).open(&disk).unwrap();
+    use std::io::{Seek, SeekFrom, Write};
+    file.seek(SeekFrom::Start(510)).unwrap();
+    file.write_all(&[0x55, 0xaa]).unwrap();
+    drop(file);
+    let written = open_setup(&screen, &dir);
+    assert_eq!(
+        written.headline.as_deref(),
+        Some("Debian is already installed. Checking SSH.")
+    );
+    assert!(written.shows_installer());
+    assert!(written.checking);
+    assert!(!written.stopped);
+    assert_eq!(written.buttons(), ["Show installer"]);
+
+    std::fs::write(dir.join("ssh/logged-in"), b"debian ok\n").unwrap();
+    let saved = cli(&["snapshot", "--dir", dir.to_str().unwrap()]);
+    assert!(saved.status.success(), "{}", String::from_utf8_lossy(&saved.stdout));
+    let done = finish_install(&saved.stdout);
+    assert!(!done.shows_installer);
+    assert_eq!(done.buttons(), ["New virtual machine"]);
+    assert_eq!(done.row("installer").state, "done");
+    assert_eq!(done.row("snapshot").detail, "Saved");
+    let reopened = open_setup(&screen, &dir);
+    assert!(reopened.snapshot_ready);
+    assert!(!reopened.shows_installer());
+    assert!(!reopened.checking);
+    assert!(reopened.stopped);
+    assert_eq!(reopened.buttons(), ["New virtual machine"]);
+    assert_eq!(
+        reopened.headline.as_deref(),
+        Some("Debian is installed and shut down. A snapshot is saved for new machines.")
+    );
 }
 
 /// Same choice as Install.onAppear after Quick start emits ready.
