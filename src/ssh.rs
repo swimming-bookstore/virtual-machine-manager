@@ -38,7 +38,10 @@ pub fn ensure(dir: &Path) -> Result<Keys> {
     if fs::read_to_string(&authorized).ok().as_deref() != Some(public_line.as_str()) {
         write_new(&authorized, public_line.as_bytes())?;
     }
-    Ok(Keys { private, public_line })
+    Ok(Keys {
+        private,
+        public_line,
+    })
 }
 
 /// True only after a login with the host key has been recorded.

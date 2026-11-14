@@ -16,16 +16,18 @@ struct WizardStep: Identifiable {
         WizardStep(id: "verify", title: "Verify checksum", detail: "SHA512SUMS", state: "wait"),
     ]
 
-    /// Page two is only these rows. The download list stays on the first page.
+    /// Page two starts with these rows. Debian setup is the same page, not the next one.
     static let preseed = [
+        WizardStep(id: "sshkey", title: "Prepare the host key", detail: "id_ed25519", state: "wait"),
         WizardStep(id: "preseed", title: "Prepare preseed disk", detail: "preseed.img", state: "wait"),
-        WizardStep(id: "patch", title: "Patch the installer", detail: "boot.iso", state: "wait"),
+        WizardStep(id: "disk", title: "Prepare the disk", detail: "disk.img", state: "wait"),
+        WizardStep(id: "patch", title: "Prepare installer", detail: "boot.iso", state: "wait"),
     ]
 
-    /// Debian setup is the next page of this wizard, not a different window.
+    /// The installer rows on the preseed page. A clone window is not this wizard.
     static let setup = [
         WizardStep(id: "installer", title: "Start the installer", detail: "boot.iso", state: "wait"),
-        WizardStep(id: "partition", title: "Write the guest disk", detail: "/dev/vda", state: "wait"),
+        WizardStep(id: "partition", title: "Install guest", detail: "disk.img", state: "wait"),
         WizardStep(id: "ssh", title: "Log in with the host key", detail: "guest port 22", state: "wait"),
         WizardStep(id: "snapshot", title: "Save a snapshot", detail: "snapshots/debian", state: "wait"),
     ]
@@ -68,6 +70,8 @@ final class Wizard: ObservableObject {
     @Published var downloading = false
 
     private var started = false
+    /// ISO path from the last ready event. Rewinding does not forget it, so a deleted ISO still maps to the download step.
+    private var isoPath: String?
     private var process: Process?
     private var output: FileHandle?
     private var buffer = Data()
@@ -82,7 +86,10 @@ final class Wizard: ObservableObject {
         return ""
     }
 
-    func start() {
+    func start() { start(from: nil) }
+
+    /// `resume` is the first step whose file is gone. Earlier steps are left as they are.
+    func start(from resume: String?) {
         guard !started else { return }
         started = true
         cancelled = false
@@ -97,7 +104,11 @@ final class Wizard: ObservableObject {
         }
         let process = Process()
         process.executableURL = worker
-        process.arguments = ["download", "--dir", CacheFolder.url.deletingLastPathComponent().path]
+        var args = ["download", "--dir", CacheFolder.url.deletingLastPathComponent().path]
+        if let resume, resume != "key" {
+            args += ["--from", resume]
+        }
+        process.arguments = args
         let pipe = Pipe()
         process.standardOutput = pipe
         process.standardError = FileHandle.nullDevice
@@ -143,16 +154,114 @@ final class Wizard: ObservableObject {
         output?.readabilityHandler = nil
     }
 
-    /// Clear the ticks when the finished ISO, the guest disk, or the opened cache folder is gone.
+    /// A finished step's file was removed. Run again from that step. Earlier steps stay done.
     func cacheWentAway() {
-        let finished = readyPath != nil || steps.contains { $0.state == "done" }
-        guard finished else { return }
-        if readyPath == nil && process?.isRunning == true { return }
-        guard imageMissing() || diskMissing() else { return }
-        if process?.isRunning == true { process?.terminate() }
+        guard !cancelled else { return }
+        if process?.isRunning == true { return }
+        guard let missing = firstMissing() else { return }
+        resume(from: missing)
+    }
+
+    private func resume(from id: String) {
+        process?.terminate()
         reap(process)
-        reset()
-        start()
+        rewind(to: id)
+        forgetDiskIfNeeded()
+        started = false
+        start(from: id)
+    }
+
+    /// The first finished step whose file is gone. Later files are rebuilt by that step.
+    private func firstMissing() -> String? {
+        let order = ["key", "sums", "sign", "check", "download", "verify", "sshkey", "preseed", "disk", "patch"]
+        for id in order {
+            guard let step = steps.first(where: { $0.id == id }), step.state == "done" else { continue }
+            if !artifactOK(id) { return id }
+        }
+        return nil
+    }
+
+    private func artifactOK(_ id: String) -> Bool {
+        let fm = FileManager.default
+        let cache = CacheFolder.url
+        let support = cache.deletingLastPathComponent()
+        func has(_ url: URL) -> Bool { fm.fileExists(atPath: url.path) }
+        switch id {
+        case "key":
+            return has(cache.appendingPathComponent("key-DA87E80D6294BE9B.txt"))
+        case "sums":
+            return has(cache.appendingPathComponent("SHA512SUMS"))
+        case "sign":
+            return has(cache.appendingPathComponent("SHA512SUMS.sign"))
+        case "check":
+            return true
+        case "download":
+            guard let isoPath else { return false }
+            return has(URL(fileURLWithPath: isoPath))
+        case "verify":
+            return has(cache.appendingPathComponent("manifest.json"))
+        case "sshkey":
+            return has(support.appendingPathComponent("ssh/id_ed25519"))
+                && has(support.appendingPathComponent("ssh/id_ed25519.pub"))
+                && has(support.appendingPathComponent("ssh/authorized_keys"))
+        case "preseed":
+            return has(cache.appendingPathComponent("preseed.img"))
+        case "disk":
+            let disk = diskPath.map { URL(fileURLWithPath: $0) }
+                ?? support.appendingPathComponent("machines/debian/disk.img")
+            return has(disk)
+        case "patch":
+            return has(cache.appendingPathComponent("boot.iso"))
+        default:
+            return true
+        }
+    }
+
+    /// Drop this step and everything after it. The page follows the step that has to run.
+    private func rewind(to id: String) {
+        if !Self.pageTwo.contains(id) {
+            steps.removeAll { Self.pageTwo.contains($0.id) }
+        } else if !steps.contains(where: { $0.id == "sshkey" }) {
+            steps.append(contentsOf: WizardStep.preseed)
+        }
+        guard let index = steps.firstIndex(where: { $0.id == id }) else { return }
+        for i in index..<steps.count {
+            steps[i].state = i == index ? "now" : "wait"
+            steps[i].detail = Self.detail(for: steps[i].id)
+        }
+        readyPath = nil
+        diskPath = nil
+        downloading = false
+        received = 0
+        total = 0
+        error = nil
+        headline = nil
+        cancelled = false
+        page = Self.pageTwo.contains(id) ? 1 : 0
+        pinned = false
+    }
+
+    private static func detail(for id: String) -> String {
+        switch id {
+        case "key": return "key-DA87E80D6294BE9B.txt"
+        case "sums": return "SHA512SUMS"
+        case "sign", "check": return "SHA512SUMS.sign"
+        case "download": return WizardStep.isoName
+        case "verify": return "SHA512SUMS"
+        case "sshkey": return "id_ed25519"
+        case "preseed": return "preseed.img"
+        case "disk": return "disk.img"
+        case "patch": return "boot.iso"
+        default: return ""
+        }
+    }
+
+    /// Preparing the disk writes this file. A stale login must not survive it.
+    private func forgetDiskIfNeeded() {
+        let disk = CacheFolder.url.deletingLastPathComponent().appendingPathComponent("machines/debian/disk.img")
+        if !FileManager.default.fileExists(atPath: disk.path) {
+            GuestSSH.forget(beside: disk)
+        }
     }
 
     private func reset() {
@@ -170,29 +279,10 @@ final class Wizard: ObservableObject {
         error = nil
         readyPath = nil
         diskPath = nil
+        isoPath = nil
         cancelled = false
         headline = nil
         started = false
-    }
-
-    private func imageMissing() -> Bool {
-        if let readyPath { return !FileManager.default.fileExists(atPath: readyPath) }
-        let cache = CacheFolder.url
-        let fm = FileManager.default
-        if !fm.fileExists(atPath: cache.path) { return true }
-        let names = ["SHA512SUMS", "SHA512SUMS.sign", "manifest.json", "key-DA87E80D6294BE9B.txt"]
-        if names.contains(where: { fm.fileExists(atPath: cache.appendingPathComponent($0).path) }) { return false }
-        let items = (try? fm.contentsOfDirectory(at: cache, includingPropertiesForKeys: nil)) ?? []
-        return !items.contains { $0.pathExtension == "iso" }
-    }
-
-    /// `disk.img` is the installed system. Removing it is not a finished install.
-    /// The login proof is not that disk. Leave it and the next empty disk looks finished.
-    private func diskMissing() -> Bool {
-        guard let diskPath else { return false }
-        let gone = !FileManager.default.fileExists(atPath: diskPath)
-        if gone { GuestSSH.forget(beside: URL(fileURLWithPath: diskPath)) }
-        return gone
     }
 
     private func watch(_ path: String) {
@@ -266,11 +356,12 @@ final class Wizard: ObservableObject {
                 steps[index].detail = detail
             }
         case "step", "ready":
-            if event.step == "preseed" || event.step == "patch" { showPreseed() }
+            if let step = event.step, Self.pageTwo.contains(step) { showPreseed() }
             if let step = event.step, let state = event.state { applyState(step, state: state, detail: event.detail) }
             if event.event == "ready" {
                 readyPath = event.path
                 diskPath = event.disk
+                if let path = event.path { isoPath = path }
                 if downloading {
                     total = max(total, 1)
                     received = total
@@ -293,24 +384,24 @@ final class Wizard: ObservableObject {
         }
     }
 
-    /// Remember preseed and patch. They stay off the download page.
+    /// Remember the host key, preseed, the guest disk, and the installer copy. They stay off the download page.
     private func showPreseed() {
-        guard !steps.contains(where: { $0.id == "preseed" }) else { return }
+        guard !steps.contains(where: { $0.id == "sshkey" }) else { return }
         for earlier in steps.indices where steps[earlier].state != "fail" {
             steps[earlier].state = "done"
         }
         steps.append(contentsOf: WizardStep.preseed)
     }
 
-    /// The page the worker has reached. Setup is only after the image is ready.
+    /// The page the worker has reached. Preseed and Debian setup are that same page.
     private var latest: Int {
-        if error == nil, readyPath != nil, diskPath != nil { return 2 }
-        if preseedReached { return 1 }
-        return 0
+        preseedReached ? 1 : 0
     }
 
+    private static let pageTwo = ["sshkey", "preseed", "disk", "patch"]
+
     private var preseedReached: Bool {
-        steps.contains { ($0.id == "preseed" || $0.id == "patch") && $0.state != "wait" }
+        steps.contains { Self.pageTwo.contains($0.id) && $0.state != "wait" }
     }
 
     /// Move to the worker's page unless the user is looking at another one.
@@ -337,9 +428,14 @@ final class Wizard: ObservableObject {
     var canGoBack: Bool { page > 0 }
     var canGoForward: Bool { page < latest }
 
-    /// Rows for the page on screen. Page two does not repeat the download list.
+    /// Host key, preseed, the empty disk, and the installer copy. Setup lists these above its own rows.
+    var preseedSteps: [WizardStep] {
+        Self.pageTwo.compactMap { id in steps.first { $0.id == id } }
+    }
+
+    /// Rows for the page on screen. Page two is the host key, preseed, the disk, and the installer copy.
     var visibleSteps: [WizardStep] {
-        let ids = page == 1 ? ["preseed", "patch"] : ["key", "sums", "sign", "check", "download", "verify"]
+        let ids = page == 1 ? Self.pageTwo : ["key", "sums", "sign", "check", "download", "verify"]
         return ids.compactMap { id in steps.first { $0.id == id } }
     }
 
@@ -389,8 +485,12 @@ enum CacheFolder {
 enum SupportDir {
     static var url: URL { CacheFolder.url.deletingLastPathComponent() }
 
+    /// Both files. Deleting the snapshot disk is the same as deleting the ready marker.
     static var snapshotReady: Bool {
-        FileManager.default.fileExists(atPath: url.appendingPathComponent("snapshots/debian/ready").path)
+        let snap = url.appendingPathComponent("snapshots/debian", isDirectory: true)
+        let fm = FileManager.default
+        return fm.fileExists(atPath: snap.appendingPathComponent("ready").path)
+            && fm.fileExists(atPath: snap.appendingPathComponent("disk.img").path)
     }
 }
 
@@ -483,20 +583,20 @@ struct QuickStart: View {
     @State private var folderError: String?
 
     var body: some View {
-        // Install stays mounted after the image is ready, so Back does not stop the guest.
+        // Page two lists preseed above Debian setup. Install stays mounted, so Back does not stop the guest.
         ZStack(alignment: .topLeading) {
             if let iso = wizard.readyPath, let disk = wizard.diskPath, wizard.error == nil {
-                Install(iso: iso, disk: disk, onBack: { wizard.back() })
-                    .opacity(wizard.page == 2 ? 1 : 0)
-                    .allowsHitTesting(wizard.page == 2)
-                    .accessibilityHidden(wizard.page != 2)
+                Install(iso: iso, disk: disk, onBack: { wizard.back() }, preseedSteps: wizard.preseedSteps)
+                    .opacity(wizard.page == 1 ? 1 : 0)
+                    .allowsHitTesting(wizard.page == 1)
+                    .accessibilityHidden(wizard.page != 1)
             }
-            if wizard.page != 2 {
+            if wizard.page != 1 || wizard.readyPath == nil || wizard.error != nil {
                 download
                     .background(.background)
             }
         }
-        .onAppear(perform: wizard.start)
+        .onAppear { wizard.start() }
         .task {
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 400_000_000)
@@ -508,7 +608,7 @@ struct QuickStart: View {
     private var download: some View {
         VStack(alignment: .leading, spacing: 18) {
             VStack(alignment: .leading, spacing: 4) {
-                Text(wizard.page == 1 ? "Preseed" : "Debian 13").font(.title2.weight(.semibold))
+                Text(wizard.page == 1 ? "Debian setup" : "Debian 13").font(.title2.weight(.semibold))
                 if let headline = wizard.headline {
                     Text(headline).font(.subheadline).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                 }

@@ -1,10 +1,10 @@
 import SwiftUI
 import Virtualization
 
-/// The screen after the download. The installer writes `disk.img`; that file is the installed system.
+/// The screen after the download. The installer installs Debian onto `disk.img`.
 /// A finished preseed powers the guest off. SSH login, not the installer screen, is the finish check.
 /// This view then snapshots that disk so later machines are clones.
-/// Setup is the next wizard page: the same steps as the download page, with a small installer thumbnail instead of the ISO bar.
+/// Setup is the preseed page of this wizard. Those rows sit above the installer rows, with a small thumbnail instead of the ISO bar.
 /// The button beside that thumbnail opens the guest in a new window. That window does not capture the mouse or the keyboard.
 /// Reopening Quick start boots a written disk alone, then checks SSH. It does not attach the installer or a pointer.
 /// A saved snapshot is the finished install. Reopening that disk does not start the installer virtual machine.
@@ -14,21 +14,24 @@ struct Install: View {
     let iso: String
     let disk: String
     var fromSnapshot = false
-    /// Wizard Back. A clone window does not get one. The guest keeps running.
+    /// Wizard Back, on the shared preseed and setup page. A clone window does not get one. The guest keeps running.
     var onBack: (() -> Void)? = nil
+    /// Preseed, the empty disk, and the installer copy, listed above the installer rows. A clone does not have them.
+    var preseedSteps: [WizardStep] = []
     @StateObject private var guest: GuestSession
     @Environment(\.openWindow) private var openWindow
 
-    init(iso: String, disk: String, fromSnapshot: Bool = false, onBack: (() -> Void)? = nil) {
+    init(iso: String, disk: String, fromSnapshot: Bool = false, onBack: (() -> Void)? = nil, preseedSteps: [WizardStep] = []) {
         self.iso = iso
         self.disk = disk
         self.fromSnapshot = fromSnapshot
         self.onBack = onBack
+        self.preseedSteps = preseedSteps
         let loggedIn = fromSnapshot || GuestSSH.loggedIn(beside: URL(fileURLWithPath: disk))
         let written = loggedIn || InstalledDisk.looksInstalled(disk)
-        // The installer disk is machines/debian. Once snapshots/debian/ready exists, that VM is finished.
-        // Quick start must not start it again. New machines are clones, opened with fromSnapshot.
-        let snapshotSaved = !fromSnapshot && SupportDir.snapshotReady
+        // The installer disk is machines/debian. A snapshot finishes that VM only while this disk is still the installed one.
+        // A new empty disk, after the old one was removed, is not that snapshot. Quick start installs again.
+        let snapshotSaved = !fromSnapshot && SupportDir.snapshotReady && written
         _guest = StateObject(wrappedValue: GuestSession(fromSnapshot: loggedIn, diskWritten: written, snapshotSaved: snapshotSaved))
     }
 
@@ -73,6 +76,12 @@ struct Install: View {
                         .background(.black, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
                         .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
                 }
+            }
+        }
+        .task {
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 400_000_000)
+                guest.noteMissingFiles()
             }
         }
         .onAppear {
@@ -131,11 +140,15 @@ struct Install: View {
         .frame(height: 100)
     }
 
+    /// Preseed, the empty disk, the installer copy, then the installer rows. One list, so setup is not another page.
+    private var listedSteps: [WizardStep] { preseedSteps + guest.setupSteps }
+
     private var stepList: some View {
-        VStack(spacing: 0) {
-            ForEach(guest.setupSteps) { step in
+        let shown = listedSteps
+        return VStack(spacing: 0) {
+            ForEach(shown) { step in
                 setupRow(step).id(step.id + step.state + step.detail)
-                if step.id != guest.setupSteps.last?.id { Divider().padding(.leading, 42) }
+                if step.id != shown.last?.id { Divider().padding(.leading, 42) }
             }
         }
         .background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
@@ -264,7 +277,7 @@ final class GuestSession: NSObject, ObservableObject, VZVirtualMachineDelegate {
         if snapshotSaved && !fromSnapshot {
             stopped = true
             markSetup("installer", state: "done", detail: nil)
-            markSetup("partition", state: "done", detail: "Guest disk written")
+            markSetup("partition", state: "done", detail: "Installed")
             markSetup("ssh", state: "done", detail: "debian")
             markSetup("snapshot", state: "done", detail: "Saved")
         }
@@ -285,7 +298,7 @@ final class GuestSession: NSObject, ObservableObject, VZVirtualMachineDelegate {
         error = nil
         headline = "Debian is installed and shut down. A snapshot is saved for new machines."
         markSetup("installer", state: "done", detail: nil)
-        markSetup("partition", state: "done", detail: "Guest disk written")
+        markSetup("partition", state: "done", detail: "Installed")
         markSetup("ssh", state: "done", detail: "debian")
         markSetup("snapshot", state: "done", detail: "Saved")
     }
@@ -343,7 +356,7 @@ final class GuestSession: NSObject, ObservableObject, VZVirtualMachineDelegate {
         }
         headline = fromSnapshotBoot ? "Starting Debian." : "Debian is already installed. Checking SSH."
         markSetup("installer", state: "done", detail: nil)
-        markSetup("partition", state: "done", detail: "Guest disk written")
+        markSetup("partition", state: "done", detail: "Installed")
         markSetup("ssh", state: "now", detail: "guest port 22")
         boot { try Guest.boot(disk: diskURL!, pointer: pointer) }
     }
@@ -401,7 +414,9 @@ final class GuestSession: NSObject, ObservableObject, VZVirtualMachineDelegate {
     }
 
     private func checkSSH() {
-        guard installed, checking, !snapshotReady, !probing, let disk = diskURL else { return }
+        // A saved snapshot still needs a probe when the login file was removed.
+        guard installed, checking, !probing, let disk = diskURL else { return }
+        if snapshotReady && GuestSSH.loggedIn(beside: disk) { return }
         // A stopped machine cannot answer. Wait, but do not require .running: that state lags start().
         if stopped && machine == nil { return }
         probing = true
@@ -416,14 +431,67 @@ final class GuestSession: NSObject, ObservableObject, VZVirtualMachineDelegate {
     }
 
     private func loginSucceeded() {
-        guard installed, checking, !snapshotReady else { return }
+        guard installed, checking else { return }
+        checking = false
         loggedIn = true
         showWindow = false
-        headline = "SSH login succeeded. Saving a snapshot."
         markSetup("ssh", state: "done", detail: "debian")
-        markSetup("snapshot", state: "now", detail: "snapshots/debian")
         watch?.invalidate()
+        // The proof file was removed, but the snapshot is still there. Restore the proof and leave the VM stopped.
+        if snapshotReady {
+            headline = "Debian is installed and shut down. A snapshot is saved for new machines."
+            stopped = true
+            machine?.stop { _ in }
+            return
+        }
+        headline = "SSH login succeeded. Saving a snapshot."
+        markSetup("snapshot", state: "now", detail: "snapshots/debian")
         saveSnapshot()
+    }
+
+    /// A step's file disappeared. Run that step again. The download wizard handles its own files.
+    func noteMissingFiles() {
+        guard !leaving, let disk = diskURL else { return }
+        if !FileManager.default.fileExists(atPath: disk.path) {
+            if fromSnapshotBoot && error == nil {
+                error = "The guest disk was removed."
+                headline = "The virtual machine did not start."
+                stopped = true
+                machine?.stop { _ in }
+            }
+            return
+        }
+        if fromSnapshotBoot { return }
+        let proof = GuestSSH.loggedIn(beside: disk)
+        let snap = SupportDir.snapshotReady
+        if snapshotReady && !snap {
+            snapshotReady = false
+            saved = false
+            showWindow = false
+            if proof {
+                markSetup("snapshot", state: "now", detail: "snapshots/debian")
+                headline = "SSH login succeeded. Saving a snapshot."
+                saveSnapshot()
+            } else {
+                markSetup("snapshot", state: "wait", detail: "snapshots/debian")
+                headline = "The snapshot was removed."
+            }
+        }
+        let sshDone = setupSteps.first { $0.id == "ssh" }?.state == "done"
+        if sshDone && !proof && !checking && !installing {
+            loggedIn = false
+            installed = true
+            checking = true
+            stopped = false
+            error = nil
+            markSetup("ssh", state: "now", detail: "guest port 22")
+            headline = "Debian is already installed. Checking SSH."
+            if machine == nil {
+                boot { try Guest.boot(disk: disk, pointer: false) }
+            } else {
+                watchSSH()
+            }
+        }
     }
 
     private func noteStopped() {
@@ -436,17 +504,22 @@ final class GuestSession: NSObject, ObservableObject, VZVirtualMachineDelegate {
             installed = true
             checking = true
             markSetup("installer", state: "done", detail: nil)
-            markSetup("partition", state: "done", detail: "Guest disk written")
+            markSetup("partition", state: "done", detail: "Installed")
             markSetup("ssh", state: "now", detail: "guest port 22")
             headline = "Installer stopped. Starting Debian to check SSH."
             startInstalled()
             return
         }
         if checking, installed, let disk = diskURL, GuestSSH.loggedIn(beside: disk) {
+            checking = false
             loggedIn = true
             showWindow = false
-            headline = "SSH login succeeded. Saving a snapshot."
             markSetup("ssh", state: "done", detail: "debian")
+            if snapshotReady {
+                headline = "Debian is installed and shut down. A snapshot is saved for new machines."
+                return
+            }
+            headline = "SSH login succeeded. Saving a snapshot."
             markSetup("snapshot", state: "now", detail: "snapshots/debian")
             saveSnapshot()
             return
@@ -522,8 +595,8 @@ final class GuestSession: NSObject, ObservableObject, VZVirtualMachineDelegate {
                             self?.watchSSH()
                         } else {
                             self?.markSetup("installer", state: "done", detail: nil)
-                            self?.markSetup("partition", state: "now", detail: "Writing /dev/vda")
-                            self?.headline = "The installer starts on its own and writes the guest disk."
+                            self?.markSetup("partition", state: "now", detail: "Installing")
+                            self?.headline = "The installer starts on its own and installs Debian."
                         }
                     case .failure(let err):
                         self?.stopped = true

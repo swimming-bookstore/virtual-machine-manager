@@ -106,26 +106,58 @@ pub struct Prepared {
     pub key: PathBuf,
 }
 
-/// Writes the answer disk, the boot ISO, and the empty guest disk.
+/// Writes the answer disk. The empty guest disk and the installer copy are later steps.
+pub fn write_preseed(cache: &Path, support: &Path) -> Result<()> {
+    fs::create_dir_all(cache).map_err(|err| anyhow!("cannot create {}: {err}", cache.display()))?;
+    let key = read_key(&support.join("ssh").join(AUTHORIZED))?;
+    let _ = write_image(&cache.join(FILE), &image(&key)?)?;
+    Ok(())
+}
+
+/// Creates the empty guest disk when it is missing. An existing file is left as it is.
+/// The bool is true when this call wrote the file.
 /// A missing disk is a new install. The previous login does not apply to the empty file written here.
-/// The bool is true when this call rewrote the installer copy. A copy that is already patched is false.
-pub fn prepare(cache: &Path, iso: &Path, support: &Path) -> Result<(Prepared, bool)> {
+pub fn write_guest_disk(support: &Path) -> Result<(PathBuf, bool)> {
+    let guest = support.join("machines").join(MACHINE);
+    fs::create_dir_all(&guest)
+        .map_err(|err| anyhow!("cannot create {}: {err}", guest.display()))?;
+    let disk = guest.join(DISK);
+    if disk.is_file() {
+        return Ok((disk, false));
+    }
+    forget_login(support, &guest);
+    sparse(&disk, GUEST)?;
+    Ok((disk, true))
+}
+
+/// Copies the installer and applies the boot edit. The signed file is not rewritten.
+/// The bool is true when this call rewrote the copy.
+pub fn prepare_installer(cache: &Path, iso: &Path, support: &Path) -> Result<bool> {
     if !iso.is_file() {
         bail!("installer image is missing: {}", iso.display());
     }
     fs::create_dir_all(cache).map_err(|err| anyhow!("cannot create {}: {err}", cache.display()))?;
     let key = read_key(&support.join("ssh").join(AUTHORIZED))?;
-    let _ = write_image(&cache.join(FILE), &image(&key)?)?;
-    let patched = write_boot(iso, &cache.join(BOOT), &key)?;
-    let guest = support.join("machines").join(MACHINE);
-    fs::create_dir_all(&guest)
-        .map_err(|err| anyhow!("cannot create {}: {err}", guest.display()))?;
-    let disk = guest.join(DISK);
-    if !disk.is_file() {
-        forget_login(support, &guest);
-        sparse(&disk, GUEST)?;
+    write_boot(iso, &cache.join(BOOT), &key)
+}
+
+/// Writes the answer disk, the empty guest disk, and the boot ISO.
+/// The bool is true when this call rewrote the installer copy. A copy that is already patched is false.
+#[cfg(test)]
+pub fn prepare(cache: &Path, iso: &Path, support: &Path) -> Result<(Prepared, bool)> {
+    if !iso.is_file() {
+        bail!("installer image is missing: {}", iso.display());
     }
-    Ok((Prepared { disk, key: support.join("ssh").join(AUTHORIZED) }, patched))
+    write_preseed(cache, support)?;
+    let (disk, _) = write_guest_disk(support)?;
+    let patched = prepare_installer(cache, iso, support)?;
+    Ok((
+        Prepared {
+            disk,
+            key: support.join("ssh").join(AUTHORIZED),
+        },
+        patched,
+    ))
 }
 
 /// `ssh/logged-in` is one file for the app. Deleting `disk.img` does not remove it.
@@ -138,7 +170,8 @@ fn read_key(path: &Path) -> Result<String> {
     if !path.is_file() {
         bail!("SSH key is missing: {}", path.display());
     }
-    let text = fs::read_to_string(path).map_err(|err| anyhow!("cannot read {}: {err}", path.display()))?;
+    let text =
+        fs::read_to_string(path).map_err(|err| anyhow!("cannot read {}: {err}", path.display()))?;
     if text.trim().is_empty() {
         bail!("SSH key is empty: {}", path.display());
     }
@@ -210,7 +243,9 @@ fn initrd_has_preseed(file: &mut File, install: &str, public_key: &str) -> bool 
     }
     let mut body = vec![0u8; initrd.size as usize];
     read_at(file, initrd.extent as u64 * SECTOR, &mut body).is_ok()
-        && body.windows(extra.len()).any(|word| word == extra.as_slice())
+        && body
+            .windows(extra.len())
+            .any(|word| word == extra.as_slice())
 }
 
 fn is_eltorito(path: &Path) -> Result<bool> {
@@ -838,12 +873,20 @@ mod tests {
         assert!(answers.contains("cp /authorized_keys"));
         assert!(answers.contains("systemctl enable ssh && sync && poweroff"));
         assert!(!answers.contains('#'));
-        assert_eq!(answers.lines().filter(|line| line.contains("late_command")).count(), 1);
+        assert_eq!(
+            answers
+                .lines()
+                .filter(|line| line.contains("late_command"))
+                .count(),
+            1
+        );
         assert!(!disk.windows(b"PRESEED/".len()).any(|w| w == b"PRESEED/"));
         let gzip = preseed_gzip(PUB).unwrap();
         assert!(gzip.len() < 800, "preseed gzip is {} bytes", gzip.len());
         let mut plain = Vec::new();
-        GzDecoder::new(gzip.as_slice()).read_to_end(&mut plain).unwrap();
+        GzDecoder::new(gzip.as_slice())
+            .read_to_end(&mut plain)
+            .unwrap();
         assert!(plain.windows(PUB.len()).any(|word| word == PUB.as_bytes()));
     }
 
@@ -875,7 +918,9 @@ mod tests {
         let mut dec = GzDecoder::new(extra);
         let mut cpio = Vec::new();
         dec.read_to_end(&mut cpio).unwrap();
-        assert!(cpio.windows(answers().len()).any(|w| w == answers().as_bytes()));
+        assert!(cpio
+            .windows(answers().len())
+            .any(|w| w == answers().as_bytes()));
         assert!(cpio.windows(PUB.len()).any(|w| w == PUB.as_bytes()));
         let (_, again) = prepare(&dir.join("cache"), &iso, &dir).unwrap();
         assert!(!again);

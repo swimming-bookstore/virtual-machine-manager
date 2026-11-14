@@ -1,9 +1,9 @@
 //! Frozen Debian disk. The install is finished when the host can SSH in.
 //! The snapshot is a sparse copy of that stopped disk, so later machines skip the installer.
 
-use std::fs::{self, File};
 #[cfg(any(target_os = "linux", test))]
 use std::fs::OpenOptions;
+use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
@@ -144,7 +144,8 @@ fn place(src: &Path, dest: &Path) -> Result<()> {
     if tmp.exists() {
         fs::remove_file(&tmp)?;
     }
-    copy_sparse(src, &tmp).map_err(|err| anyhow!("cannot copy {} to {}: {err}", src.display(), dest.display()))?;
+    copy_sparse(src, &tmp)
+        .map_err(|err| anyhow!("cannot copy {} to {}: {err}", src.display(), dest.display()))?;
     fs::rename(&tmp, dest)?;
     Ok(())
 }
@@ -227,8 +228,10 @@ fn clonefile_copy(src: &Path, dest: &Path) -> Result<()> {
     extern "C" {
         fn clonefile(src: *const c_char, dest: *const c_char, flags: u32) -> i32;
     }
-    let src = CString::new(src.as_os_str().as_bytes()).map_err(|_| anyhow!("source path has a null"))?;
-    let dest = CString::new(dest.as_os_str().as_bytes()).map_err(|_| anyhow!("destination path has a null"))?;
+    let src =
+        CString::new(src.as_os_str().as_bytes()).map_err(|_| anyhow!("source path has a null"))?;
+    let dest = CString::new(dest.as_os_str().as_bytes())
+        .map_err(|_| anyhow!("destination path has a null"))?;
     let rc = unsafe { clonefile(src.as_ptr(), dest.as_ptr(), 0) };
     if rc != 0 {
         bail!("clonefile: {}", io::Error::last_os_error());
@@ -332,15 +335,26 @@ mod tests {
 
     #[test]
     fn a_finished_install_snapshots_once_and_clones_fast() {
-        let dir = std::env::temp_dir().join(format!("vmm-snap-{}-{}", std::process::id(), std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "vmm-snap-{}-{}",
+            std::process::id(),
+            std::process::id()
+        ));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(dir.join("cache")).unwrap();
         fs::create_dir_all(dir.join("ssh")).unwrap();
-        fs::write(dir.join("ssh").join("authorized_keys"), b"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestKeyForTheInstaller\n").unwrap();
+        fs::write(
+            dir.join("ssh").join("authorized_keys"),
+            b"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestKeyForTheInstaller\n",
+        )
+        .unwrap();
         let iso = dir.join("cache").join("debian.iso");
         fs::write(&iso, b"iso").unwrap();
         let prepared = preseed::prepare(&dir.join("cache"), &iso, &dir).unwrap().0;
-        assert!(save(&dir).unwrap_err().to_string().contains("install is not finished"));
+        assert!(save(&dir)
+            .unwrap_err()
+            .to_string()
+            .contains("install is not finished"));
         assert!(clone_machine(&dir, None)
             .unwrap_err()
             .to_string()
@@ -348,14 +362,19 @@ mod tests {
 
         mark_installed(&prepared.disk);
         fs::write(prepared.disk.parent().unwrap().join(NVRAM), b"efi-vars").unwrap();
-        assert!(save(&dir).unwrap_err().to_string().contains("SSH has not logged in"));
+        assert!(save(&dir)
+            .unwrap_err()
+            .to_string()
+            .contains("SSH has not logged in"));
         ssh::record_login(&dir.join("ssh")).unwrap();
 
         let saved = save(&dir).unwrap();
         assert_eq!(saved.disk.metadata().unwrap().len(), GUEST);
         assert!(saved.disk.metadata().unwrap().blocks() < 256);
         assert_eq!(fs::read(saved.dir.join(NVRAM)).unwrap(), b"efi-vars");
-        assert!(fs::read_to_string(saved.dir.join(READY)).unwrap().starts_with("ssh-ok"));
+        assert!(fs::read_to_string(saved.dir.join(READY))
+            .unwrap()
+            .starts_with("ssh-ok"));
 
         let mut snap = OpenOptions::new().write(true).open(&saved.disk).unwrap();
         snap.seek(SeekFrom::Start(600)).unwrap();
@@ -380,10 +399,7 @@ mod tests {
             "clone took {:?}",
             started.elapsed()
         );
-        assert_eq!(
-            cloned.disk,
-            dir.join("machines/debian-2").join(DISK)
-        );
+        assert_eq!(cloned.disk, dir.join("machines/debian-2").join(DISK));
         assert_eq!(cloned.disk.metadata().unwrap().len(), GUEST);
         assert!(cloned.disk.metadata().unwrap().blocks() < 256);
         assert_eq!(fs::read(cloned.dir.join(NVRAM)).unwrap(), b"efi-vars");
