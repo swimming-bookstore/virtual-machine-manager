@@ -16,6 +16,10 @@ struct WizardStep: Identifiable {
         WizardStep(id: "verify", title: "Verify checksum", detail: "SHA512SUMS", state: "wait"),
     ]
 
+    static let preseed = [
+        WizardStep(id: "preseed", title: "Prepare preseed disk", detail: "preseed.img", state: "wait"),
+    ]
+
     static var isoName: String {
         #if arch(arm64)
         "debian-*-arm64-netinst.iso"
@@ -35,15 +39,19 @@ struct WorkerEvent: Decodable {
     var received: Double?
     var total: Double?
     var path: String?
+    var disk: String?
+    var marker: String?
 }
 
 final class Wizard: ObservableObject {
     @Published var steps = WizardStep.initial
+    @Published var page = 0
     @Published var received = 0.0
     @Published var total = 0.0
     @Published var headline: String?
     @Published var error: String?
     @Published var readyPath: String?
+    @Published var diskPath: String?
     @Published var cancelled = false
     @Published var downloading = false
 
@@ -67,6 +75,7 @@ final class Wizard: ObservableObject {
         cancelled = false
         error = nil
         readyPath = nil
+        diskPath = nil
         guard let worker = WorkerPath.url() else {
             error = "The worker is not built. Run cargo build --release, then try again."
             failCurrent()
@@ -137,11 +146,13 @@ final class Wizard: ObservableObject {
         source = nil
         buffer.removeAll()
         steps = WizardStep.initial
+        page = 0
         received = 0
         total = 0
         downloading = false
         error = nil
         readyPath = nil
+        diskPath = nil
         cancelled = false
         headline = nil
         started = false
@@ -214,9 +225,11 @@ final class Wizard: ObservableObject {
                 steps[index].detail = detail
             }
         case "step", "ready":
+            if event.step == "preseed" { showPreseed() }
             if let step = event.step, let state = event.state { applyState(step, state: state, detail: event.detail) }
             if event.event == "ready" {
                 readyPath = event.path
+                diskPath = event.disk
                 if downloading {
                     total = max(total, 1)
                     received = total
@@ -234,6 +247,12 @@ final class Wizard: ObservableObject {
         default:
             break
         }
+    }
+
+    private func showPreseed() {
+        if page == 1 { return }
+        page = 1
+        steps = WizardStep.preseed
     }
 
     private func applyState(_ id: String, state: String, detail: String?) {
@@ -279,6 +298,80 @@ enum CacheFolder {
     }
 }
 
+enum SupportDir {
+    static var url: URL { CacheFolder.url.deletingLastPathComponent() }
+
+    static var snapshotReady: Bool {
+        FileManager.default.fileExists(atPath: url.appendingPathComponent("snapshots/debian/ready").path)
+    }
+}
+
+enum ClonedDisk {
+    case success(String)
+    case failure(String)
+}
+
+enum Worker {
+    static func snapshot(dir: URL) -> String? {
+        let (code, text) = run(["snapshot", "--dir", dir.path])
+        return code == 0 ? nil : (message(text) ?? "Could not save the snapshot.")
+    }
+
+    static func cloneMachine(dir: URL) -> ClonedDisk {
+        let (code, text) = run(["clone", "--dir", dir.path])
+        if code != 0 {
+            return .failure(message(text) ?? "Could not create a virtual machine.")
+        }
+        guard let disk = diskPath(text) else {
+            return .failure("The clone did not name a disk.")
+        }
+        return .success(disk)
+    }
+
+    private static func run(_ args: [String]) -> (Int32, String) {
+        guard let url = WorkerPath.url() else {
+            return (1, "The worker is not built. Run cargo build --release, then try again.")
+        }
+        let process = Process()
+        process.executableURL = url
+        process.arguments = args
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = pipe
+        do {
+            try process.run()
+        } catch {
+            return (1, error.localizedDescription)
+        }
+        process.waitUntilExit()
+        let text = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        return (process.terminationStatus, text)
+    }
+
+    private static func message(_ text: String) -> String? {
+        for line in text.split(separator: "\n") {
+            if let data = line.data(using: .utf8),
+               let event = try? JSONDecoder().decode(WorkerEvent.self, from: data),
+               let detail = event.detail, !detail.isEmpty {
+                return detail
+            }
+        }
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private static func diskPath(_ text: String) -> String? {
+        for line in text.split(separator: "\n") {
+            if let data = line.data(using: .utf8),
+               let event = try? JSONDecoder().decode(WorkerEvent.self, from: data),
+               let disk = event.disk, !disk.isEmpty {
+                return disk
+            }
+        }
+        return nil
+    }
+}
+
 enum WorkerPath {
     static func url() -> URL? {
         if let env = ProcessInfo.processInfo.environment["VMM_WORKER"], !env.isEmpty {
@@ -286,12 +379,14 @@ enum WorkerPath {
             if FileManager.default.isExecutableFile(atPath: url.path) { return url }
         }
         let exe = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath()
-        let repo = exe.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
-        return [
-            exe.deletingLastPathComponent().appendingPathComponent("virtual-machine-worker"),
+        let beside = exe.deletingLastPathComponent()
+        let repo = beside.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let candidates = [
+            beside.appendingPathComponent("virtual-machine-worker"),
             repo.appendingPathComponent("target/release/virtual-machine-worker"),
             repo.appendingPathComponent("target/debug/virtual-machine-worker"),
-        ].first { FileManager.default.isExecutableFile(atPath: $0.path) }
+        ]
+        return candidates.first { FileManager.default.isExecutableFile(atPath: $0.path) }
     }
 }
 
@@ -300,9 +395,26 @@ struct QuickStart: View {
     @State private var folderError: String?
 
     var body: some View {
+        Group {
+            if let iso = wizard.readyPath, let disk = wizard.diskPath, wizard.error == nil {
+                Install(iso: iso, disk: disk)
+            } else {
+                download
+            }
+        }
+        .onAppear(perform: wizard.start)
+        .task {
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 400_000_000)
+                wizard.cacheWentAway()
+            }
+        }
+    }
+
+    private var download: some View {
         VStack(alignment: .leading, spacing: 18) {
             VStack(alignment: .leading, spacing: 4) {
-                Text("Debian 13").font(.title2.weight(.semibold))
+                Text(wizard.page == 1 ? "Preseed" : "Debian 13").font(.title2.weight(.semibold))
                 if let headline = wizard.headline {
                     Text(headline).font(.subheadline).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                 }
@@ -336,19 +448,12 @@ struct QuickStart: View {
         }
         .padding(24)
         .frame(width: 440, alignment: .topLeading)
-        .onAppear(perform: wizard.start)
-        .task {
-            while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 400_000_000)
-                wizard.cacheWentAway()
-            }
-        }
     }
 
     @ViewBuilder private var progress: some View {
         // The bar is up as soon as the ISO fetch starts, including while the size is unknown.
         // ProgressView eases toward each value, so the fill is drawn at the byte count instead.
-        if wizard.downloading {
+        if wizard.page == 0 && wizard.downloading {
             VStack(alignment: .leading, spacing: 6) {
                 byteBar
                 HStack {

@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>How the preseed patch boots Debian</title>
+<style>
+  :root {
+    --bg: #10140f;
+    --ink: #e7efe4;
+    --muted: #9aab97;
+    --line: #2a3828;
+    --card: #182117;
+    --signed: #c4b48a;
+    --boot: #8fd0a4;
+    --guest: #8eb7e8;
+    --warn: #e2b15a;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background:
+      radial-gradient(900px 420px at 10% -10%, #243322, transparent 60%),
+      var(--bg);
+    color: var(--ink);
+    font: 16px/1.5 "Iowan Old Style", Palatino, "Palatino Linotype", serif;
+  }
+  main { max-width: 1040px; margin: 0 auto; padding: 48px 24px 80px; }
+  h1 { font-size: 42px; line-height: 1.05; margin: 0 0 12px; letter-spacing: -0.03em; }
+  h2 { font-size: 26px; margin: 48px 0 12px; }
+  p { color: var(--muted); }
+  a { color: var(--boot); }
+  code, .mono { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 0.86em; }
+  .lede { font-size: 20px; max-width: 42rem; color: var(--ink); }
+  .row { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; margin-top: 28px; }
+  .disk {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 16px;
+    padding: 16px;
+    min-height: 180px;
+  }
+  .disk b { display: block; font-size: 18px; }
+  .tag { display: inline-block; margin-top: 10px; padding: 2px 8px; border-radius: 999px; font-size: 12px; letter-spacing: 0.04em; text-transform: uppercase; }
+  .signed { border-top: 4px solid var(--signed); }
+  .boot { border-top: 4px solid var(--boot); }
+  .guest { border-top: 4px solid var(--guest); }
+  .tag.s { background: #3a3220; color: var(--signed); }
+  .tag.b { background: #1d3324; color: var(--boot); }
+  .tag.g { background: #1b2c40; color: var(--guest); }
+  .flow { display: flex; gap: 8px; align-items: stretch; margin: 20px 0; flex-wrap: wrap; }
+  .step {
+    flex: 1 1 140px;
+    background: #141c13;
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    padding: 12px;
+    cursor: pointer;
+  }
+  .step.on { outline: 2px solid var(--boot); }
+  .step small { display: block; color: var(--muted); }
+  .panel {
+    background: #0c120c;
+    border: 1px solid var(--line);
+    border-radius: 16px;
+    padding: 18px 20px;
+    min-height: 150px;
+  }
+  .panel h3 { margin: 0 0 8px; }
+  .split { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  pre {
+    background: #0b100b;
+    border-radius: 10px;
+    padding: 12px;
+    overflow: auto;
+    color: #d7e6d4;
+    font-size: 13px;
+    line-height: 1.45;
+  }
+  .del { color: #c98484; }
+  .add { color: #8fd0a4; }
+  .slack {
+    display: flex;
+    height: 36px;
+    border-radius: 8px;
+    overflow: hidden;
+    border: 1px solid var(--line);
+    margin: 10px 0 6px;
+  }
+  .used { background: #35543c; width: 78%; display: flex; align-items: center; padding-left: 10px; }
+  .free { background: repeating-linear-gradient(90deg, #3a3420, #3a3420 8px, #2a2618 8px, #2a2618 16px); width: 22%; display: flex; align-items: center; justify-content: center; color: var(--warn); }
+  .answers { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .answers div { background: #141c13; border-radius: 10px; padding: 10px 12px; }
+  .answers strong { display: block; }
+  .note { border-left: 3px solid var(--warn); padding-left: 12px; color: var(--muted); }
+  @media (max-width: 800px) {
+    .row, .split, .answers { grid-template-columns: 1fr; }
+    h1 { font-size: 32px; }
+  }
+</style>
+</head>
+<body>
+<main>
+  <p class="mono">virtual-machine-manager · prepare-preseed</p>
+  <h1>The signed ISO is not the disk that boots.</h1>
+  <p class="lede">Quick start checks the Debian signature, then copies the installer. Two in-place edits on that copy start the text installer and answer it. The file Debian writes is the guest disk.</p>
+
+  <div class="row">
+    <article class="disk signed">
+      <b>netinst.iso</b>
+      <span class="tag s">signed, never rewritten</span>
+      <p>SHA512SUMS.sign is checked before this file is trusted. Patching it would break that check.</p>
+    </article>
+    <article class="disk boot">
+      <b>boot.iso</b>
+      <span class="tag b">USB, read-only</span>
+      <p>A copy of the ISO. GRUB no longer waits, and the text initrd contains <span class="mono">preseed.cfg</span>.</p>
+    </article>
+    <article class="disk guest">
+      <b>disk.img</b>
+      <span class="tag g">virtio · /dev/vda</span>
+      <p>A 16 GiB sparse file. This is the installed system, under <span class="mono">machines/debian/</span>.</p>
+    </article>
+  </div>
+
+  <h2>What firmware actually reads</h2>
+  <p>Virtualization.framework has no CD drive, so <span class="mono">boot.iso</span> is a USB disk. EFI does not open the menu you see. It loads a tiny GRUB from the El Torito image, and that stub only runs <span class="mono">source /boot/grub/grub.cfg</span>. Editing the stub leaves the real menu waiting for a key.</p>
+
+  <div class="flow" id="boot">
+    <div class="step on" data-i="0"><b>1</b> EFI<small>USB El Torito</small></div>
+    <div class="step" data-i="1"><b>2</b> stub<small>grub.cfg in the FAT image</small></div>
+    <div class="step" data-i="2"><b>3</b> menu<small>/boot/grub/grub.cfg</small></div>
+    <div class="step" data-i="3"><b>4</b> kernel<small>text initrd</small></div>
+    <div class="step" data-i="4"><b>5</b> disk<small>/dev/vda</small></div>
+  </div>
+  <div class="panel" id="panel"></div>
+
+  <h2>Two edits, both in place</h2>
+  <div class="split">
+    <section>
+      <h3>1. The menu does not wait</h3>
+      <p>The largest <span class="mono">/boot/grub/grub.cfg</span> is the one both directory trees share. The text install entry is the one whose <span class="mono">initrd</span> is <span class="mono">/install.amd/initrd.gz</span> or <span class="mono">/install.a64/initrd.gz</span>, not the graphical <span class="mono">gtk</span> initrd. Its GRUB index becomes the default, and the timeout becomes 0.</p>
+      <pre><span class="add">set default=&lt;text entry&gt;
+set timeout=0</span>
+menuentry 'Install' {
+  linux /install.amd/vmlinuz <span class="add">auto=true priority=critical</span> --- quiet
+  initrd /install.amd/initrd.gz
+}</pre>
+      <p class="note">The guide puts <span class="mono">auto=true priority=critical</span> before <span class="mono">---</span>. Parameters after that dash are not installer questions. Timeout 0 is the GRUB form of “do not hit Enter”.</p>
+    </section>
+    <section>
+      <h3>2. Answers ride in the text initrd</h3>
+      <p>The guide’s initrd method is a file named <span class="mono">preseed.cfg</span> in the initrd root. The installer loads it by itself. The graphical initrd is left alone, so a wrong menu entry cannot see the answers.</p>
+      <div class="slack" aria-hidden="true">
+        <div class="used">initrd.gz</div>
+        <div class="free">slack</div>
+      </div>
+      <p>ISO files occupy whole 2048-byte sectors. The unused tail of the last sector is enough for one more gzip member: a cpio archive of <span class="mono">preseed.cfg</span> plus <span class="mono">TRAILER!!!</span>. The directory size, little-endian and big-endian, grows by that many bytes. Nothing after the file moves, so the signature of the original ISO is irrelevant and the boot copy stays the same length.</p>
+    </section>
+  </div>
+
+  <h2>What the answers decide</h2>
+  <div class="answers">
+    <div><strong>Language and keys</strong> US English, US keymap, UTC.</div>
+    <div><strong>Network</strong> first interface, host <span class="mono">debian.local</span>, mirror <span class="mono">deb.debian.org</span>.</div>
+    <div><strong>User</strong> account <span class="mono">debian</span>, root login off. The password is locked (<span class="mono">!</span>), so the install can finish unattended.</div>
+    <div><strong>Disk</strong> one partition on <span class="mono">/dev/vda</span>, which is the virtio guest disk. GRUB is installed there too.</div>
+    <div><strong>Packages</strong> tasksel does not run. The cdrom is not the apt source.</div>
+    <div><strong>Finish</strong> no media check. When Debian and GRUB are on disk, the installer writes a finish token and powers off.</div>
+  </div>
+
+  <h2>The other preseed disk</h2>
+  <p><span class="mono">preseed.img</span> is a 64 KiB FAT12 stick labeled <span class="mono">PRESEED</span> with the same file at its root. It is attached beside the installer. The boot line does not pass <span class="mono">preseed/file=/hd-media/preseed.cfg</span>. The copy inside the text initrd is the one the installer loads.</p>
+
+  <h2>After the installer stops</h2>
+  <p>The preseed does not trust a reboot. <span class="mono">late_command</span> checks that <span class="mono">/target/etc/debian_version</span> and <span class="mono">/target/boot/grub/grub.cfg</span> exist, then writes <span class="mono">vmm-install-ok</span> to the virtio disk whose size is 1 MiB. That disk is <span class="mono">marker.img</span>, beside the guest disk. The installer then halts and powers off. The host reads the token, and if the guest is still running it stops the machine. Only then does it snapshot <span class="mono">disk.img</span> and <span class="mono">nvram.bin</span> into <span class="mono">snapshots/debian/</span>.</p>
+  <p>The snapshot is taken once, after the guest has stopped, so it is the installed system and not a half-written disk. New Debian machines are clones of that directory. On APFS the clone shares blocks with the snapshot, so creating another machine does not copy 16 GiB. Start Debian still boots the original guest disk, without the installer USB.</p>
+  <p>While preseed is running, the guest has a keyboard and no pointer. The install view also ignores clicks, so the host cursor is not captured. When the guest stops, Start Debian boots <span class="mono">disk.img</span> alone. That file, next to <span class="mono">nvram.bin</span>, is the installed system.</p>
+</main>
+<script>
+const panels = [
+  ["EFI", "The virtual machine uses an EFI loader. Its variable store is nvram.bin beside disk.img. There is no optical drive, so the installer is a USB mass-storage image."],
+  ["The stub is not the menu", "The El Torito EFI image contains a one-line GRUB config. It searches for /.disk/info and sources /boot/grub/grub.cfg. Patching only that stub still shows the stock menu."],
+  ["The menu that waits", "The file firmware ends up running is /boot/grub/grub.cfg on the ISO. The patch sets its default to the text install entry and set timeout=0, then inserts the auto parameters on that entry's linux line."],
+  ["The initrd already knows", "The kernel is /install.amd/vmlinuz or /install.a64/vmlinuz. Its initrd.gz now ends with another gzip member. The installer finds /preseed.cfg and does not ask the questions that file answers."],
+  ["The installed system", "partman writes /dev/vda. That is disk.img, a sparse 16 GiB file. When the install checks out, the guest writes the finish token, powers off, and the host snapshots that disk."]
+];
+const nodes = [...document.querySelectorAll("#boot .step")];
+const panel = document.getElementById("panel");
+function show(i) {
+  nodes.forEach((n, j) => n.classList.toggle("on", j === i));
+  panel.innerHTML = "<h3>" + panels[i][0] + "</h3><p>" + panels[i][1] + "</p>";
+}
+nodes.forEach(n => n.addEventListener("click", () => show(+n.dataset.i)));
+show(0);
+</script>
+</body>
+</html>

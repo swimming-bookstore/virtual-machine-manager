@@ -1,6 +1,8 @@
 //! Quick start's disk worker. One JSON object per line. The signature is checked
 //! before the ISO is downloaded, and the checksum is checked after.
 
+mod preseed;
+mod snapshot;
 mod verify;
 
 use std::env;
@@ -14,7 +16,9 @@ use anyhow::{anyhow, bail, Result};
 use clap::{Parser, Subcommand};
 use serde::Serialize;
 
-const STEPS: [&str; 6] = ["key", "sums", "sign", "check", "download", "verify"];
+const STEPS: [&str; 7] = [
+    "key", "sums", "sign", "check", "download", "verify", "preseed",
+];
 
 enum OrderMsg {
     Set(&'static str, &'static str, Sender<Result<()>>),
@@ -36,6 +40,10 @@ struct Event<'a> {
     total: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    disk: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    marker: Option<String>,
 }
 
 fn blank(event: &str) -> Event<'_> {
@@ -47,6 +55,8 @@ fn blank(event: &str) -> Event<'_> {
         received: None,
         total: None,
         path: None,
+        disk: None,
+        marker: None,
     }
 }
 
@@ -75,7 +85,7 @@ fn fail(err: anyhow::Error, order: &Sender<OrderMsg>) -> ! {
 }
 
 /// A step may run only after every earlier step has finished, and a finished step cannot start again.
-fn check_order(order: &mut [&'static str; 6], id: &str, state: &str) -> Result<()> {
+fn check_order(order: &mut [&'static str; 7], id: &str, state: &str) -> Result<()> {
     let Some(index) = STEPS.iter().position(|item| *item == id) else {
         bail!("unknown step {id}");
     };
@@ -120,7 +130,7 @@ fn check_order(order: &mut [&'static str; 6], id: &str, state: &str) -> Result<(
 }
 
 fn order_loop(rx: Receiver<OrderMsg>) {
-    let mut order = ["wait"; 6];
+    let mut order = ["wait"; 7];
     while let Ok(msg) = rx.recv() {
         match msg {
             OrderMsg::Set(id, state, reply) => {
@@ -361,6 +371,9 @@ fn finish(
     let cache = dest
         .parent()
         .ok_or_else(|| anyhow!("image path has no directory"))?;
+    let support = cache
+        .parent()
+        .ok_or_else(|| anyhow!("cache has no parent"))?;
     let manifest = serde_json::json!({
         "url": url,
         "sha512": published.sha512,
@@ -374,7 +387,10 @@ fn finish(
     fs::write(&tmp, serde_json::to_string_pretty(&manifest)? + "\n")?;
     fs::rename(&tmp, cache.join("manifest.json"))?;
     step("verify", "done", "Checksum matches", order);
-    emit!("ready", step: Some("verify"), state: Some("done"), detail: Some("Checksum matches".to_string()), received: Some(bytes), total: Some(bytes), path: Some(dest.display().to_string()));
+    step("preseed", "now", preseed::FILE, order);
+    let prepared = preseed::prepare(cache, dest, support)?;
+    step("preseed", "done", preseed::FILE, order);
+    emit!("ready", step: Some("preseed"), state: Some("done"), detail: Some(preseed::boot_args()), received: Some(bytes), total: Some(bytes), path: Some(dest.display().to_string()), disk: Some(prepared.disk.display().to_string()), marker: Some(prepared.marker.display().to_string()));
     Ok(())
 }
 
@@ -396,15 +412,61 @@ enum Command {
         #[arg(long, value_name = "PATH")]
         dir: Option<PathBuf>,
     },
+    /// Copy a finished install so later machines skip the installer.
+    Snapshot {
+        /// Support directory that contains machines/debian. Defaults to the app support directory.
+        #[arg(long, value_name = "PATH")]
+        dir: Option<PathBuf>,
+    },
+    /// Clone the snapshot into a new machine directory.
+    Clone {
+        /// Support directory. Defaults to the app support directory.
+        #[arg(long, value_name = "PATH")]
+        dir: Option<PathBuf>,
+        /// Directory name under machines/. Defaults to the next debian-N.
+        #[arg(long, value_name = "NAME")]
+        name: Option<String>,
+    },
 }
 
 fn main() {
     let cli = Cli::try_parse().unwrap_or_else(|err| err.exit());
-    let Command::Download { dir } = cli.command;
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || order_loop(rx));
-    if let Err(err) = run(dir.as_deref().unwrap_or(&support_dir()), &tx) {
-        fail(err, &tx);
+    match cli.command {
+        Command::Download { dir } => {
+            let (tx, rx) = mpsc::channel();
+            std::thread::spawn(move || order_loop(rx));
+            if let Err(err) = run(dir.as_deref().unwrap_or(&support_dir()), &tx) {
+                fail(err, &tx);
+            }
+        }
+        Command::Snapshot { dir } => {
+            let support = dir.unwrap_or_else(support_dir);
+            match snapshot::save(&support) {
+                Ok(saved) => emit_saved("snapshot", &saved),
+                Err(err) => die(err),
+            }
+        }
+        Command::Clone { dir, name } => {
+            let support = dir.unwrap_or_else(support_dir);
+            match snapshot::clone_machine(&support, name.as_deref()) {
+                Ok(saved) => emit_saved("clone", &saved),
+                Err(err) => die(err),
+            }
+        }
+    }
+}
+
+fn die(err: anyhow::Error) -> ! {
+    emit!("error", detail: Some(err.to_string()));
+    std::process::exit(1);
+}
+
+fn emit_saved(event: &str, saved: &snapshot::Saved) {
+    let path = saved.dir.display().to_string();
+    let disk = saved.disk.display().to_string();
+    match event {
+        "clone" => emit!("clone", state: Some("done"), path: Some(path), disk: Some(disk)),
+        _ => emit!("snapshot", state: Some("done"), path: Some(path), disk: Some(disk)),
     }
 }
 
@@ -413,7 +475,7 @@ mod tests {
     use super::check_order;
 
     fn run_seq(seq: &[(&str, &str)]) -> anyhow::Result<()> {
-        let mut order = ["wait"; 6];
+        let mut order = ["wait"; 7];
         for (id, state) in seq {
             check_order(&mut order, id, state)?;
         }
@@ -421,10 +483,12 @@ mod tests {
     }
 
     fn full() -> Vec<(&'static str, &'static str)> {
-        ["key", "sums", "sign", "check", "download", "verify"]
-            .into_iter()
-            .flat_map(|id| [(id, "now"), (id, "done")])
-            .collect()
+        [
+            "key", "sums", "sign", "check", "download", "verify", "preseed",
+        ]
+        .into_iter()
+        .flat_map(|id| [(id, "now"), (id, "done")])
+        .collect()
     }
 
     #[test]
