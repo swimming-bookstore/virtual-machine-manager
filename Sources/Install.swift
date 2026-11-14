@@ -4,7 +4,7 @@ import Virtualization
 /// The screen after the download. The installer installs Debian onto `disk.img`.
 /// A finished preseed powers the guest off. SSH login, not the installer screen, is the finish check.
 /// This view then snapshots that disk so later machines are clones.
-/// Setup is the preseed page of this wizard. Those rows sit above the installer rows, with a small thumbnail instead of the ISO bar.
+/// Setup is the third page of this wizard. It lists the installer rows, with a small thumbnail instead of the ISO bar.
 /// The button beside that thumbnail opens the guest in a new window. That window does not capture the mouse or the keyboard.
 /// Reopening Quick start boots a written disk alone, then checks SSH. It does not attach the installer or a pointer.
 /// A saved snapshot is the finished install. Reopening that disk does not start the installer virtual machine.
@@ -14,19 +14,19 @@ struct Install: View {
     let iso: String
     let disk: String
     var fromSnapshot = false
-    /// Wizard Back, on the shared preseed and setup page. A clone window does not get one. The guest keeps running.
+    /// Wizard Back and Next. A clone window does not get them. The guest keeps running.
     var onBack: (() -> Void)? = nil
-    /// Preseed, the empty disk, and the installer copy, listed above the installer rows. A clone does not have them.
-    var preseedSteps: [WizardStep] = []
+    var onForward: (() -> Void)? = nil
     @StateObject private var guest: GuestSession
+    @State private var folderError: String?
     @Environment(\.openWindow) private var openWindow
 
-    init(iso: String, disk: String, fromSnapshot: Bool = false, onBack: (() -> Void)? = nil, preseedSteps: [WizardStep] = []) {
+    init(iso: String, disk: String, fromSnapshot: Bool = false, onBack: (() -> Void)? = nil, onForward: (() -> Void)? = nil) {
         self.iso = iso
         self.disk = disk
         self.fromSnapshot = fromSnapshot
         self.onBack = onBack
-        self.preseedSteps = preseedSteps
+        self.onForward = onForward
         let loggedIn = fromSnapshot || GuestSSH.loggedIn(beside: URL(fileURLWithPath: disk))
         let written = loggedIn || InstalledDisk.looksInstalled(disk)
         // The installer disk is machines/debian. A snapshot finishes that VM only while this disk is still the installed one.
@@ -64,6 +64,9 @@ struct Install: View {
                 Text(error).font(.callout).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true)
             }
             actions
+            if let folderError {
+                Text(folderError).font(.caption).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true)
+            }
         }
         .padding(24)
         .frame(width: setup ? 440 : 848, alignment: .topLeading)
@@ -140,11 +143,9 @@ struct Install: View {
         .frame(height: 100)
     }
 
-    /// Preseed, the empty disk, the installer copy, then the installer rows. One list, so setup is not another page.
-    private var listedSteps: [WizardStep] { preseedSteps + guest.setupSteps }
-
+    /// Installer rows only. Prepare is the previous page.
     private var stepList: some View {
-        let shown = listedSteps
+        let shown = guest.setupSteps
         return VStack(spacing: 0) {
             ForEach(shown) { step in
                 setupRow(step).id(step.id + step.state + step.detail)
@@ -156,8 +157,14 @@ struct Install: View {
 
     private var actions: some View {
         HStack {
+            if setup {
+                Button("Open folder") { folderError = SupportDir.open() }.buttonStyle(.bordered)
+            }
             if setup, let onBack {
                 Button("Back", action: onBack).buttonStyle(.bordered)
+            }
+            if setup, let onForward {
+                Button("Next", action: onForward).buttonStyle(.bordered)
             }
             Spacer(minLength: 12)
             if guest.stopped {

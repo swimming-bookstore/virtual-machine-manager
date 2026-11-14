@@ -539,21 +539,9 @@ fn run(dir: &Path, from: Option<&str>, order: &Sender<OrderMsg>) -> Result<()> {
     }
     if reaches(start, "sshkey") {
         let ssh = dir.join("ssh");
-        let existed = ssh.join("id_ed25519").is_file()
-            && ssh.join("id_ed25519.pub").is_file()
-            && ssh.join(preseed::AUTHORIZED).is_file();
         step("sshkey", "now", "id_ed25519", order);
         ssh::ensure(&ssh)?;
-        step(
-            "sshkey",
-            "done",
-            if existed {
-                "Already prepared"
-            } else {
-                "id_ed25519"
-            },
-            order,
-        );
+        step("sshkey", "done", "id_ed25519", order);
     } else {
         ssh::ensure(&dir.join("ssh"))?;
     }
@@ -564,22 +552,12 @@ fn run(dir: &Path, from: Option<&str>, order: &Sender<OrderMsg>) -> Result<()> {
     }
     if reaches(start, "disk") {
         step("disk", "now", preseed::DISK, order);
-        let (_, wrote) = preseed::write_guest_disk(dir)?;
-        let detail = if wrote {
-            preseed::DISK
-        } else {
-            "Already prepared"
-        };
-        step("disk", "done", detail, order);
+        preseed::write_guest_disk(dir)?;
+        step("disk", "done", preseed::DISK, order);
     }
-    let patched = preseed::prepare_installer(&cache, &dest, dir)?;
-    let patch_detail = if patched {
-        preseed::BOOT
-    } else {
-        "Already prepared"
-    };
+    preseed::prepare_installer(&cache, &dest, dir)?;
     step("patch", "now", preseed::BOOT, order);
-    step("patch", "done", patch_detail, order);
+    step("patch", "done", preseed::BOOT, order);
     let prepared = preseed::Prepared {
         disk: dir
             .join("machines")
@@ -587,7 +565,7 @@ fn run(dir: &Path, from: Option<&str>, order: &Sender<OrderMsg>) -> Result<()> {
             .join(preseed::DISK),
         key: dir.join("ssh").join(preseed::AUTHORIZED),
     };
-    emit_ready(&dest, &prepared, patch_detail)?;
+    emit_ready(&dest, &prepared, preseed::BOOT)?;
     Ok(())
 }
 

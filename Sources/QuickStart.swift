@@ -16,15 +16,15 @@ struct WizardStep: Identifiable {
         WizardStep(id: "verify", title: "Verify checksum", detail: "SHA512SUMS", state: "wait"),
     ]
 
-    /// Page two starts with these rows. Debian setup is the same page, not the next one.
+    /// Page two. Debian setup is the next page.
     static let preseed = [
         WizardStep(id: "sshkey", title: "Prepare the host key", detail: "id_ed25519", state: "wait"),
         WizardStep(id: "preseed", title: "Prepare preseed disk", detail: "preseed.img", state: "wait"),
-        WizardStep(id: "disk", title: "Prepare the disk", detail: "disk.img", state: "wait"),
+        WizardStep(id: "disk", title: "Prepare the guest disk", detail: "disk.img", state: "wait"),
         WizardStep(id: "patch", title: "Prepare installer", detail: "boot.iso", state: "wait"),
     ]
 
-    /// The installer rows on the preseed page. A clone window is not this wizard.
+    /// The installer rows. They are the third page, not this one. A clone window is not this wizard.
     static let setup = [
         WizardStep(id: "installer", title: "Start the installer", detail: "boot.iso", state: "wait"),
         WizardStep(id: "partition", title: "Install guest", detail: "disk.img", state: "wait"),
@@ -393,9 +393,10 @@ final class Wizard: ObservableObject {
         steps.append(contentsOf: WizardStep.preseed)
     }
 
-    /// The page the worker has reached. Preseed and Debian setup are that same page.
+    /// The page the worker has reached. Prepare is the second page. Install is the third, once the files are ready.
     private var latest: Int {
-        preseedReached ? 1 : 0
+        if readyPath != nil && diskPath != nil && error == nil { return 2 }
+        return preseedReached ? 1 : 0
     }
 
     private static let pageTwo = ["sshkey", "preseed", "disk", "patch"]
@@ -427,11 +428,6 @@ final class Wizard: ObservableObject {
 
     var canGoBack: Bool { page > 0 }
     var canGoForward: Bool { page < latest }
-
-    /// Host key, preseed, the empty disk, and the installer copy. Setup lists these above its own rows.
-    var preseedSteps: [WizardStep] {
-        Self.pageTwo.compactMap { id in steps.first { $0.id == id } }
-    }
 
     /// Rows for the page on screen. Page two is the host key, preseed, the disk, and the installer copy.
     var visibleSteps: [WizardStep] {
@@ -471,19 +467,28 @@ enum CacheFolder {
     }
 
     static func open() -> String? {
-        let folder = url
-        do { try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true) }
-        catch { return "Could not create the cache folder. \(error.localizedDescription)" }
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-        process.arguments = [folder.path]
-        do { try process.run() } catch { return "Could not open the cache folder. \(error.localizedDescription)" }
-        return nil
+        openFolder(url, name: "cache folder")
     }
+}
+
+/// Opens a directory in Finder. The download page uses the cache. Prepare and setup use the data folder, which also holds the host key, the guest disk, and the snapshot.
+private func openFolder(_ folder: URL, name: String) -> String? {
+    do { try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true) }
+    catch { return "Could not create the \(name). \(error.localizedDescription)" }
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+    process.arguments = [folder.path]
+    do { try process.run() } catch { return "Could not open the \(name). \(error.localizedDescription)" }
+    return nil
 }
 
 enum SupportDir {
     static var url: URL { CacheFolder.url.deletingLastPathComponent() }
+
+    /// Host key, cache, guest disk, and snapshot. Prepare and setup are not only the cache.
+    static func open() -> String? {
+        openFolder(url, name: "folder")
+    }
 
     /// Both files. Deleting the snapshot disk is the same as deleting the ready marker.
     static var snapshotReady: Bool {
@@ -583,15 +588,20 @@ struct QuickStart: View {
     @State private var folderError: String?
 
     var body: some View {
-        // Page two lists preseed above Debian setup. Install stays mounted, so Back does not stop the guest.
+        // Install stays mounted, so Back does not stop the guest. Prepare is the page under it.
         ZStack(alignment: .topLeading) {
             if let iso = wizard.readyPath, let disk = wizard.diskPath, wizard.error == nil {
-                Install(iso: iso, disk: disk, onBack: { wizard.back() }, preseedSteps: wizard.preseedSteps)
-                    .opacity(wizard.page == 1 ? 1 : 0)
-                    .allowsHitTesting(wizard.page == 1)
-                    .accessibilityHidden(wizard.page != 1)
+                Install(
+                    iso: iso,
+                    disk: disk,
+                    onBack: wizard.canGoBack ? { wizard.back() } : nil as (() -> Void)?,
+                    onForward: wizard.canGoForward ? { wizard.forward() } : nil as (() -> Void)?
+                )
+                    .opacity(wizard.page == 2 ? 1 : 0)
+                    .allowsHitTesting(wizard.page == 2)
+                    .accessibilityHidden(wizard.page != 2)
             }
-            if wizard.page != 1 || wizard.readyPath == nil || wizard.error != nil {
+            if wizard.page != 2 || wizard.readyPath == nil || wizard.error != nil {
                 download
                     .background(.background)
             }
@@ -605,10 +615,17 @@ struct QuickStart: View {
         }
     }
 
+    private var pageTitle: String {
+        switch wizard.page {
+        case 1: return "Prepare"
+        default: return "Debian 13"
+        }
+    }
+
     private var download: some View {
         VStack(alignment: .leading, spacing: 18) {
             VStack(alignment: .leading, spacing: 4) {
-                Text(wizard.page == 1 ? "Debian setup" : "Debian 13").font(.title2.weight(.semibold))
+                Text(pageTitle).font(.title2.weight(.semibold))
                 if let headline = wizard.headline {
                     Text(headline).font(.subheadline).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                 }
@@ -629,7 +646,11 @@ struct QuickStart: View {
                 Text(error).font(.callout).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true)
             }
             HStack {
-                Button("Open cache folder") { folderError = CacheFolder.open() }.buttonStyle(.bordered)
+                if wizard.page == 0 {
+                    Button("Open cache folder") { folderError = CacheFolder.open() }.buttonStyle(.bordered)
+                } else {
+                    Button("Open folder") { folderError = SupportDir.open() }.buttonStyle(.bordered)
+                }
                 Spacer(minLength: 12)
                 if wizard.canGoBack {
                     Button("Back", action: wizard.back).buttonStyle(.bordered)
