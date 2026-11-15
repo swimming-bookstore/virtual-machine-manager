@@ -164,7 +164,19 @@ fn serve(
                         waiting = Some(next_tx);
                     }
                     thread::spawn(move || {
-                        handle(conn, &files, hold, path, range, cut, release_rx, limit_rx, next_rx)
+                        handle(
+                            conn,
+                            Serve {
+                                files,
+                                hold,
+                                path,
+                                range,
+                                cut,
+                                release: release_rx,
+                                limits: limit_rx,
+                                next: next_rx,
+                            },
+                        )
                     });
                 }
                 Err(mpsc::TryRecvError::Empty) => {
@@ -216,9 +228,8 @@ fn request_range(head: &str) -> Option<usize> {
     })
 }
 
-fn handle(
-    mut sock: TcpStream,
-    files: &[(&'static str, Vec<u8>)],
+struct Serve {
+    files: Vec<(&'static str, Vec<u8>)>,
     hold: bool,
     path: String,
     range: Option<usize>,
@@ -226,8 +237,20 @@ fn handle(
     release: Receiver<()>,
     limits: Receiver<Option<usize>>,
     next: Receiver<Option<usize>>,
-) {
-    let Some(body) = file(&path, files) else {
+}
+
+fn handle(mut sock: TcpStream, job: Serve) {
+    let Serve {
+        files,
+        hold,
+        path,
+        range,
+        cut,
+        release,
+        limits,
+        next,
+    } = job;
+    let Some(body) = file(&path, &files) else {
         let _ = respond(&mut sock, "404 Not Found", "", b"missing");
         return;
     };
@@ -325,16 +348,45 @@ fn clap_parses_download_and_rejects_unknown_args() {
     assert!(help.status.success());
     let text = String::from_utf8_lossy(&help.stdout);
     assert!(text.contains("--dir"));
+    assert!(text.contains("--rebuild"));
 
     let unknown = cli(&["download", "--nope"]);
     assert!(!unknown.status.success());
     assert!(unknown.stdout.is_empty());
     assert!(String::from_utf8_lossy(&unknown.stderr).contains("unexpected argument"));
+
+    let snapshot = cli(&["snapshot", "--help"]);
+    assert!(
+        snapshot.status.success(),
+        "{}",
+        String::from_utf8_lossy(&snapshot.stderr)
+    );
+    assert!(String::from_utf8_lossy(&snapshot.stdout).contains("--dir"));
+    let clone = cli(&["clone", "--help"]);
+    assert!(
+        clone.status.success(),
+        "{}",
+        String::from_utf8_lossy(&clone.stderr)
+    );
+    assert!(String::from_utf8_lossy(&clone.stdout).contains("--name"));
 }
 
 fn spawn(base: &str, dir: &Path) -> std::process::Child {
+    spawn_args(base, dir, &["download", "--dir", dir.to_str().unwrap()])
+}
+
+/// Reset. The download cache stays. Preseed, the guest disk, and the snapshot are done again.
+fn rebuild(base: &str, dir: &Path) -> std::process::Child {
+    spawn_args(
+        base,
+        dir,
+        &["download", "--rebuild", "--dir", dir.to_str().unwrap()],
+    )
+}
+
+fn spawn_args(base: &str, _dir: &Path, args: &[&str]) -> std::process::Child {
     Command::new(env!("CARGO_BIN_EXE_virtual-machine-worker"))
-        .args(["download", "--dir", dir.to_str().unwrap()])
+        .args(args)
         .env("VMM_BASE", base)
         .env("VMM_KEY_FP", FP.trim())
         .env_remove("VMM_DIR")
@@ -378,7 +430,6 @@ fn names(events: &[Value]) -> Vec<String> {
         .filter(|e| {
             e["event"] == "step"
                 || e["event"] == "ready"
-                || e["event"] == "detail"
                 || e["event"] == "error"
         })
         .map(|e| {
@@ -423,12 +474,19 @@ fn quick_start_checks_the_signature_before_the_iso() {
             "step sign done",
             "step check now",
             "step check done",
-            "detail download ",
             "step download now",
             "step download done",
             "step verify now",
             "step verify done",
-            "ready verify done",
+            "step sshkey now",
+            "step sshkey done",
+            "step preseed now",
+            "step preseed done",
+            "step disk now",
+            "step disk done",
+            "step patch now",
+            "step patch done",
+            "ready patch done",
         ]
     );
     assert!(events
@@ -476,7 +534,17 @@ fn quick_start_checks_the_signature_before_the_iso() {
         num(&progress.last().unwrap()["received"]),
         Some(ISO.len() as f64)
     );
-    let screen = finish(&events, status);
+    let download: Vec<_> = events
+        .iter()
+        .take_while(|event| event["step"] != "sshkey")
+        .cloned()
+        .collect();
+    let download = drive(&download);
+    assert_eq!(download.page, 0);
+    assert_eq!(download.steps.len(), 13);
+    assert!(download.steps.iter().any(|step| step.id == "sshkey"));
+    assert_eq!(download.page_rows(), ["download", "partition", "snapshot"]);
+    let mut screen = finish(&events, status);
     assert!(screen.bar_visible());
     assert_eq!(screen.percent(), 100);
     assert_eq!(
@@ -488,13 +556,156 @@ fn quick_start_checks_the_signature_before_the_iso() {
         )
     );
     assert_eq!(screen.ready_path.as_deref(), Some(iso_path(&dir).as_str()));
-    assert_eq!(screen.buttons(), ["Open cache folder"]);
-    assert_eq!(screen.row("verify").detail, "Checksum matches");
+    assert_eq!(screen.row("download").state, "done");
+    assert_eq!(screen.row("verify").state, "done");
+    assert_eq!(screen.row("ssh").state, "wait");
+    assert_eq!(screen.row("snapshot").state, "wait");
+    assert_eq!(
+        screen.disk_path.as_deref(),
+        Some(dir.join("snapshots/debian/disk.img").to_str().unwrap())
+    );
+    assert_eq!(screen.page, 0, "the wizard is one page");
+    assert_eq!(screen.title(), "Debian 13");
+    assert_eq!(screen.steps.len(), 13);
+    assert_eq!(screen.page_rows(), ["download", "partition", "snapshot"]);
+    assert_eq!(screen.shown("download"), "done");
+    assert_eq!(screen.status("download"), "Downloaded");
+    assert_eq!(screen.shown("partition"), "now");
+    assert_eq!(screen.status("partition"), "Installing");
+    assert_eq!(screen.shown("snapshot"), "wait");
+    assert_eq!(screen.status("snapshot"), "Waiting");
+    // The three words follow the work. A hidden check does not add a row.
+    let mut words = Screen::new();
+    words.start();
+    assert_eq!(
+        (
+            words.status("download"),
+            words.status("partition"),
+            words.status("snapshot")
+        ),
+        ("Waiting", "Waiting", "Waiting")
+    );
+    for event in &events {
+        words.apply(event);
+        for id in ["download", "partition", "snapshot"] {
+            let word = words.status(id);
+            assert!(!word.contains('/'), "{id} {word}");
+            assert!(
+                matches!(
+                    word,
+                    "Waiting" | "Downloading" | "Downloaded" | "Failed" | "Installing" | "Installed" | "Saving" | "Saved"
+                ),
+                "{id} {word}"
+            );
+        }
+        assert_eq!(words.page_rows(), ["download", "partition", "snapshot"]);
+    }
+    assert_eq!(words.status("download"), "Downloaded");
+    assert_eq!(words.status("partition"), "Installing");
+    assert_eq!(words.status("snapshot"), "Waiting");
+    // Open waits for the tick. Download ISO is done, so it has the button. The guest disk and snapshot are already on disk, but those steps have not ticked.
+    assert_eq!(screen.row_buttons("download", &dir), [] as [&str; 0]);
+    assert_eq!(screen.row_buttons("partition", &dir), [] as [&str; 0]);
+    assert_eq!(screen.row_buttons("snapshot", &dir), [] as [&str; 0]);
+    assert!(dir.join("snapshots/debian/disk.img").is_file());
+    assert!(
+        !dir.join("machines").exists(),
+        "the install disk is the snapshot, not a machine"
+    );
+    screen.show_log = true;
+    assert_eq!(screen.row_buttons("key", &dir), [] as [&str; 0]);
+    assert_eq!(screen.row_buttons("check", &dir), [] as [&str; 0]);
+    assert_eq!(screen.row_buttons("ssh", &dir), [] as [&str; 0]);
+    assert_eq!(screen.page_rows(), ["download", "partition", "snapshot"]);
+    let patch_now = events
+        .iter()
+        .position(|event| {
+            event["event"] == "step" && event["step"] == "patch" && event["state"] == "now"
+        })
+        .unwrap();
+    let download_done = events
+        .iter()
+        .position(|event| {
+            event["event"] == "step" && event["step"] == "download" && event["state"] == "done"
+        })
+        .unwrap();
+    let before_iso = drive(&events[..download_done]);
+    assert_eq!(before_iso.row("download").state, "now");
+    assert_eq!(before_iso.row_buttons("download", &dir), [] as [&str; 0]);
+    let iso_ticked = drive(&events[..=download_done]);
+    assert_eq!(iso_ticked.row("download").state, "done");
+    assert_eq!(iso_ticked.row_buttons("download", &dir), [] as [&str; 0]);
+    assert_eq!(iso_ticked.row_buttons("partition", &dir), [] as [&str; 0]);
+    assert_eq!(iso_ticked.row_buttons("snapshot", &dir), [] as [&str; 0]);
+    let mut mid = drive(&events[..=patch_now]);
+    assert_eq!(mid.page, 0);
+    assert_eq!(mid.title(), "Debian 13");
+    assert_eq!(mid.visible_ids(), ["download", "partition", "snapshot"]);
+    assert_eq!(mid.row("patch").state, "now");
+    assert_eq!(mid.shown("download"), "done");
+    assert_eq!(mid.shown("partition"), "now");
+    assert_eq!(mid.shown("snapshot"), "wait");
+    assert_eq!(mid.buttons(), ["Reset", "Cancel"]);
+    mid.show_log = true;
+    assert_eq!(mid.visible_ids(), ["download", "partition", "snapshot"]);
+    for event in &events[patch_now + 1..] {
+        mid.apply(event);
+    }
+    assert_eq!(mid.page, 0, "ready does not open another page");
+    assert!(mid.installing());
+    assert_eq!(mid.buttons(), ["Reset"]);
+    assert_eq!(mid.row("patch").state, "done");
+    assert_eq!(mid.page_rows(), ["download", "partition", "snapshot"]);
+    mid.show_log = false;
+    assert_eq!(mid.page_rows(), ["download", "partition", "snapshot"]);
+    assert_eq!(screen.row("download").state, "done");
+    assert_eq!(screen.row("verify").state, "done");
+    assert_eq!(screen.row("preseed").state, "done");
+    assert_eq!(screen.row("patch").state, "done");
+    assert_eq!(screen.row("disk").state, "done");
+    assert!(screen.installing());
+    assert_eq!(screen.page, 0);
+    let setup = open_setup(&screen, &dir);
+    assert_eq!(setup.title, "Debian setup");
+    assert!(setup.shows_installer());
+    assert_eq!(setup.thumbnail_row(), Some("partition"));
+    assert_eq!(setup.buttons(), [] as [&str; 0]);
+    assert_eq!(setup.row("partition").state, "now");
+    assert!(!setup.captures_pointer());
+    assert!(dir.join("installer/preseed.img").is_file());
+    assert!(dir.join("installer/boot.iso").is_file());
+    assert!(!dir.join("preseed.img").exists());
+    assert!(!dir.join("boot.iso").exists());
+    assert!(!dir.join("cache/preseed.img").exists());
+    assert!(!dir.join("cache/boot.iso").exists());
+    assert_eq!(
+        setup.attached,
+        vec![
+            dir.join("installer/boot.iso").display().to_string(),
+            dir.join("installer/preseed.img").display().to_string(),
+        ],
+        "setup attaches the copies in installer/, not the signed ISO"
+    );
+    assert_eq!(
+        std::fs::metadata(dir.join("snapshots/debian/disk.img"))
+            .unwrap()
+            .len(),
+        16 * 1024 * 1024 * 1024
+    );
+    let key = dir.join("ssh/authorized_keys");
+    assert!(key.is_file(), "host key was not generated");
+    assert!(std::fs::read_to_string(&key)
+        .unwrap()
+        .contains("ssh-ed25519"));
+    assert!(!dir.join("snapshots/debian/marker.img").exists());
+    let ready = events.iter().find(|e| e["event"] == "ready").unwrap();
+    assert_eq!(ready["key"], key.display().to_string());
+    assert_eq!(screen.row("preseed").state, "done");
 
     let (status, events) = wait(spawn(&base, &dir));
     assert_eq!(status, 0, "{events:?}");
     let log = log_of(&world);
-    assert_eq!(log.len(), 3, "cached iso was fetched again: {log:?}");
+    assert!(log.is_empty(), "cached files were fetched again: {log:?}");
     assert!(events.iter().any(|e| e["event"] == "ready"));
     assert!(events
         .iter()
@@ -502,16 +713,36 @@ fn quick_start_checks_the_signature_before_the_iso() {
     assert!(events
         .iter()
         .any(|e| e["event"] == "progress" && e["step"] == "verify"));
-    let cached = finish(&events, status);
+    let mut cached = finish(&events, status);
     assert!(!cached.bar_visible());
     assert_eq!(cached.received, 0.0);
     assert_eq!(cached.total, 0.0);
     assert_eq!(cached.bytes_label(), "");
     assert_eq!(cached.ready_path.as_deref(), Some(iso_path(&dir).as_str()));
-    assert_eq!(cached.buttons(), ["Open cache folder"]);
-    assert_eq!(cached.row("key").detail, "key-DA87E80D6294BE9B.txt");
-    assert_eq!(cached.row("download").detail, iso_name());
-    assert_eq!(cached.row("verify").state, "done");
+    assert_eq!(cached.row("download").state, "done");
+    assert_eq!(cached.row("snapshot").state, "wait");
+    assert!(cached.installing());
+    assert_eq!(cached.page, 0);
+    assert_eq!(cached.row("preseed").state, "done");
+    assert_eq!(cached.row("sshkey").state, "done");
+    assert_eq!(cached.row("disk").state, "done");
+    assert_eq!(cached.row("patch").state, "done");
+    assert_eq!(cached.buttons(), ["Reset"]);
+    assert_eq!(cached.page_rows(), ["download", "partition", "snapshot"]);
+    cached.show_log = true;
+    assert_eq!(cached.page_rows(), ["download", "partition", "snapshot"]);
+    let setup = open_setup(&cached, &dir);
+    assert!(setup.shows_installer());
+    assert_eq!(setup.thumbnail_row(), Some("partition"));
+    assert_eq!(setup.row("partition").state, "now");
+    assert_eq!(
+        setup.attached,
+        vec![
+            dir.join("installer/boot.iso").display().to_string(),
+            dir.join("installer/preseed.img").display().to_string(),
+        ]
+    );
+    assert!(setup.attached.iter().all(|path| !path.contains("/cache/")));
 }
 
 #[test]
@@ -527,26 +758,37 @@ fn a_bad_signature_stops_before_the_iso() {
         "check"
     );
     assert!(!dir.join("cache").join(iso_name()).exists());
-    let mut screen = finish(&events, status);
+    let screen = finish(&events, status);
     let error = screen.error.clone().unwrap();
     assert!(!screen.bar_visible());
     assert_eq!(screen.headline.as_deref(), Some("Download failed"));
-    assert_eq!(screen.buttons(), ["Open cache folder", "Try again"]);
+    assert_eq!(screen.buttons(), ["Reset", "Try again"]);
     assert_eq!(screen.row("check").state, "fail");
-    assert_eq!(screen.row("check").detail, error);
+    assert_eq!(screen.shown("download"), "fail");
+    assert_eq!(screen.page_rows(), ["download", "partition", "snapshot"]);
     assert!(error.contains("SHA512SUMS was not signed"));
     assert_eq!(screen.row("key").state, "done");
     assert_eq!(screen.row("download").state, "wait");
-    assert_eq!(screen.row("download").detail, iso_glob());
     let cache = dir.join("cache");
-    assert!(!screen.cache_went_away(&cache));
+    let frozen: Vec<_> = screen
+        .steps
+        .iter()
+        .map(|step| step.state.clone())
+        .collect();
     std::fs::remove_dir_all(&cache).unwrap();
-    assert!(screen.cache_went_away(&cache));
-    assert!(screen.steps.iter().all(|step| step.state == "wait"));
-    assert_eq!(screen.buttons(), ["Open cache folder", "Cancel"]);
+    assert_eq!(
+        screen
+            .steps
+            .iter()
+            .map(|step| step.state.clone())
+            .collect::<Vec<_>>(),
+        frozen,
+        "deleting the cache does not start again"
+    );
+    assert_eq!(screen.buttons(), ["Reset", "Try again"]);
     let mut idle = Screen::new();
     idle.start();
-    assert!(!idle.cache_went_away(Path::new("/no/such/cache")));
+    assert!(idle.running);
 }
 
 #[test]
@@ -569,11 +811,13 @@ fn a_bad_key_stops_before_the_checksum_file() {
     );
     let screen = finish(&events, status);
     let error = screen.error.clone().unwrap();
+    assert!(!error.is_empty());
     assert!(!screen.bar_visible());
     assert_eq!(screen.row("key").state, "fail");
-    assert_eq!(screen.row("key").detail, error);
+    assert_eq!(screen.shown("download"), "fail");
+    assert_eq!(screen.shown("partition"), "wait");
     assert!(screen.steps.iter().skip(1).all(|step| step.state == "wait"));
-    assert_eq!(screen.buttons(), ["Open cache folder", "Try again"]);
+    assert_eq!(screen.buttons(), ["Reset", "Try again"]);
     assert_eq!(screen.headline.as_deref(), Some("Download failed"));
 }
 
@@ -594,13 +838,12 @@ fn a_checksum_mismatch_removes_the_iso() {
     assert!(dir.join("cache/SHA512SUMS").is_file());
     assert!(!dir.join("cache/manifest.json").exists());
     let screen = finish(&events, status);
-    let shown = screen.error.clone().unwrap();
     assert!(screen.bar_visible());
     assert_eq!(screen.percent(), 100);
     assert_eq!(screen.row("verify").state, "fail");
-    assert_eq!(screen.row("verify").detail, shown);
+    assert_eq!(screen.shown("download"), "fail");
     assert!(screen.ready_path.is_none());
-    assert_eq!(screen.buttons(), ["Open cache folder", "Try again"]);
+    assert_eq!(screen.buttons(), ["Reset", "Try again"]);
     assert_eq!(screen.headline.as_deref(), Some("Download failed"));
 }
 
@@ -616,21 +859,20 @@ fn a_partial_download_resumes() {
     let mut screen = finish(&events, status);
     let last = events
         .iter()
-        .filter(|event| event["event"] == "progress" && event["step"] == "download")
-        .last()
+        .rfind(|event| event["event"] == "progress" && event["step"] == "download")
         .unwrap();
     assert!(screen.bar_visible());
     assert!(screen.received < screen.total);
     assert_eq!(screen.received, num(&last["received"]).unwrap());
     assert_eq!(screen.total, num(&last["total"]).unwrap());
     assert_eq!(screen.row("download").state, "fail");
-    assert_eq!(screen.row("download").detail, screen.error.clone().unwrap());
-    assert_eq!(screen.buttons(), ["Open cache folder", "Try again"]);
+    assert_eq!(screen.row("download").title, "Download ISO");
+    assert_eq!(screen.buttons(), ["Reset", "Try again"]);
     screen.retry();
     assert!(!screen.bar_visible());
     assert_eq!(screen.received, 0.0);
     assert!(screen.steps.iter().all(|step| step.state == "wait"));
-    assert_eq!(screen.buttons(), ["Open cache folder", "Cancel"]);
+    assert_eq!(screen.buttons(), ["Reset", "Cancel"]);
     assert!(screen.headline.is_none());
     let (status, events) = wait(spawn(&base, &dir));
     assert_eq!(status, 0, "{events:?}");
@@ -643,7 +885,7 @@ fn a_partial_download_resumes() {
     assert!(screen.bar_visible());
     assert_eq!(screen.percent(), 100);
     assert_eq!(screen.ready_path.as_deref(), Some(iso_path(&dir).as_str()));
-    assert_eq!(screen.buttons(), ["Open cache folder"]);
+    assert!(screen.installing());
 }
 
 #[test]
@@ -676,18 +918,17 @@ fn a_second_download_is_refused_while_the_lock_is_held() {
     let error = screen.error.clone().unwrap();
     assert!(!screen.bar_visible());
     assert_eq!(screen.row("key").state, "fail");
-    assert_eq!(screen.row("key").detail, "key-DA87E80D6294BE9B.txt");
     assert!(error.contains("a download is already running"));
     assert!(screen.steps.iter().skip(1).all(|step| step.state == "wait"));
-    assert_eq!(screen.buttons(), ["Open cache folder", "Try again"]);
+    assert_eq!(screen.buttons(), ["Reset", "Try again"]);
     assert_eq!(screen.headline.as_deref(), Some("Download failed"));
 }
 
 /// Quick start window. Same rules as Sources/QuickStart.swift.
+#[derive(Debug, Clone)]
 struct Step {
     id: &'static str,
     title: &'static str,
-    detail: String,
     state: String,
 }
 
@@ -698,17 +939,25 @@ struct Screen {
     headline: Option<String>,
     error: Option<String>,
     ready_path: Option<String>,
+    disk_path: Option<String>,
     cancelled: bool,
     downloading: bool,
+    /// True only for the run Reset just started. A later open does not set this.
+    rebuild: bool,
+    /// Changes on Reset so the mounted install is a new guest.
+    run_id: i32,
     started: bool,
     running: bool,
+    page: i32,
+    /// Kept so older checks can set it. The page does not grow a log of hidden steps.
+    show_log: bool,
 }
 
-fn iso_glob() -> &'static str {
-    match arch() {
-        "arm64" => "debian-*-arm64-netinst.iso",
-        "amd64" => "debian-*-amd64-netinst.iso",
-        _ => "debian-*-netinst.iso",
+fn face_of(id: &str) -> &'static str {
+    match id {
+        "sshkey" | "preseed" | "disk" | "patch" | "partition" | "ssh" => "partition",
+        "snapshot" => "snapshot",
+        _ => "download",
     }
 }
 
@@ -735,37 +984,66 @@ impl Screen {
                 Step {
                     id: "key",
                     title: "Download OpenPGP keyring",
-                    detail: "key-DA87E80D6294BE9B.txt".into(),
                     state: "wait".into(),
                 },
                 Step {
                     id: "sums",
                     title: "Download checksums file",
-                    detail: "SHA512SUMS".into(),
                     state: "wait".into(),
                 },
                 Step {
                     id: "sign",
                     title: "Download signature file",
-                    detail: "SHA512SUMS.sign".into(),
                     state: "wait".into(),
                 },
                 Step {
                     id: "check",
                     title: "Verify signature",
-                    detail: "SHA512SUMS.sign".into(),
                     state: "wait".into(),
                 },
                 Step {
                     id: "download",
                     title: "Download ISO",
-                    detail: iso_glob().into(),
                     state: "wait".into(),
                 },
                 Step {
                     id: "verify",
                     title: "Verify checksum",
-                    detail: "SHA512SUMS".into(),
+                    state: "wait".into(),
+                },
+                Step {
+                    id: "sshkey",
+                    title: "Prepare the host key",
+                    state: "wait".into(),
+                },
+                Step {
+                    id: "preseed",
+                    title: "Prepare preseed disk",
+                    state: "wait".into(),
+                },
+                Step {
+                    id: "disk",
+                    title: "Prepare the guest disk",
+                    state: "wait".into(),
+                },
+                Step {
+                    id: "patch",
+                    title: "Prepare installer",
+                    state: "wait".into(),
+                },
+                Step {
+                    id: "partition",
+                    title: "Install guest",
+                    state: "wait".into(),
+                },
+                Step {
+                    id: "ssh",
+                    title: "Verify with host key",
+                    state: "wait".into(),
+                },
+                Step {
+                    id: "snapshot",
+                    title: "Create snapshot",
                     state: "wait".into(),
                 },
             ],
@@ -774,10 +1052,15 @@ impl Screen {
             headline: None,
             error: None,
             ready_path: None,
+            disk_path: None,
             cancelled: false,
             downloading: false,
+            rebuild: false,
+            run_id: 0,
             started: false,
             running: false,
+            page: 0,
+            show_log: false,
         }
     }
 
@@ -816,6 +1099,15 @@ impl Screen {
         self.start();
     }
 
+    /// Reset keeps the download cache and rebuilds the image. Deleting a file does not.
+    fn reset_wizard(&mut self) {
+        self.running = false;
+        self.reset();
+        self.rebuild = true;
+        self.run_id += 1;
+        self.start();
+    }
+
     fn cancel(&mut self) {
         self.cancelled = true;
         self.running = false;
@@ -823,7 +1115,6 @@ impl Screen {
         self.headline = Some("Cancelled. The download was not saved.".into());
         if let Some(step) = self.steps.iter_mut().find(|step| step.state == "now") {
             step.state = "wait".into();
-            step.detail = "Cancelled".into();
         }
     }
 
@@ -858,21 +1149,13 @@ impl Screen {
             }
         }
         match kind {
-            "detail" => {
-                if let (Some(id), Some(detail)) = (step, event["detail"].as_str()) {
-                    if !detail.is_empty() {
-                        if let Some(row) = self.steps.iter_mut().find(|row| row.id == id) {
-                            row.detail = detail.to_string();
-                        }
-                    }
-                }
-            }
             "step" | "ready" => {
                 if let (Some(id), Some(state)) = (step, event["state"].as_str()) {
-                    self.apply_state(id, state, event["detail"].as_str());
+                    self.apply_state(id, state);
                 }
                 if kind == "ready" {
                     self.ready_path = event["path"].as_str().map(str::to_string);
+                    self.disk_path = event["disk"].as_str().map(str::to_string);
                     if self.downloading {
                         self.total = self.total.max(1.0);
                         self.received = self.total;
@@ -885,25 +1168,77 @@ impl Screen {
                 self.headline = Some("Download failed".into());
                 if let Some(id) = step {
                     if self.steps.iter().any(|row| row.id == id) {
-                        self.apply_state(id, "fail", detail);
-                        return;
+                        self.apply_state(id, "fail");
+                    } else {
+                        self.fail_current();
                     }
+                } else {
+                    self.fail_current();
                 }
-                self.fail_current();
             }
             _ => {}
         }
     }
 
-    fn apply_state(&mut self, id: &str, state: &str, detail: Option<&str>) {
+    fn title(&self) -> &'static str {
+        "Debian 13"
+    }
+
+    fn page_rows(&self) -> Vec<&'static str> {
+        self.visible_ids()
+    }
+
+    /// Waiting, Downloading, Downloaded. A hidden step only changes this word.
+    fn status(&self, id: &str) -> &'static str {
+        match (id, self.shown(id)) {
+            ("download", "now") => "Downloading",
+            ("download", "done") => "Downloaded",
+            ("download", "fail") => "Failed",
+            ("partition", "now") => "Installing",
+            ("partition", "done") => "Installed",
+            ("partition", "fail") => "Failed",
+            ("snapshot", "now") => "Saving",
+            ("snapshot", "done") => "Saved",
+            ("snapshot", "fail") => "Failed",
+            _ => "Waiting",
+        }
+    }
+
+    /// Download ISO, Install guest, and Create snapshot. The other steps still run.
+    fn visible_ids(&self) -> Vec<&'static str> {
+        let _ = self.show_log;
+        ["download", "partition", "snapshot"]
+            .into_iter()
+            .filter(|id| self.steps.iter().any(|step| step.id == *id))
+            .collect()
+    }
+
+    /// The row the user sees. A hidden check uses the row it belongs to.
+    fn shown(&self, id: &str) -> &str {
+        let group: Vec<_> = self
+            .steps
+            .iter()
+            .filter(|step| face_of(step.id) == id)
+            .collect();
+        if group.iter().any(|step| step.state == "fail") {
+            return "fail";
+        }
+        if group.iter().any(|step| step.state == "now") {
+            return "now";
+        }
+        if !group.is_empty() && group.iter().all(|step| step.state == "done") {
+            return "done";
+        }
+        if !self.cancelled && group.iter().any(|step| step.state == "done") {
+            return "now";
+        }
+        "wait"
+    }
+
+    fn apply_state(&mut self, id: &str, state: &str) {
         let Some(row) = self.steps.iter_mut().find(|row| row.id == id) else {
             return;
         };
-        if let Some(detail) = detail {
-            if !detail.is_empty() {
-                row.detail = detail.to_string();
-            }
-        }
         row.state = state.to_string();
     }
 
@@ -918,47 +1253,30 @@ impl Screen {
         }
     }
 
-    fn cache_went_away(&mut self, cache: &Path) -> bool {
-        let finished =
-            self.ready_path.is_some() || self.steps.iter().any(|step| step.state == "done");
-        if !finished || (self.ready_path.is_none() && self.running) || !self.image_missing(cache) {
-            return false;
-        }
-        self.running = false;
-        self.reset();
-        self.start();
-        true
-    }
-
-    fn image_missing(&self, cache: &Path) -> bool {
-        if let Some(path) = &self.ready_path {
-            return !Path::new(path).is_file();
-        }
-        if !cache.is_dir() {
-            return true;
-        }
-        let names = [
-            "SHA512SUMS",
-            "SHA512SUMS.sign",
-            "manifest.json",
-            "key-DA87E80D6294BE9B.txt",
-        ];
-        if names.iter().any(|name| cache.join(name).is_file()) {
-            return false;
-        }
-        std::fs::read_dir(cache)
-            .ok()
-            .into_iter()
-            .flatten()
-            .flatten()
-            .all(|item| item.path().extension().and_then(|ext| ext.to_str()) != Some("iso"))
-    }
-
     fn row(&self, id: &str) -> &Step {
         self.steps
             .iter()
             .find(|step| step.id == id)
             .unwrap_or_else(|| panic!("missing {id}"))
+    }
+
+    /// The installer sits on Install guest, not in a slot above the list.
+    /// The download bar sits on Download ISO. A saved snapshot has nothing to install.
+    fn shows_thumbnail(&self, id: &str, dir: &Path, snapshot_saved: bool, window_open: bool) -> bool {
+        let _ = dir;
+        id == "partition" && !snapshot_saved && !window_open && self.error.is_none()
+    }
+
+    /// Nothing sits above the steps. The bar and the installer are inside their rows.
+    fn top_slot(&self, snapshot_saved: bool, window_open: bool) -> &'static str {
+        let _ = (snapshot_saved, window_open);
+        "empty"
+    }
+
+    /// A row has no Open button. The path is the label.
+    fn row_buttons(&self, id: &str, dir: &Path) -> Vec<&'static str> {
+        let _ = (id, dir);
+        vec![]
     }
 
     fn bar_visible(&self) -> bool {
@@ -970,13 +1288,17 @@ impl Screen {
     }
 
     fn buttons(&self) -> Vec<&'static str> {
-        let mut buttons = vec!["Open cache folder"];
+        let mut buttons = vec!["Reset"];
         if self.error.is_some() || self.cancelled {
             buttons.push("Try again");
         } else if self.ready_path.is_none() {
             buttons.push("Cancel");
         }
         buttons
+    }
+
+    fn installing(&self) -> bool {
+        self.error.is_none() && self.ready_path.is_some() && self.disk_path.is_some()
     }
 
     fn bytes_label(&self) -> String {
@@ -1031,11 +1353,7 @@ fn drive(events: &[Value]) -> Screen {
         let step = event["step"].as_str();
         let (received, total) = (screen.received, screen.total);
         screen.apply(event);
-        if kind == "detail" && step == Some("download") {
-            assert_eq!(screen.row("download").detail, iso_name());
-            assert_eq!(screen.row("download").state, "wait");
-            assert!(!screen.bar_visible());
-        } else if kind == "progress" && step == Some("download") {
+        if kind == "progress" && step == Some("download") {
             saw_download = true;
         } else if kind == "progress" {
             assert_eq!((screen.received, screen.total), (received, total));
@@ -1054,6 +1372,342 @@ fn drive(events: &[Value]) -> Screen {
 
 fn iso_path(dir: &Path) -> String {
     dir.join("cache").join(iso_name()).display().to_string()
+}
+
+/// The installer is not run here. The worker still refuses a snapshot until SSH has logged in and the partition table exists.
+#[test]
+fn snapshot_waits_for_ssh_then_clones() {
+    let (base, _) = serve(SUMS, SIGN, ISO, KEY, false, false, false);
+    let (status, events, dir) = run(&base);
+    assert_eq!(status, 0, "{events:?}");
+    let screen = finish(&events, status);
+    assert!(screen.installing());
+    assert_eq!(
+        screen.disk_path.as_deref(),
+        Some(dir.join("snapshots/debian/disk.img").to_str().unwrap())
+    );
+    assert!(dir.join("ssh/id_ed25519").is_file());
+    assert!(dir.join("ssh/authorized_keys").is_file());
+
+    let missing = cli(&["clone", "--dir", dir.to_str().unwrap()]);
+    assert!(!missing.status.success());
+    let missing_out = String::from_utf8_lossy(&missing.stdout);
+    assert!(missing_out.contains("no Debian snapshot"), "{missing_out}");
+    assert!(missing_out.contains("\"event\":\"error\""), "{missing_out}");
+    let install = finish_install(&missing.stdout);
+    assert_eq!(
+        install.error.as_deref(),
+        Some("no Debian snapshot yet. Finish the installer first.")
+    );
+    assert_eq!(
+        install.headline.as_deref(),
+        Some("Debian shut down, but the snapshot was not saved.")
+    );
+    assert!(!install.snapshot_ready);
+
+    let early = cli(&["snapshot", "--dir", dir.to_str().unwrap()]);
+    assert!(!early.status.success());
+    let early_out = String::from_utf8_lossy(&early.stdout);
+    assert!(early_out.contains("install is not finished"), "{early_out}");
+    assert!(!dir.join("snapshots/debian/ready").exists());
+    let refused = finish_install(&early.stdout);
+    assert!(!refused.snapshot_ready);
+    assert!(refused.error.unwrap().contains("install is not finished"));
+
+    let disk = dir.join("snapshots/debian/disk.img");
+    let mut file = std::fs::OpenOptions::new().write(true).open(&disk).unwrap();
+    use std::io::{Seek, SeekFrom, Write};
+    file.seek(SeekFrom::Start(510)).unwrap();
+    file.write_all(&[0x55, 0xaa]).unwrap();
+    file.seek(SeekFrom::Start(4096)).unwrap();
+    file.write_all(b"GUEST-BYTES!").unwrap();
+    drop(file);
+    std::fs::write(dir.join("snapshots/debian/nvram.bin"), b"efi").unwrap();
+    let refused = cli(&["snapshot", "--dir", dir.to_str().unwrap()]);
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stdout).contains("SSH has not logged in"));
+    std::fs::write(dir.join("ssh/ssh-ok"), b"debian ok\n").unwrap();
+
+    let saved = cli(&["snapshot", "--dir", dir.to_str().unwrap()]);
+    assert!(
+        saved.status.success(),
+        "{}",
+        String::from_utf8_lossy(&saved.stdout)
+    );
+    let event = one_event(&saved.stdout);
+    assert_eq!(event["event"], "snapshot");
+    assert_eq!(event["state"], "done");
+    assert_eq!(
+        event["path"],
+        dir.join("snapshots/debian").display().to_string()
+    );
+    assert_eq!(
+        event["disk"],
+        dir.join("snapshots/debian/disk.img").display().to_string()
+    );
+    assert!(
+        event.get("detail").is_none(),
+        "snapshot success has no error detail"
+    );
+    assert!(dir.join("snapshots/debian/ready").is_file());
+    assert!(std::fs::read_to_string(dir.join("snapshots/debian/ready"))
+        .unwrap()
+        .starts_with("ssh-ok"));
+    std::fs::remove_file(dir.join("snapshots/debian/ready")).unwrap();
+    let again = cli(&["snapshot", "--dir", dir.to_str().unwrap()]);
+    assert!(
+        again.status.success(),
+        "{}",
+        String::from_utf8_lossy(&again.stdout)
+    );
+    assert!(dir.join("snapshots/debian/ready").is_file());
+    // The guest disk is the snapshot. Removing it does not leave a second copy to restore.
+    std::fs::remove_file(dir.join("snapshots/debian/disk.img")).unwrap();
+    let recopied = cli(&["snapshot", "--dir", dir.to_str().unwrap()]);
+    assert!(!recopied.status.success());
+    assert!(String::from_utf8_lossy(&recopied.stdout).contains("guest disk is missing"));
+    let mut restored = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .open(&disk)
+        .unwrap();
+    restored.set_len(16 * 1024 * 1024 * 1024).unwrap();
+    restored.seek(SeekFrom::Start(510)).unwrap();
+    restored.write_all(&[0x55, 0xaa]).unwrap();
+    drop(restored);
+    let installed = finish_install(&saved.stdout);
+    assert!(installed.error.is_none());
+    assert!(installed.snapshot_ready);
+    assert_eq!(
+        installed.headline.as_deref(),
+        Some("Debian is installed and shut down. A snapshot is saved for new machines.")
+    );
+    assert_eq!(
+        installed.buttons(),
+        ["New virtual machine"]
+    );
+    assert!(
+        !installed.shows_installer,
+        "a saved snapshot hides the thumbnail"
+    );
+    assert_eq!(installed.row("snapshot").state, "done");
+    assert_eq!(installed.row("ssh").state, "done");
+
+    let mut src = std::fs::OpenOptions::new().write(true).open(&disk).unwrap();
+    src.seek(SeekFrom::Start(4096)).unwrap();
+    src.write_all(b"CHANGED!!!!!").unwrap();
+    drop(src);
+    std::fs::write(dir.join("snapshots/debian/nvram.bin"), b"mutated").unwrap();
+    let again = cli(&["snapshot", "--dir", dir.to_str().unwrap()]);
+    assert!(
+        again.status.success(),
+        "{}",
+        String::from_utf8_lossy(&again.stdout)
+    );
+    // The saved snapshot is this disk, so a later save keeps the bytes written here.
+    let mut frozen = [0u8; 12];
+    let mut snap = std::fs::File::open(dir.join("snapshots/debian/disk.img")).unwrap();
+    snap.seek(SeekFrom::Start(4096)).unwrap();
+    std::io::Read::read_exact(&mut snap, &mut frozen).unwrap();
+    assert_eq!(&frozen, b"CHANGED!!!!!");
+    assert_eq!(
+        std::fs::read(dir.join("snapshots/debian/nvram.bin")).unwrap(),
+        b"mutated"
+    );
+
+    let bad = cli(&["clone", "--dir", dir.to_str().unwrap(), "--name", "../x"]);
+    assert!(!bad.status.success());
+    assert!(String::from_utf8_lossy(&bad.stdout).contains("machine name"));
+    let named = cli(&["clone", "--dir", dir.to_str().unwrap(), "--name", "lab"]);
+    assert!(
+        named.status.success(),
+        "{}",
+        String::from_utf8_lossy(&named.stdout)
+    );
+    let named_event = one_event(&named.stdout);
+    assert_eq!(named_event["event"], "clone");
+    assert_eq!(
+        named_event["disk"],
+        dir.join("machines/lab/disk.img").display().to_string()
+    );
+    let dup = cli(&["clone", "--dir", dir.to_str().unwrap(), "--name", "lab"]);
+    assert!(!dup.status.success());
+    assert!(String::from_utf8_lossy(&dup.stdout).contains("already exists"));
+    let installer = cli(&["clone", "--dir", dir.to_str().unwrap(), "--name", "debian"]);
+    assert!(!installer.status.success());
+    assert!(String::from_utf8_lossy(&installer.stdout).contains("snapshot name"));
+
+    let cloned = cli(&["clone", "--dir", dir.to_str().unwrap()]);
+    assert!(
+        cloned.status.success(),
+        "{}",
+        String::from_utf8_lossy(&cloned.stdout)
+    );
+    let event = one_event(&cloned.stdout);
+    assert_eq!(event["event"], "clone");
+    assert_eq!(event["state"], "done");
+    assert_eq!(
+        event["disk"],
+        dir.join("machines/debian-2/disk.img").display().to_string()
+    );
+    assert_eq!(
+        std::fs::metadata(dir.join("machines/debian-2/disk.img"))
+            .unwrap()
+            .len(),
+        16 * 1024 * 1024 * 1024
+    );
+    let mut cloned_buf = [0u8; 12];
+    let mut cloned_disk = std::fs::File::open(dir.join("machines/debian-2/disk.img")).unwrap();
+    cloned_disk.seek(SeekFrom::Start(4096)).unwrap();
+    std::io::Read::read_exact(&mut cloned_disk, &mut cloned_buf).unwrap();
+    assert_eq!(&cloned_buf, b"CHANGED!!!!!");
+    assert_eq!(
+        std::fs::read(dir.join("machines/debian-2/nvram.bin")).unwrap(),
+        b"mutated"
+    );
+    let cloned_machine = finish_clone(&cloned.stdout);
+    assert_eq!(cloned_machine.disk.as_deref(), event["disk"].as_str());
+    assert!(cloned_machine.error.is_none());
+    let machine = open_clone(event["disk"].as_str().unwrap());
+    assert_eq!(machine.title, "Debian");
+    assert!(machine.captures_pointer());
+    assert!(!machine.shows_installer());
+    assert_eq!(machine.thumbnail_row(), None, "a clone is a machine, not the install thumbnail");
+    assert_eq!(machine.headline.as_deref(), Some("Starting Debian."));
+    assert_eq!(machine.buttons(), [] as [&str; 0]);
+
+    let next = cli(&["clone", "--dir", dir.to_str().unwrap()]);
+    assert!(
+        next.status.success(),
+        "{}",
+        String::from_utf8_lossy(&next.stdout)
+    );
+    assert_eq!(
+        one_event(&next.stdout)["disk"],
+        dir.join("machines/debian-3/disk.img").display().to_string()
+    );
+
+    // The install disk is the snapshot. A broken copy cannot be rebuilt from a second file.
+    std::fs::write(dir.join("snapshots/debian/ready"), b"nope").unwrap();
+    std::fs::write(dir.join("snapshots/debian/disk.img"), b"short").unwrap();
+    let replaced = cli(&["snapshot", "--dir", dir.to_str().unwrap()]);
+    assert!(!replaced.status.success());
+    assert!(String::from_utf8_lossy(&replaced.stdout).contains("guest disk is"));
+}
+
+fn one_event(stdout: &[u8]) -> Value {
+    let text = std::str::from_utf8(stdout).unwrap();
+    let line = text.lines().next().unwrap();
+    serde_json::from_str(line).unwrap_or_else(|_| panic!("bad event {text}"))
+}
+
+/// Same snapshot outcome as Install.swift `saveSnapshot`, then the setup rows that page paints.
+struct Installed {
+    error: Option<String>,
+    headline: Option<String>,
+    snapshot_ready: bool,
+    steps: Vec<Step>,
+    stopped: bool,
+    shows_installer: bool,
+    cloning: bool,
+}
+
+fn finish_install(stdout: &[u8]) -> Installed {
+    let err = worker_error(stdout);
+    let mut page = setup_page(false);
+    if let Some(err) = err {
+        page.fail_current();
+        page.headline = Some("Debian shut down, but the snapshot was not saved.".into());
+        page.error = Some(err);
+        page.snapshot_ready = false;
+    } else {
+        page.mark("ssh", "done");
+        page.mark("snapshot", "done");
+        page.headline =
+            Some("Debian is installed and shut down. A snapshot is saved for new machines.".into());
+        page.error = None;
+        page.snapshot_ready = true;
+        page.show_window = false;
+    }
+    page.stopped = true;
+    let shows_installer = page.shows_installer();
+    Installed {
+        error: page.error,
+        headline: page.headline,
+        snapshot_ready: page.snapshot_ready,
+        steps: page.steps,
+        stopped: page.stopped,
+        shows_installer,
+        cloning: false,
+    }
+}
+
+impl Installed {
+    fn row(&self, id: &str) -> &Step {
+        self.steps.iter().find(|step| step.id == id).unwrap()
+    }
+
+    fn buttons(&self) -> Vec<&'static str> {
+        if !self.stopped {
+            return Vec::new();
+        }
+        let mut buttons = Vec::new();
+        if !self.snapshot_ready {
+            buttons.push("Start Debian");
+        } else {
+            buttons.push("New virtual machine");
+        }
+        if self.error.is_some() && !self.snapshot_ready {
+            buttons.push("Save snapshot");
+        }
+        let _ = self.cloning;
+        buttons
+    }
+}
+
+/// Same clone outcome as Install.swift `newMachine`.
+struct Cloned {
+    disk: Option<String>,
+    error: Option<String>,
+}
+
+fn finish_clone(stdout: &[u8]) -> Cloned {
+    match worker_disk(stdout) {
+        Some(disk) => Cloned {
+            disk: Some(disk),
+            error: None,
+        },
+        None => Cloned {
+            disk: None,
+            error: Some(
+                worker_error(stdout)
+                    .unwrap_or_else(|| "Could not create a virtual machine.".into()),
+            ),
+        },
+    }
+}
+
+fn worker_error(stdout: &[u8]) -> Option<String> {
+    parse_events(stdout).into_iter().find_map(|event| {
+        (event["event"] == "error").then(|| {
+            event["detail"]
+                .as_str()
+                .filter(|text| !text.is_empty())
+                .unwrap_or("Could not save the snapshot.")
+                .to_string()
+        })
+    })
+}
+
+fn worker_disk(stdout: &[u8]) -> Option<String> {
+    for event in parse_events(stdout) {
+        if let Some(disk) = event["disk"].as_str() {
+            if !disk.is_empty() {
+                return Some(disk.to_string());
+            }
+        }
+    }
+    None
 }
 
 fn watch(base: &str, dir: &Path) -> (std::process::Child, Receiver<Value>, thread::JoinHandle<()>) {
@@ -1127,7 +1781,11 @@ fn bar_hidden_until_iso_progress(events: &[Value]) {
     assert!(saw, "download never painted a bar");
 }
 
-fn until(events: &Receiver<Value>, seen: &mut Vec<Value>, pred: impl Fn(&Value) -> bool) -> Vec<Value> {
+fn until(
+    events: &Receiver<Value>,
+    seen: &mut Vec<Value>,
+    pred: impl Fn(&Value) -> bool,
+) -> Vec<Value> {
     let started = Instant::now();
     loop {
         if seen.iter().any(&pred) {
@@ -1174,7 +1832,7 @@ fn cancel_stops_the_window_and_ignores_later_events() {
     let frozen: Vec<_> = screen
         .steps
         .iter()
-        .map(|step| (step.state.clone(), step.detail.clone()))
+        .map(|step| step.state.clone())
         .collect();
     let headline = screen.headline.clone();
     let received = screen.received;
@@ -1185,17 +1843,19 @@ fn cancel_stops_the_window_and_ignores_later_events() {
     let now: Vec<_> = screen
         .steps
         .iter()
-        .map(|step| (step.state.clone(), step.detail.clone()))
+        .map(|step| step.state.clone())
         .collect();
     assert_eq!(now, frozen, "events after cancel must not paint");
     assert_eq!(screen.headline, headline);
     assert_eq!(screen.received, received);
     assert!(screen.error.is_none());
-    assert_eq!(screen.headline.as_deref(), Some("Cancelled. The download was not saved."));
+    assert_eq!(
+        screen.headline.as_deref(),
+        Some("Cancelled. The download was not saved.")
+    );
     assert_eq!(screen.row("download").state, "wait");
-    assert_eq!(screen.row("download").detail, "Cancelled");
     assert_eq!(screen.row("check").state, "done");
-    assert_eq!(screen.buttons(), ["Open cache folder", "Try again"]);
+    assert_eq!(screen.buttons(), ["Reset", "Try again"]);
     assert!(
         screen.bar_visible(),
         "cancel does not wipe a bar that was already on screen"
@@ -1205,6 +1865,7 @@ fn cancel_stops_the_window_and_ignores_later_events() {
     assert_eq!(status, 0, "{events:?}");
     let screen = finish(&events, status);
     assert_eq!(screen.ready_path.as_deref(), Some(iso_path(&dir).as_str()));
+    assert!(screen.installing());
 }
 
 #[test]
@@ -1230,63 +1891,161 @@ fn a_killed_worker_fails_the_step_that_was_running() {
     );
     assert_eq!(screen.headline.as_deref(), Some("Download failed"));
     assert_eq!(screen.row("download").state, "fail");
-    assert_eq!(screen.row("download").detail, iso_name());
     assert!(screen.bar_visible());
     assert!(screen.ready_path.is_none());
-    assert_eq!(screen.buttons(), ["Open cache folder", "Try again"]);
+    assert_eq!(screen.buttons(), ["Reset", "Try again"]);
     assert!(!screen.cancelled);
 }
 
 #[test]
-fn deleting_the_finished_iso_clears_the_window_and_starts_again() {
+fn deleting_a_file_does_not_start_again() {
+    let (base, _) = serve(SUMS, SIGN, ISO, KEY, false, false, false);
+    let (status, first, dir) = run(&base);
+    assert_eq!(status, 0, "{first:?}");
+    let screen = finish(&first, status);
+    let before = screen.steps.iter().map(|step| step.state.clone()).collect::<Vec<_>>();
+    std::fs::remove_file(dir.join("cache").join(iso_name())).unwrap();
+    std::fs::remove_file(dir.join("snapshots/debian/disk.img")).unwrap();
+    assert_eq!(
+        screen.steps.iter().map(|step| step.state.clone()).collect::<Vec<_>>(),
+        before,
+        "deleting a file does not rewind the wizard"
+    );
+    assert!(screen.ready_path.is_some());
+    assert_eq!(screen.buttons(), ["Reset"]);
+    assert!(!screen.running);
+}
+
+#[test]
+fn a_second_run_reuses_the_cache_and_rewrites_a_missing_disk() {
+    let (base, world) = serve(SUMS, SIGN, ISO, KEY, false, false, false);
+    let (status, events, dir) = run(&base);
+    assert_eq!(status, 0, "{events:?}");
+    let disk = dir.join("snapshots/debian/disk.img");
+    let screen = finish(&events, status);
+    assert!(screen.installing());
+    std::fs::remove_file(&disk).unwrap();
+    std::fs::write(dir.join("ssh/ssh-ok"), b"debian ok\n").unwrap();
+    let _ = log_of(&world);
+    let (status, events) = wait(spawn(&base, &dir));
+    assert_eq!(status, 0, "{events:?}");
+    assert!(
+        log_of(&world).is_empty(),
+        "a missing guest disk does not download the ISO again"
+    );
+    assert!(events.iter().any(|event| event["step"] == "key" && event["state"] == "now"));
+    assert!(events.iter().any(|event| event["step"] == "disk" && event["state"] == "now"));
+    let screen = finish(&events, status);
+    assert!(disk.is_file(), "prepare the guest disk must write disk.img again");
+    assert_eq!(screen.disk_path.as_deref(), Some(disk.to_str().unwrap()));
+    assert!(screen.installing());
+    assert_eq!(screen.row("disk").state, "done");
+    assert!(
+        !std::fs::read_dir(dir.join("ssh"))
+            .unwrap()
+            .flatten()
+            .any(|item| item.file_name() == "ssh-ok"),
+        "a new empty disk must not inherit the previous login"
+    );
+}
+
+#[test]
+fn a_full_run_reuses_cached_files_and_rewrites_missing_ones() {
+    let help = cli(&["download", "--help"]);
+    assert!(!String::from_utf8_lossy(&help.stdout).contains("--from"));
     let (base, world) = serve(SUMS, SIGN, ISO, KEY, false, false, false);
     let (status, events, dir) = run(&base);
     assert_eq!(status, 0, "{events:?}");
     let cache = dir.join("cache");
-    let iso = cache.join(iso_name());
-    let mut screen = finish(&events, status);
-    assert!(!screen.cache_went_away(&cache));
-    assert!(screen.ready_path.is_some());
+    std::fs::remove_file(dir.join("installer/preseed.img")).unwrap();
+    std::fs::remove_file(dir.join("installer/boot.iso")).unwrap();
     std::fs::remove_file(cache.join("SHA512SUMS")).unwrap();
-    assert!(
-        !screen.cache_went_away(&cache),
-        "the finished path is the ISO, not the checksum file"
-    );
-    std::fs::remove_file(&iso).unwrap();
-    assert!(screen.cache_went_away(&cache));
-    assert!(screen.steps.iter().all(|step| step.state == "wait"));
-    assert!(!screen.bar_visible());
-    assert!(screen.ready_path.is_none());
-    assert!(screen.headline.is_none());
-    assert_eq!(screen.buttons(), ["Open cache folder", "Cancel"]);
-    assert!(screen.running);
     let _ = log_of(&world);
     let (status, events) = wait(spawn(&base, &dir));
     assert_eq!(status, 0, "{events:?}");
-    assert!(log_of(&world).iter().any(|line| line.contains(".iso")));
-    let screen = finish(&events, status);
-    assert!(screen.bar_visible());
-    assert_eq!(screen.percent(), 100);
-    assert_eq!(
-        screen.ready_path.as_deref(),
-        Some(iso.display().to_string()).as_deref()
-    );
-    assert_eq!(screen.buttons(), ["Open cache folder"]);
-
-    let mut running = drive(
-        &events[..events
-            .iter()
-            .position(|event| event["step"] == "download" && event["state"] == "now")
-            .unwrap()
-            + 1],
-    );
-    assert!(running.running && running.ready_path.is_none());
-    std::fs::remove_dir_all(&cache).unwrap();
+    let log = log_of(&world);
     assert!(
-        !running.cache_went_away(&cache),
-        "do not clear ticks while the download is still running"
+        log.iter().any(|line| line.contains("SHA512SUMS")) && log.iter().all(|line| !line.contains(".iso")),
+        "a missing checksum is fetched again, the ISO is not: {log:?}"
     );
-    assert!(running.steps.iter().any(|step| step.state == "done"));
+    assert!(events.iter().any(|event| event["step"] == "key" && event["state"] == "now"));
+    assert!(events.iter().any(|event| event["step"] == "preseed" && event["state"] == "now"));
+    assert!(events.iter().any(|event| event["step"] == "patch" && event["state"] == "now"));
+    let screen = finish(&events, status);
+    assert!(dir.join("installer/preseed.img").is_file());
+    assert!(dir.join("installer/boot.iso").is_file());
+    assert!(!cache.join("preseed.img").exists());
+    assert_eq!(screen.row("preseed").state, "done");
+    assert_eq!(screen.row("patch").state, "done");
+    assert!(screen.installing());
+}
+
+/// Reset keeps the download cache and rebuilds the image. A plain second run still reuses the disk.
+#[test]
+fn reset_keeps_the_download_cache_and_rebuilds_the_image() {
+    let (base, world) = serve(SUMS, SIGN, ISO, KEY, false, false, false);
+    let (status, events, dir) = run(&base);
+    assert_eq!(status, 0, "{events:?}");
+    let iso = std::fs::read(dir.join("cache").join(iso_name())).unwrap();
+    let disk = dir.join("snapshots/debian/disk.img");
+    std::fs::write(&disk, b"already installed").unwrap();
+    std::fs::write(dir.join("snapshots/debian/ready"), b"ssh-ok\n").unwrap();
+    std::fs::write(dir.join("installer/preseed.img"), b"old preseed").unwrap();
+    std::fs::write(dir.join("installer/boot.iso"), b"old boot").unwrap();
+    std::fs::write(dir.join("ssh/ssh-ok"), b"debian ok\n").unwrap();
+    let finished = finish(&events, status);
+    assert!(finished.installing());
+    assert!(snapshot_ready(&disk), "a saved snapshot skips Install guest");
+    assert!(!reopen_boot(disk.to_str().unwrap()).starts_vm);
+
+    let _ = log_of(&world);
+    let (status, again) = wait(rebuild(&base, &dir));
+    assert_eq!(status, 0, "{again:?}");
+    assert!(log_of(&world).is_empty(), "reset must not download the ISO again");
+    assert_eq!(std::fs::read(dir.join("cache").join(iso_name())).unwrap(), iso);
+    assert!(dir.join("cache/SHA512SUMS").is_file());
+    assert!(dir.join("cache/SHA512SUMS.sign").is_file());
+    assert!(dir.join("cache/key-DA87E80D6294BE9B.txt").is_file());
+    assert_eq!(std::fs::metadata(&disk).unwrap().len(), 16 * 1024 * 1024 * 1024);
+    assert_ne!(std::fs::read(dir.join("installer/preseed.img")).unwrap(), b"old preseed");
+    assert_ne!(std::fs::read(dir.join("installer/boot.iso")).unwrap(), b"old boot");
+    assert!(!dir.join("snapshots/debian/ready").exists());
+    assert!(!dir.join("ssh/ssh-ok").exists(), "the old login does not belong to the new disk");
+    for step in ["key", "sums", "sign", "check", "download", "verify", "sshkey", "preseed", "disk", "patch"] {
+        assert!(again.iter().any(|event| event["step"] == step && event["state"] == "now"), "{step}");
+    }
+    let mut screen = finished;
+    screen.reset_wizard();
+    assert_eq!(screen.run_id, 1);
+    assert!(screen.rebuild, "Reset passes --rebuild; opening the window does not");
+    assert!(screen.steps.iter().all(|step| step.state == "wait"));
+    for event in &again {
+        screen.apply(event);
+    }
+    screen.worker_exited(status);
+    assert!(screen.installing());
+    assert_eq!(screen.disk_path.as_deref(), Some(disk.to_str().unwrap()));
+    assert!(!snapshot_ready(&disk));
+    let boot = reopen_boot(disk.to_str().unwrap());
+    assert!(boot.starts_vm, "the rebuilt image starts the installer again");
+    assert!(!boot.snapshot_saved);
+
+    // A plain second run still reuses the disk, the preseed, and the installer copy.
+    std::fs::write(&disk, b"kept").unwrap();
+    std::fs::write(dir.join("installer/preseed.img"), b"kept preseed").unwrap();
+    std::fs::write(dir.join("installer/boot.iso"), b"kept boot").unwrap();
+    let _ = log_of(&world);
+    let (status, reused) = wait(spawn(&base, &dir));
+    assert_eq!(status, 0, "{reused:?}");
+    assert!(log_of(&world).is_empty());
+    assert_eq!(std::fs::read(&disk).unwrap(), b"kept");
+    assert_eq!(std::fs::read(dir.join("installer/preseed.img")).unwrap(), b"kept preseed");
+    assert_eq!(std::fs::read(dir.join("installer/boot.iso")).unwrap(), b"kept boot");
+    assert!(reused.iter().any(|event| event["step"] == "preseed" && event["state"] == "done"));
+    let mut plain = Screen::new();
+    plain.start();
+    assert!(!plain.rebuild);
+    assert_eq!(plain.run_id, 0);
 }
 
 #[test]
@@ -1294,9 +2053,13 @@ fn the_window_ignores_checksum_bytes_and_formats_its_own() {
     let mut screen = Screen::new();
     assert!(!screen.bar_visible());
     assert!(screen.headline.is_none());
-    assert_eq!(screen.buttons(), ["Open cache folder", "Cancel"]);
+    assert_eq!(screen.buttons(), ["Reset", "Cancel"]);
     assert_eq!(screen.row("key").title, "Download OpenPGP keyring");
-    assert_eq!(screen.row("download").detail, iso_glob());
+    assert_eq!(screen.row("download").title, "Download ISO");
+    assert_eq!(screen.row("verify").title, "Verify checksum");
+    assert_eq!(screen.row("check").title, "Verify signature");
+    assert_eq!(screen.row("ssh").title, "Verify with host key");
+    assert_eq!(screen.row("partition").title, "Install guest");
     screen.start();
     screen.apply(&serde_json::json!({"event": "progress", "step": "verify", "received": 5_000_000_000u64, "total": 5_000_000_000u64}));
     assert!(!screen.bar_visible());
@@ -1327,7 +2090,7 @@ fn the_window_ignores_checksum_bytes_and_formats_its_own() {
         screen.bar_visible(),
         "cancel does not wipe a bar that was already on screen"
     );
-    assert_eq!(screen.buttons(), ["Open cache folder", "Try again"]);
+    assert_eq!(screen.buttons(), ["Reset", "Try again"]);
 
     let mut missing = Screen::new();
     missing.worker_missing();
@@ -1337,7 +2100,8 @@ fn the_window_ignores_checksum_bytes_and_formats_its_own() {
     );
     assert_eq!(missing.headline.as_deref(), Some("Could not start"));
     assert_eq!(missing.row("key").state, "fail");
-    assert_eq!(missing.buttons(), ["Open cache folder", "Try again"]);
+    assert_eq!(missing.shown("download"), "fail");
+    assert_eq!(missing.buttons(), ["Reset", "Try again"]);
     assert!(!missing.bar_visible());
     missing.worker_missing();
     assert_eq!(
@@ -1345,6 +2109,43 @@ fn the_window_ignores_checksum_bytes_and_formats_its_own() {
         "fail",
         "a second start does not run again"
     );
+}
+
+/// The row the user sees is its title and one status word. A path is not that word.
+#[test]
+fn a_worker_path_does_not_become_the_status_word() {
+    let src = include_str!("../Sources/QuickStart.swift");
+    assert!(!src.contains("func rowLabel"));
+    assert!(!src.contains("WrappingPath(text: rowLabel"));
+    assert!(src.contains("static func status"));
+    let mut screen = Screen::new();
+    assert_eq!(screen.status("download"), "Waiting");
+    assert_eq!(screen.status("partition"), "Waiting");
+    assert_eq!(screen.status("snapshot"), "Waiting");
+    for (id, path) in [
+        ("check", "cache/SHA512SUMS.sign"),
+        ("verify", "cache/SHA512SUMS"),
+        ("partition", "snapshots/debian/disk.img"),
+        ("ssh", "snapshots/debian/ssh-ok"),
+        ("download", "cache/debian-13.7.0-amd64-netinst.iso"),
+    ] {
+        let title = screen.row(id).title;
+        screen.apply(&serde_json::json!({"event": "detail", "step": id, "detail": path}));
+        screen.apply(&serde_json::json!({"event": "step", "step": id, "state": "now", "detail": format!("/tmp/{path}")}));
+        assert_eq!(screen.row(id).title, title);
+        assert_eq!(screen.row(id).state, "now");
+        let word = screen.status(face_of(id));
+        assert!(!word.contains('/'), "{word}");
+        assert_ne!(word, "Waiting");
+    }
+    assert_eq!(screen.status("download"), "Downloading");
+    screen.apply(&serde_json::json!({"event": "error", "step": "verify", "detail": "/tmp/cache/SHA512SUMS"}));
+    assert_eq!(screen.row("verify").state, "fail");
+    assert_eq!(screen.row("verify").title, "Verify checksum");
+    assert_eq!(screen.status("download"), "Failed");
+    screen.apply(&serde_json::json!({"event": "step", "step": "check", "state": "done", "detail": "Signature is valid"}));
+    assert_eq!(screen.row("check").state, "done");
+    assert_eq!(screen.row("check").title, "Verify signature");
 }
 
 /// The ISO bar is on screen while the mirror is still holding the response.
@@ -1397,7 +2198,7 @@ fn the_download_bar_shows_when_the_iso_step_starts() {
     assert!(!at_step.bar_visible());
     let screen = drive(&started);
     assert_eq!(screen.row("download").state, "now");
-    assert_eq!(screen.row("download").detail, iso_name());
+    assert_eq!(screen.row("download").title, "Download ISO");
     assert!(screen.bar_visible());
     assert!(!screen.shows_percent());
     assert_eq!(screen.received, 0.0);
@@ -1424,8 +2225,10 @@ fn the_download_bar_shows_when_the_iso_step_starts() {
             byte_count(ISO.len() as f64)
         )
     );
-    assert_eq!(screen.row("download").state, "done");
+    assert_eq!(screen.page, 0);
+    assert_eq!(screen.row("preseed").state, "done");
     assert_eq!(screen.ready_path.as_deref(), Some(iso_path(&dir).as_str()));
+    assert!(screen.installing());
 }
 
 /// Headers can name the size while the body is still held. The bar shows that size immediately.
@@ -1462,9 +2265,7 @@ fn the_download_bar_shows_the_size_before_any_body_byte() {
         screen.bytes_label(),
         format!("0 KB of {}", byte_count(ISO.len() as f64))
     );
-    let partial = dir
-        .join("cache")
-        .join(format!("{}.partial", iso_name()));
+    let partial = dir.join("cache").join(format!("{}.partial", iso_name()));
     assert_eq!(std::fs::metadata(&partial).unwrap().len(), 0);
 
     more(&world, None);
@@ -1475,7 +2276,10 @@ fn the_download_bar_shows_the_size_before_any_body_byte() {
     assert!(screen.shows_percent());
     assert_eq!(screen.percent(), 100);
     assert_eq!(screen.received, ISO.len() as f64);
-    assert_eq!(std::fs::read(dir.join("cache").join(iso_name())).unwrap(), ISO);
+    assert_eq!(
+        std::fs::read(dir.join("cache").join(iso_name())).unwrap(),
+        ISO
+    );
     assert!(!partial.exists());
 }
 
@@ -1498,7 +2302,10 @@ fn the_download_bar_shows_partial_bytes_before_the_body_finishes() {
             && event["step"] == "download"
             && num(&event["total"]) == Some(0.0)
     });
-    assert!(connecting.is_some(), "bar must appear before the size is known");
+    assert!(
+        connecting.is_some(),
+        "bar must appear before the size is known"
+    );
     assert!(drive(&sized[..=connecting.unwrap()]).bar_visible());
     assert!(!drive(&sized[..=connecting.unwrap()]).shows_percent());
     let empty = drive(&sized);
@@ -1544,7 +2351,10 @@ fn the_download_bar_shows_partial_bytes_before_the_body_finishes() {
     assert!(screen.bar_visible());
     assert_eq!(screen.percent(), 100);
     assert_eq!(screen.received, ISO.len() as f64);
-    assert_eq!(std::fs::read(dir.join("cache").join(iso_name())).unwrap(), ISO);
+    assert_eq!(
+        std::fs::read(dir.join("cache").join(iso_name())).unwrap(),
+        ISO
+    );
     assert!(!partial.exists());
 }
 
@@ -1587,7 +2397,10 @@ fn a_resume_shows_the_download_bar_before_the_range_response() {
     assert!(screen.bar_visible());
     assert_eq!(screen.percent(), 100);
     assert_eq!(screen.received, ISO.len() as f64);
-    assert_eq!(std::fs::read(dir.join("cache").join(iso_name())).unwrap(), ISO);
+    assert_eq!(
+        std::fs::read(dir.join("cache").join(iso_name())).unwrap(),
+        ISO
+    );
 }
 
 #[test]
@@ -1602,9 +2415,8 @@ fn a_cached_iso_does_not_show_the_download_bar() {
     let (status, again) = wait(spawn(&base, &dir));
     assert_eq!(status, 0, "{again:?}");
     let again_log = log_of(&world);
-    assert_eq!(
-        again_log.len(),
-        3,
+    assert!(
+        again_log.is_empty(),
         "cached iso was fetched again: {again_log:?}"
     );
     assert!(again
@@ -1626,8 +2438,693 @@ fn a_cached_iso_does_not_show_the_download_bar() {
     assert_eq!(screen.total, 0.0);
     assert_eq!(screen.bytes_label(), "");
     assert_eq!(screen.ready_path.as_deref(), Some(iso_path(&dir).as_str()));
+    assert!(screen.installing());
+    assert_eq!(screen.page, 0);
+    assert_eq!(screen.row("preseed").state, "done");
+    assert_eq!(screen.page_rows(), ["download", "partition", "snapshot"]);
+    screen.show_log = true;
+    assert_eq!(screen.page_rows(), ["download", "partition", "snapshot"]);
+}
+
+/// Reopen is a new process. The ISO is cached, so the worker is fast, then the window
+/// builds Install again. A partition table is not a finished guest. The wizard runs the installer again.
+/// A saved snapshot is the finished installer. Reopening that disk does not start it.
+#[test]
+fn reopening_quick_start_boots_the_installed_disk() {
+    let (base, _) = serve(SUMS, SIGN, ISO, KEY, false, false, false);
+    let dir = dir();
+    let (status, events) = wait(spawn(&base, &dir));
+    assert_eq!(status, 0, "{events:?}");
+    let disk = dir.join("snapshots/debian/disk.img");
+    let mut file = std::fs::OpenOptions::new().write(true).open(&disk).unwrap();
+    use std::io::{Seek, SeekFrom, Write};
+    file.seek(SeekFrom::Start(510)).unwrap();
+    file.write_all(&[0x55, 0xaa]).unwrap();
+    drop(file);
+
+    let (status, again) = wait(spawn(&base, &dir));
+    assert_eq!(status, 0, "{again:?}");
+    let screen = finish(&again, status);
+    assert!(screen.installing());
+    assert_eq!(screen.disk_path.as_deref(), Some(disk.to_str().unwrap()));
+    let boot = reopen_boot(screen.disk_path.as_deref().unwrap());
+    assert_eq!(boot.headline.as_deref(), Some("Starting the installer."));
+    assert!(!boot.installed, "a partition table is not a finished guest");
+    assert!(boot.attaches_installer, "{boot:?}");
+    assert!(
+        !boot.captures_pointer,
+        "quick start starts the installer with no pointer"
+    );
+    assert!(!boot.checks_ssh);
+    assert!(boot.starts_vm);
+
+    std::fs::write(disk.parent().unwrap().join("ssh-ok"), b"debian ok\n").unwrap();
+    let boot = reopen_boot(disk.to_str().unwrap());
+    assert_eq!(boot.headline.as_deref(), Some("Starting the installer."));
+    assert!(
+        !boot.installed,
+        "a leftover login file is not a finished guest"
+    );
+    assert!(boot.attaches_installer, "{boot:?}");
+    assert!(!boot.checks_ssh);
+    assert!(
+        !boot.captures_pointer,
+        "quick start starts the installer with no pointer"
+    );
+    assert!(!boot.snapshot_saved);
+    assert!(boot.starts_vm);
+
+    std::fs::create_dir_all(dir.join("snapshots/debian")).unwrap();
+    std::fs::write(dir.join("snapshots/debian/ready"), b"ssh-ok\n").unwrap();
+    let boot = reopen_boot(disk.to_str().unwrap());
+    assert!(boot.snapshot_saved, "{boot:?}");
+    assert!(
+        !boot.starts_vm,
+        "a saved snapshot must not start the installer virtual machine"
+    );
+    assert!(!boot.attaches_installer);
+    assert!(!boot.captures_pointer);
+    assert!(!boot.checks_ssh);
+    assert_eq!(
+        boot.headline.as_deref(),
+        Some("Debian is installed and shut down. A snapshot is saved for new machines.")
+    );
+
+    std::fs::remove_file(&disk).unwrap();
+    std::fs::remove_file(dir.join("snapshots/debian/ready")).unwrap();
+    std::fs::write(dir.join("ssh/ssh-ok"), b"debian ok\n").unwrap();
+    let (status, fresh) = wait(spawn(&base, &dir));
+    assert_eq!(status, 0, "{fresh:?}");
+    assert!(
+        !dir.join("ssh/ssh-ok").exists(),
+        "recreating disk.img must drop the login that belonged to the deleted disk"
+    );
+    let boot = reopen_boot(dir.join("snapshots/debian/disk.img").to_str().unwrap());
+    assert!(!boot.installed);
+    assert!(boot.attaches_installer);
+    assert!(!boot.captures_pointer);
+    assert!(!boot.checks_ssh);
+    assert!(boot.starts_vm);
+    assert!(!boot.snapshot_saved);
+    assert_eq!(boot.headline.as_deref(), Some("Starting the installer."));
+}
+
+/// Debian setup, the page Quick start shows once the worker is ready.
+/// Same rules as Install.swift. The worker is not asked to boot a virtual machine.
+#[derive(Debug)]
+struct Setup {
+    title: &'static str,
+    headline: Option<String>,
+    error: Option<String>,
+    steps: Vec<Step>,
+    installed: bool,
+    logged_in: bool,
+    stopped: bool,
+    snapshot_ready: bool,
+    from_snapshot: bool,
+    show_window: bool,
+    started: bool,
+    checking: bool,
+    /// Disks attached for a fresh install. Empty unless the installer starts. The signed ISO is not one of them.
+    attached: Vec<String>,
+}
+
+fn setup_steps() -> Vec<Step> {
+    vec![
+        Step {
+            id: "partition",
+            title: "Install guest",
+            state: "wait".into(),
+        },
+        Step {
+            id: "ssh",
+            title: "Verify with host key",
+            state: "wait".into(),
+        },
+        Step {
+            id: "snapshot",
+            title: "Create snapshot",
+            state: "wait".into(),
+        },
+    ]
+}
+
+fn setup_page(from_snapshot: bool) -> Setup {
+    Setup {
+        title: if from_snapshot {
+            "Debian"
+        } else {
+            "Debian setup"
+        },
+        headline: None,
+        error: None,
+        steps: setup_steps(),
+        installed: from_snapshot,
+        logged_in: from_snapshot,
+        stopped: false,
+        snapshot_ready: false,
+        from_snapshot,
+        show_window: false,
+        started: false,
+        checking: false,
+        attached: Vec::new(),
+    }
+}
+
+impl Setup {
+    fn row(&self, id: &str) -> &Step {
+        self.steps.iter().find(|step| step.id == id).unwrap()
+    }
+
+    /// A row has no Open button.
+    fn row_buttons(&self, id: &str, dir: &Path) -> Vec<&'static str> {
+        let _ = (id, dir);
+        vec![]
+    }
+
+    /// The installer is drawn on Install guest, not above the list.
+    fn thumbnail_row(&self) -> Option<&'static str> {
+        if self.shows_installer() {
+            Some("partition")
+        } else {
+            None
+        }
+    }
+
+    fn shows_installer(&self) -> bool {
+        !self.from_snapshot && !self.snapshot_ready && !self.show_window
+    }
+
+    fn captures_pointer(&self) -> bool {
+        self.from_snapshot
+    }
+
+    fn mark(&mut self, id: &str, state: &str) {
+        let Some(index) = self.steps.iter().position(|step| step.id == id) else {
+            return;
+        };
+        self.steps[index].state = state.to_string();
+        if state == "done" || state == "now" {
+            for earlier in 0..index {
+                if self.steps[earlier].state != "done" && self.steps[earlier].state != "fail" {
+                    self.steps[earlier].state = "done".into();
+                }
+            }
+        }
+    }
+
+    fn fail_current(&mut self) {
+        let index = self
+            .steps
+            .iter()
+            .position(|step| step.state == "now")
+            .or_else(|| self.steps.iter().position(|step| step.state == "wait"));
+        if let Some(index) = index {
+            self.steps[index].state = "fail".into();
+        }
+    }
+
+    /// Deleting a file does not start a step again. Reset is the only restart.
+
+    fn hold_finished(&mut self, disk: &str) {
+        self.started = true;
+        self.stopped = true;
+        self.installed = true;
+        self.logged_in = true;
+        self.snapshot_ready = true;
+        self.checking = false;
+        self.show_window = false;
+        self.error = None;
+        self.headline =
+            Some("Debian is installed and shut down. A snapshot is saved for new machines.".into());
+        self.mark("partition", "done");
+        self.mark("ssh", "done");
+        self.mark("snapshot", "done");
+        let _ = disk;
+    }
+
+    /// Install.onAppear. A saved snapshot does not start. Running the wizard again starts the installer.
+    fn appear(&mut self, iso: &str, disk: &str) {
+        if self.snapshot_ready && !self.from_snapshot {
+            self.hold_finished(disk);
+        } else if self.from_snapshot {
+            self.boot_disk(disk, true);
+        } else {
+            self.start(iso, disk);
+        }
+    }
+
+    fn start(&mut self, iso: &str, disk: &str) {
+        if self.started {
+            return;
+        }
+        self.started = true;
+        self.error = None;
+        self.stopped = false;
+        if self.snapshot_ready {
+            self.hold_finished(disk);
+            return;
+        }
+        // A partition table or a leftover login file is not a finished guest. Attach the installer again.
+        self.steps = setup_steps();
+        self.mark("partition", "now");
+        self.headline = Some("Starting the installer.".into());
+        // The signed ISO lives in cache/. boot.iso and preseed.img are in installer/, not that cache.
+        let support = Path::new(iso)
+            .parent()
+            .and_then(|cache| cache.parent())
+            .unwrap();
+        self.attached = vec![
+            support.join("installer/boot.iso").display().to_string(),
+            support.join("installer/preseed.img").display().to_string(),
+        ];
+    }
+
+    fn boot_disk(&mut self, disk: &str, pointer: bool) {
+        if self.started {
+            return;
+        }
+        self.started = true;
+        self.installed = true;
+        self.logged_in = guest_logged_in(Path::new(disk)) || self.from_snapshot;
+        self.checking = true;
+        self.stopped = false;
+        self.error = None;
+        if !self.from_snapshot && snapshot_ready(Path::new(disk)) {
+            self.hold_finished(disk);
+            return;
+        }
+        let _ = pointer;
+        self.headline = Some(if self.from_snapshot {
+            "Starting Debian.".into()
+        } else {
+            "Debian is already installed. Checking SSH.".into()
+        });
+        self.mark("partition", "done");
+        self.mark("ssh", "now");
+    }
+
+    fn buttons(&self) -> Vec<&'static str> {
+        let mut buttons = Vec::new();
+        if self.stopped {
+            if !self.snapshot_ready {
+                buttons.push(if self.installed {
+                    "Start Debian"
+                } else {
+                    "Start from the guest disk"
+                });
+            }
+            if self.snapshot_ready {
+                buttons.push("New virtual machine");
+            }
+            if self.error.is_some() && self.installed && !self.snapshot_ready {
+                buttons.push("Save snapshot");
+            }
+            if self.error.is_some() && !self.installed && !self.from_snapshot {
+                buttons.push("Try again");
+            }
+        }
+        buttons
+    }
+}
+
+
+fn open_setup(screen: &Screen, dir: &Path) -> Setup {
+    assert!(screen.installing());
+    let disk = screen.disk_path.as_deref().unwrap();
+    // A partition table or a leftover login file does not skip Install guest. The snapshot does.
+    let saved = snapshot_ready(Path::new(disk));
+    let mut page = setup_page(false);
+    page.installed = saved;
+    page.logged_in = guest_logged_in(Path::new(disk)) || saved;
+    page.snapshot_ready = saved;
+    if saved {
+        page.stopped = true;
+        page.headline =
+            Some("Debian is installed and shut down. A snapshot is saved for new machines.".into());
+        page.mark("partition", "done");
+        page.mark("ssh", "done");
+        page.mark("snapshot", "done");
+    } else {
+        page.headline = Some("Starting the installer.".into());
+    }
+    page.appear(screen.ready_path.as_deref().unwrap(), disk);
+    let _ = dir;
+    page
+}
+
+fn open_clone(disk: &str) -> Setup {
+    let mut page = setup_page(true);
+    page.snapshot_ready = false;
+    page.headline = Some("Starting Debian.".into());
+    page.appear("", disk);
+    page
+}
+
+#[test]
+fn the_setup_page_hides_the_installer_once_the_snapshot_is_saved() {
+    let (base, _) = serve(SUMS, SIGN, ISO, KEY, false, false, false);
+    let (status, events, dir) = run(&base);
+    assert_eq!(status, 0, "{events:?}");
+    let screen = finish(&events, status);
+    let mut setup = open_setup(&screen, &dir);
+    assert_eq!(setup.title, "Debian setup");
+    assert!(setup.shows_installer());
+    assert_eq!(setup.thumbnail_row(), Some("partition"));
+    assert!(!setup.captures_pointer());
+    assert_eq!(setup.buttons(), [] as [&str; 0]);
+    assert_eq!(setup.row("partition").state, "now");
+    assert_eq!(setup.row("partition").title, "Install guest");
+    // The guest disk is already there. Open stays hidden until this step ticks.
+    assert!(dir.join("snapshots/debian/disk.img").is_file());
+    assert_eq!(setup.row_buttons("partition", &dir), [] as [&str; 0]);
+    assert_eq!(setup.row_buttons("snapshot", &dir), [] as [&str; 0]);
+    assert_eq!(setup.row_buttons("ssh", &dir), [] as [&str; 0]);
+    setup.show_window = true;
+    assert!(!setup.shows_installer(), "the open window holds the only guest view");
+    assert_eq!(setup.thumbnail_row(), None);
+    assert_eq!(setup.buttons(), [] as [&str; 0]);
+
+    let disk = dir.join("snapshots/debian/disk.img");
+    let mut file = std::fs::OpenOptions::new().write(true).open(&disk).unwrap();
+    use std::io::{Seek, SeekFrom, Write};
+    file.seek(SeekFrom::Start(510)).unwrap();
+    file.write_all(&[0x55, 0xaa]).unwrap();
+    drop(file);
+    let written = open_setup(&screen, &dir);
+    assert_eq!(written.headline.as_deref(), Some("Starting the installer."));
+    assert!(written.shows_installer());
+    assert_eq!(written.thumbnail_row(), Some("partition"));
+    assert!(!written.checking, "a partition table does not skip Install guest");
+    assert!(!written.stopped);
+    assert_eq!(written.buttons(), [] as [&str; 0]);
+    assert!(
+        !written.attached.is_empty(),
+        "running the wizard again attaches the installer"
+    );
+
+    std::fs::write(dir.join("ssh/ssh-ok"), b"debian ok\n").unwrap();
+    let saved = cli(&["snapshot", "--dir", dir.to_str().unwrap()]);
+    assert!(
+        saved.status.success(),
+        "{}",
+        String::from_utf8_lossy(&saved.stdout)
+    );
+    let done = finish_install(&saved.stdout);
+    assert!(!done.shows_installer);
+    assert_eq!(
+        done.buttons(),
+        ["New virtual machine"]
+    );
+    assert_eq!(done.row("partition").state, "done");
+    assert_eq!(done.row("snapshot").state, "done");
+    let reopened = open_setup(&screen, &dir);
+    assert!(reopened.snapshot_ready);
+    assert!(!reopened.shows_installer());
+    assert_eq!(reopened.thumbnail_row(), None);
+    assert!(!reopened.checking);
+    assert!(reopened.stopped);
+    assert_eq!(
+        reopened.buttons(),
+        ["New virtual machine"]
+    );
+    assert_eq!(
+        reopened.headline.as_deref(),
+        Some("Debian is installed and shut down. A snapshot is saved for new machines.")
+    );
+    assert_eq!(reopened.row("partition").state, "done");
+    assert_eq!(
+        reopened.row_buttons("partition", &dir),
+        [] as [&str; 0],
+        "Install guest has no Open"
+    );
+    assert_eq!(reopened.row_buttons("snapshot", &dir), [] as [&str; 0]);
+    assert!(dir.join("snapshots/debian/ssh-ok").is_file());
+    assert_eq!(reopened.row_buttons("ssh", &dir), [] as [&str; 0]);
+}
+
+/// A leftover guest disk and snapshot are not a finished step. Open appears only after the tick.
+#[test]
+fn open_waits_for_the_tick_even_when_the_file_is_already_there() {
+    let dir = dir();
+    let disk = dir.join("snapshots/debian/disk.img");
+    std::fs::create_dir_all(disk.parent().unwrap()).unwrap();
+    std::fs::write(&disk, b"disk").unwrap();
+    std::fs::create_dir_all(dir.join("snapshots/debian")).unwrap();
+    std::fs::write(dir.join("snapshots/debian/ready"), b"ssh-ok\n").unwrap();
+    std::fs::create_dir_all(dir.join("cache")).unwrap();
+    std::fs::write(dir.join("cache").join(iso_name()), b"iso").unwrap();
+
+    let mut screen = Screen::new();
+    screen.start();
+    assert_eq!(screen.row("partition").state, "wait");
+    assert_eq!(screen.row("snapshot").state, "wait");
+    assert_eq!(screen.row_buttons("partition", &dir), [] as [&str; 0]);
+    assert_eq!(screen.row_buttons("snapshot", &dir), [] as [&str; 0]);
+    assert_eq!(screen.row_buttons("download", &dir), [] as [&str; 0]);
+
+    screen.apply(&serde_json::json!({
+        "event": "step",
+        "step": "download",
+        "state": "done"
+    }));
     assert_eq!(screen.row("download").state, "done");
-    assert_eq!(screen.row("download").detail, iso_name());
+    assert_eq!(screen.row("download").title, "Download ISO");
+    assert_eq!(screen.row_buttons("download", &dir), [] as [&str; 0]);
+    assert_eq!(screen.row_buttons("partition", &dir), [] as [&str; 0]);
+    assert_eq!(screen.row_buttons("snapshot", &dir), [] as [&str; 0]);
+
+    screen.apply(&serde_json::json!({
+        "event": "step",
+        "step": "partition",
+        "state": "now",
+        "detail": "Installing"
+    }));
+    assert_eq!(screen.row_buttons("partition", &dir), [] as [&str; 0]);
+    screen.apply(&serde_json::json!({
+        "event": "step",
+        "step": "partition",
+        "state": "done",
+        "detail": "Installed"
+    }));
+    assert_eq!(screen.row("partition").state, "done");
+    assert_eq!(screen.row("partition").title, "Install guest");
+    assert_eq!(screen.row_buttons("partition", &dir), [] as [&str; 0]);
+
+    screen.apply(&serde_json::json!({"event": "step", "step": "disk", "state": "done"}));
+    assert_eq!(screen.row_buttons("disk", &dir), [] as [&str; 0]);
+    assert_eq!(screen.row("snapshot").title, "Create snapshot");
+    screen.apply(&serde_json::json!({"event": "step", "step": "snapshot", "state": "done"}));
+    assert_eq!(screen.row("snapshot").state, "done");
+    assert_eq!(screen.row("snapshot").title, "Create snapshot");
+    assert_eq!(screen.row_buttons("snapshot", &dir), [] as [&str; 0]);
+    std::fs::remove_dir_all(dir.join("snapshots/debian")).unwrap();
+    assert_eq!(screen.row_buttons("snapshot", &dir), [] as [&str; 0]);
+    assert!(
+        !screen.shows_thumbnail("partition", &dir, true, false),
+        "a saved snapshot hides the installer"
+    );
+    assert!(
+        screen.shows_thumbnail("partition", &dir, false, false),
+        "removing the snapshot shows the installer on Install guest"
+    );
+    assert_eq!(screen.top_slot(false, false), "empty");
+    assert!(!screen.shows_thumbnail("partition", &dir, false, true));
+    screen.show_log = false;
+    screen.apply(&serde_json::json!({"event": "step", "step": "partition", "state": "wait"}));
+    assert!(
+        screen.shows_thumbnail("partition", &dir, false, false),
+        "a waiting install row still shows the installer"
+    );
+    assert_eq!(screen.top_slot(true, false), "empty");
+
+    let mut setup = setup_page(false);
+    setup.mark("partition", "now");
+    assert_eq!(setup.row_buttons("partition", &dir), [] as [&str; 0]);
+    assert_eq!(setup.row_buttons("snapshot", &dir), [] as [&str; 0]);
+    std::fs::create_dir_all(disk.parent().unwrap()).unwrap();
+    std::fs::write(&disk, b"disk").unwrap();
+    setup.mark("partition", "done");
+    assert_eq!(
+        setup.row_buttons("partition", &dir),
+        [] as [&str; 0],
+        "Install guest has no Open"
+    );
+    assert_eq!(setup.row_buttons("snapshot", &dir), [] as [&str; 0]);
+    setup.mark("snapshot", "done");
+    std::fs::create_dir_all(dir.join("snapshots/debian")).unwrap();
+    assert_eq!(setup.row_buttons("snapshot", &dir), [] as [&str; 0]);
+    assert_eq!(setup.row_buttons("ssh", &dir), [] as [&str; 0]);
+}
+
+/// There is no Open button and no Open folder button.
+#[test]
+fn there_is_no_open_button() {
+    let src = include_str!("../Sources/QuickStart.swift");
+    assert!(!src.contains("Button(\"Open"));
+    assert!(!src.contains("func openFolder"));
+    assert!(!src.contains("func launchOpen"));
+    assert!(!include_str!("../Sources/Install.swift").contains("Button(\"Open"));
+}
+
+/// Same choice as Install.onAppear after Quick start emits ready.
+/// A partition table, a leftover login file, or a hash of the disk is not a finished guest.
+/// Running the wizard again starts the installer. snapshots/debian/ready is the only skip.
+fn reopen_boot(disk: &str) -> Reopen {
+    let url = std::path::Path::new(disk);
+    let snapshot_saved = snapshot_ready(url);
+    let starts_vm = !snapshot_saved;
+    Reopen {
+        installed: snapshot_saved,
+        attaches_installer: starts_vm,
+        captures_pointer: false,
+        checks_ssh: false,
+        starts_vm,
+        snapshot_saved,
+        headline: Some(if snapshot_saved {
+            "Debian is installed and shut down. A snapshot is saved for new machines.".into()
+        } else {
+            "Starting the installer.".into()
+        }),
+    }
+}
+
+fn support_of(disk: &std::path::Path) -> std::path::PathBuf {
+    disk.parent()
+        .and_then(|dir| dir.parent())
+        .and_then(|dir| dir.parent())
+        .unwrap()
+        .to_path_buf()
+}
+
+fn snapshot_ready(disk: &std::path::Path) -> bool {
+    let snap = support_of(disk).join("snapshots/debian");
+    snap.join("disk.img").is_file()
+        && std::fs::read_to_string(snap.join("ready"))
+            .ok()
+            .is_some_and(|text| text.starts_with("ssh-ok"))
+}
+
+fn guest_logged_in(disk: &std::path::Path) -> bool {
+    let beside = disk.parent().unwrap().join("ssh-ok");
+    let shared = support_of(disk).join("ssh/ssh-ok");
+    [beside, shared].into_iter().any(|path| {
+        std::fs::read_to_string(path)
+            .ok()
+            .is_some_and(|text| text.starts_with("debian") && text.contains("ok"))
+    })
+}
+
+#[derive(Debug)]
+struct Reopen {
+    installed: bool,
+    attaches_installer: bool,
+    captures_pointer: bool,
+    checks_ssh: bool,
+    starts_vm: bool,
+    snapshot_saved: bool,
+    headline: Option<String>,
+}
+
+#[test]
+fn deleting_a_setup_file_does_not_rerun_that_step() {
+    let dir = dir();
+    let disk = dir.join("snapshots/debian/disk.img");
+    std::fs::create_dir_all(disk.parent().unwrap()).unwrap();
+    std::fs::write(&disk, b"disk").unwrap();
+    std::fs::create_dir_all(dir.join("ssh")).unwrap();
+    std::fs::create_dir_all(dir.join("installer")).unwrap();
+    std::fs::write(dir.join("installer/preseed.img"), b"preseed").unwrap();
+    std::fs::write(dir.join("installer/boot.iso"), b"boot").unwrap();
+    std::fs::create_dir_all(dir.join("snapshots/debian")).unwrap();
+    std::fs::write(dir.join("ssh/ssh-ok"), b"debian ok\n").unwrap();
+    std::fs::write(disk.parent().unwrap().join("ssh-ok"), b"debian ok\n").unwrap();
+    std::fs::write(dir.join("snapshots/debian/ready"), b"ssh-ok\n").unwrap();
+    std::fs::write(&disk, b"disk").unwrap();
+
+    let mut setup = setup_page(false);
+    setup.snapshot_ready = true;
+    setup.logged_in = true;
+    setup.installed = true;
+    setup.stopped = true;
+    setup.mark("ssh", "done");
+    setup.mark("snapshot", "done");
+    assert_eq!(setup.row("partition").state, "done");
+    assert!(!setup.shows_installer());
+    let before = setup.steps.iter().map(|step| step.state.clone()).collect::<Vec<_>>();
+    std::fs::remove_file(dir.join("snapshots/debian/disk.img")).unwrap();
+    std::fs::remove_file(dir.join("ssh/ssh-ok")).unwrap();
+    std::fs::remove_file(disk.parent().unwrap().join("ssh-ok")).unwrap();
+    std::fs::remove_file(dir.join("snapshots/debian/ready")).unwrap();
+    std::fs::remove_file(dir.join("installer/preseed.img")).unwrap();
+    std::fs::remove_file(dir.join("installer/boot.iso")).unwrap();
+    assert_eq!(
+        setup.steps.iter().map(|step| step.state.clone()).collect::<Vec<_>>(),
+        before,
+        "deleting a setup file does not rerun that step"
+    );
+    assert!(setup.snapshot_ready);
+    assert!(!setup.shows_installer());
+}
+
+/// Deleting snapshots/debian does not start the installer again. Reset does that.
+#[test]
+fn removing_the_snapshot_does_not_start_again() {
+    let dir = dir();
+    let disk = dir.join("snapshots/debian/disk.img");
+    std::fs::create_dir_all(disk.parent().unwrap()).unwrap();
+    std::fs::write(&disk, b"disk").unwrap();
+    std::fs::write(dir.join("snapshots/debian/ready"), b"ssh-ok\n").unwrap();
+    std::fs::create_dir_all(dir.join("ssh")).unwrap();
+    std::fs::write(dir.join("ssh/ssh-ok"), b"debian ok\n").unwrap();
+    std::fs::write(disk.parent().unwrap().join("ssh-ok"), b"debian ok\n").unwrap();
+    std::fs::create_dir_all(dir.join("installer")).unwrap();
+    std::fs::write(dir.join("installer/boot.iso"), b"boot").unwrap();
+    std::fs::write(dir.join("installer/preseed.img"), b"preseed").unwrap();
+
+    let mut setup = setup_page(false);
+    setup.snapshot_ready = true;
+    setup.logged_in = true;
+    setup.installed = true;
+    setup.stopped = true;
+    setup.mark("partition", "done");
+    setup.mark("ssh", "done");
+    setup.mark("snapshot", "done");
+    assert!(!setup.shows_installer());
+    assert_eq!(setup.thumbnail_row(), None);
+    let before = setup.steps.iter().map(|step| step.state.clone()).collect::<Vec<_>>();
+    std::fs::remove_dir_all(dir.join("snapshots/debian")).unwrap();
+    assert_eq!(
+        setup.steps.iter().map(|step| step.state.clone()).collect::<Vec<_>>(),
+        before,
+        "deleting the snapshot does not rerun Create snapshot"
+    );
+    assert!(setup.snapshot_ready);
+    assert_eq!(setup.row("partition").state, "done");
+    assert!(!setup.shows_installer());
+
+    let mut screen = Screen::new();
+    screen.show_log = false;
+    screen.apply(&serde_json::json!({"event": "step", "step": "partition", "state": "done", "detail": "Installed"}));
+    screen.apply(&serde_json::json!({"event": "step", "step": "ssh", "state": "done", "detail": "Logged in"}));
+    screen.apply(&serde_json::json!({"event": "step", "step": "snapshot", "state": "done"}));
+    assert!(
+        !screen.shows_thumbnail("partition", &dir, true, false),
+        "the snapshot is still saved"
+    );
+    assert!(
+        screen.shows_thumbnail("partition", &dir, false, false),
+        "the installer is on Install guest, not above the list"
+    );
+    assert_eq!(screen.top_slot(false, false), "empty");
+    screen.show_log = true;
+    assert!(screen.shows_thumbnail("partition", &dir, false, false));
+    assert!(!screen.shows_thumbnail("partition", &dir, false, true));
+    assert_eq!(screen.top_slot(false, true), "empty");
+    screen.downloading = true;
+    assert_eq!(screen.top_slot(false, false), "empty", "the download bar is on Download ISO, not above the list");
+    screen.downloading = false;
+    assert_eq!(screen.top_slot(true, false), "empty", "nothing sits above the steps");
 }
 
 #[test]
@@ -1635,6 +3132,146 @@ fn quick_start_swift_gates_the_bar_on_a_real_download() {
     let src = include_str!("../Sources/QuickStart.swift");
     assert!(src.contains("if event.event == \"progress\", event.step == \"download\""));
     assert!(src.contains("if wizard.downloading {"));
+    assert!(src.contains("steps = WizardStep.initial + WizardStep.preseed + WizardStep.setup"));
+    assert!(!src.contains("showPreseed"));
+    assert!(!src.contains("Show all"));
+    assert!(!src.contains("Hide all"));
+    assert!(!src.contains("func rowLabel"));
+    assert!(!src.contains("WrappingPath(text: rowLabel"));
+    assert!(src.contains("static func status"));
+    assert!(src.contains("Text(WizardStep.status(step.id, state: step.state))"));
+    assert!(include_str!("../Sources/Install.swift").contains("Text(WizardStep.status(step.id, state: step.state))"));
+    assert!(!include_str!("../Sources/Install.swift").contains("WrappingPath(text: rowLabel"));
+    assert!(src.contains("frame(minWidth: 440, idealWidth: 440, maxWidth: .infinity, minHeight: 360, idealHeight: 640, maxHeight: .infinity, alignment: .topLeading)"));
+    assert!(!src.contains("minHeight: 420"));
+    assert!(include_str!("../Sources/App.swift").contains("Window(\"Quick start\", id: \"quick-start\")"));
+    assert!(include_str!("../Sources/App.swift").contains("final class QuickStartModel"));
+    assert!(include_str!("../Sources/App.swift").contains("QuickStart(wizard: quickStart.wizard, installSlot: quickStart.installSlot)"));
+    assert!(include_str!("../Sources/Install.swift").contains("func pauseHostKey"));
+    assert!(include_str!("../Sources/Install.swift").contains("func resumeHostKey"));
+    assert!(include_str!("../Sources/Install.swift").contains("Checking SSH again."));
+    assert!(include_str!("../Sources/App.swift").contains(".windowResizability(.automatic)"));
+    assert!(include_str!("../Sources/App.swift").contains(".defaultSize(width: 440, height: 640)"));
+    assert!(!src.contains(".frame(width: 440, alignment: .topLeading)"));
+    assert!(!src.contains(".frame(width: 440, alignment: .topLeading)\n        .fixedSize(horizontal: false, vertical: true)"));
+    assert!(src.contains(".fixedSize(horizontal: false, vertical: true)"));
+    assert!(src.contains("struct FitWindowHeight"));
+    assert!(src.contains("frame.height > visible.height"));
+    assert!(src.contains("ScrollView {"));
+    assert!(src.contains("private var showsInstaller: Bool"));
+    assert!(src.contains("if step.id == \"download\""));
+    assert!(src.contains("if step.id == \"partition\", showsInstaller"));
+    assert!(src.contains("installerView"));
+    assert!(src.contains("InstallGuest(session: installSlot.session!)"));
+    assert!(!src.contains("Button(\"Show installer\")"));
+    assert!(!src.contains("Button(\"Open"));
+    assert!(src.contains(".frame(width: 160, height: 100)"));
+    assert!(!src.contains("onTapGesture(count: 2)"));
+    assert!(!include_str!("../Sources/Install.swift").contains("Button(\"Show installer\")"));
+    assert!(!include_str!("../Sources/Install.swift").contains("onTapGesture(count: 2)"));
+    assert!(include_str!("../Sources/Install.swift").contains("var needsInstallGuest"));
+    assert!(!src.contains("enum StepPath"));
+    assert!(!src.contains("func rowLabel"));
+    assert!(src.contains("if step.id == \"download\", step.state == \"now\""));
+    assert!(include_str!("../src/preseed.rs").contains("pub const SNAPSHOT: &str = \"snapshots/debian\""));
+    assert!(src.contains("struct FitWindowHeight"));
+    assert!(src.contains("A closed wizard proposes nothing"));
+    assert!(include_str!("../Sources/Install.swift").contains("func sizeThatFits(_ proposal: ProposedViewSize, nsView: InstallScreen, context: Context) -> CGSize?"));
+    assert!(include_str!("../Sources/Install.swift").contains("?? 800"));
+    assert!(include_str!("../Sources/Install.swift").contains("override var intrinsicContentSize"));
+    assert!(include_str!("../Sources/Install.swift").contains("Closing the wizard mid-install"));
+    assert!(!src.contains("WrappingPath(text: rowLabel(step))"));
+    assert!(!include_str!("../src/main.rs").contains("fn step_file"));
+    assert!(!include_str!("../src/main.rs").contains("fn step_rel"));
+
+    assert!(src.contains("Install(iso: iso, disk: disk, embedded: true, freshInstall: wizard.runID > 0, steps: $wizard.steps, slot: installSlot)"));
+    assert!(src.contains("@ObservedObject var wizard: Wizard"));
+    assert!(!src.contains("@StateObject private var wizard = Wizard()"));
+    assert!(!src.contains("Button(\"Open"));
+    assert!(src.contains("if step.id == \"partition\", showsInstaller"));
+    assert!(!include_str!("../Sources/Install.swift").contains("detail: \"snapshots/debian/ssh-ok\""));
+    assert!(!include_str!("../Sources/Install.swift").contains("detail: \"debian\""));
+    assert!(src.contains("appendingPathComponent(\"snapshots/debian\", isDirectory: true)"));
+    assert!(include_str!("../Sources/Install.swift").contains("appendingPathComponent(\"preseed.img\")"));
+    assert!(include_str!("../Sources/Install.swift").contains("appendingPathComponent(\"boot.iso\")"));
+    assert!(!src.contains("preseedSteps"));
+    assert!(!include_str!("../Sources/Install.swift").contains("preseedSteps"));
+    assert!(include_str!("../Sources/Install.swift").contains("let shown = WizardStep.visible(guest.setupSteps)"));
+    assert!(src.contains("static let shownIDs = [\"download\", \"partition\", \"snapshot\"]"));
+    assert!(src.contains("Button(\"Reset\")"));
+    assert!(src.contains("func resetWizard"));
+    assert!(src.contains("--rebuild"));
+    assert!(src.contains("freshInstall: wizard.runID > 0"));
+    assert!(include_str!("../Sources/Install.swift").contains("freshInstall: Bool = false"));
+    assert!(!src.contains("--from"));
+    assert!(!src.contains("firstMissing"));
+    assert!(!include_str!("../Sources/Install.swift").contains("func noteMissingFiles"));
+    assert!(!include_str!("../Sources/Install.swift").contains("missingFile"));
+    assert!(include_str!("../Sources/Install.swift")
+        .contains("appendingPathComponent(\"installer\", isDirectory: true)"));
+    assert!(
+        include_str!("../Sources/Install.swift").contains("SupportDir.snapshotReady")
+    );
+    assert!(include_str!("../Sources/Install.swift")
+        .contains("GuestSession(fromSnapshot: fromSnapshot, diskWritten: false, snapshotSaved: snapshotSaved, loggedIn: loggedIn)"));
+    assert!(!include_str!("../Sources/Install.swift").contains("GuestSession(fromSnapshot: loggedIn"));
+    assert!(!src.contains("Button(\"Open"));
+    assert!(!include_str!("../Sources/Install.swift").contains("SupportDir.open()"));
+    assert!(!src.contains("Button(\"Back\""));
+    assert!(!src.contains("Button(\"Next\""));
+    assert!(src.contains("static let preseed"));
+    assert!(include_str!("../Sources/Install.swift").contains("Debian setup"));
+    assert!(src.contains("private var showsInstaller: Bool"));
+    assert!(include_str!("../Sources/Install.swift").contains("if !guest.snapshotReady {"));
+    assert!(include_str!("../Sources/Install.swift").contains("GuestMirror"));
+    assert!(
+        include_str!("../Sources/Install.swift").contains("func attach(_ screen: InstallScreen)")
+    );
+    assert!(include_str!("../Sources/Install.swift").contains(".nonactivatingPanel"));
+    assert!(include_str!("../Sources/Install.swift").contains("becomesKeyOnlyIfNeeded = true"));
+    assert!(include_str!("../Sources/Install.swift").contains("struct InstallerWindow"));
+    assert!(!include_str!("../Sources/Install.swift").contains(".popover(isPresented:"));
+    assert!(include_str!("../Sources/Install.swift").contains("frame(width: setup ? 440 : 848"));
+    assert!(!include_str!("../Sources/Install.swift").contains("frame(height: 96)"));
+    assert!(include_str!("../Sources/Install.swift")
+        .contains("private var capturePointer: Bool { fromSnapshot }"));
+    assert!(include_str!("../Sources/Install.swift").contains("pointer: false"));
+    assert!(include_str!("../Sources/Guest.swift").contains("pointer: Bool = false"));
+    assert!(!include_str!("../Sources/Install.swift").contains("InstalledDisk.looksInstalled"));
+    assert!(include_str!("../Sources/Guest.swift").contains("func looksInstalled"));
+    assert!(include_str!("../Sources/Install.swift").contains("guest.setupSteps"));
+    assert!(include_str!("../Sources/QuickStart.swift").contains("static let setup"));
+    assert!(include_str!("../Sources/Install.swift").contains("guest.start(iso: iso, disk: disk)"));
+    assert!(include_str!("../Sources/Install.swift")
+        .contains("Debian is installed and shut down. A snapshot is saved for new machines."));
+    assert!(include_str!("../Sources/Install.swift").contains("func holdFinished"));
+    assert!(include_str!("../Sources/Install.swift").contains("SupportDir.snapshotReady"));
+    assert!(include_str!("../Sources/Install.swift").contains("checking = true"));
+    assert!(include_str!("../Sources/Guest.swift").contains("VZNATNetworkDeviceAttachment()"));
+    assert!(!include_str!("../Sources/Guest.swift").contains("VZNATNetworkDeviceForwardingRules"));
+    assert!(include_str!("../Sources/Guest.swift").contains("192.168.64."));
+    assert!(include_str!("../Sources/Guest.swift").contains("% 253"));
+    assert!(include_str!("../Sources/Guest.swift").contains("ConnectTimeout=1"));
+    assert!(include_str!("../Sources/Guest.swift").contains("terminationHandler"));
+    assert!(include_str!("../Sources/Install.swift").contains("self.watchSSH()"));
+    assert!(include_str!("../Sources/Install.swift").contains("A saved snapshot is the artifact"));
+    assert!(!include_str!("../Sources/Install.swift").contains("login file was removed"));
+    assert!(!include_str!("../Sources/Install.swift").contains("machine?.state == .running"));
+    assert!(include_str!("../Sources/Guest.swift").contains("func forget(beside disk: URL)"));
+    assert!(include_str!("../Sources/Install.swift")
+        .contains("SSH login succeeded. Saving a snapshot."));
+    assert!(include_str!("../Sources/Install.swift").contains("New virtual machine"));
+    assert!(include_str!("../Sources/Guest.swift").contains("GuestSSH"));
+    assert!(
+        include_str!("../Sources/Guest.swift").contains("snapshots/debian/ssh-ok")
+            || include_str!("../Sources/Guest.swift").contains("sshPort: UInt16 = 22")
+    );
+    assert!(
+        include_str!("../Sources/QuickStart.swift").contains("[\"snapshot\", \"--dir\", dir.path]")
+    );
+    assert!(!include_str!("../Sources/Welcome.swift").contains("New Debian"));
+    assert!(include_str!("../Sources/Welcome.swift").contains("Quick start"));
+    assert!(include_str!("../Sources/App.swift").contains("id: \"debian\""));
     assert!(!src.contains("wizard.downloading && wizard.total > 0"));
     assert!(src.contains("Connecting..."));
     assert!(src.contains("scaleEffect(x: wizard.fraction"));
