@@ -369,6 +369,34 @@ fn clap_parses_download_and_rejects_unknown_args() {
         String::from_utf8_lossy(&clone.stderr)
     );
     assert!(String::from_utf8_lossy(&clone.stdout).contains("--name"));
+    let ssh = cli(&["ssh", "--help"]);
+    assert!(
+        ssh.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ssh.stderr)
+    );
+    assert!(String::from_utf8_lossy(&ssh.stdout).contains("--disk"));
+}
+
+#[test]
+fn ssh_probe_is_true_only_after_login() {
+    let dir = dir();
+    let disk = dir.join("snapshots/debian/disk.img");
+    std::fs::create_dir_all(disk.parent().unwrap()).unwrap();
+    std::fs::write(&disk, b"disk").unwrap();
+    let missing = cli(&["ssh", "--disk", disk.to_str().unwrap()]);
+    assert!(!missing.status.success());
+    std::fs::create_dir_all(dir.join("ssh")).unwrap();
+    std::fs::write(dir.join("ssh/ssh-ok"), b"debian ok\n").unwrap();
+    let ok = cli(&["ssh", "--disk", disk.to_str().unwrap()]);
+    assert!(
+        ok.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ok.stdout)
+    );
+    let event = one_event(&ok.stdout);
+    assert_eq!(event["event"], "ssh");
+    assert_eq!(event["state"], "done");
 }
 
 fn spawn(base: &str, dir: &Path) -> std::process::Child {
@@ -3249,10 +3277,11 @@ fn quick_start_swift_gates_the_bar_on_a_real_download() {
     assert!(include_str!("../Sources/Install.swift").contains("checking = true"));
     assert!(include_str!("../Sources/Guest.swift").contains("VZNATNetworkDeviceAttachment()"));
     assert!(!include_str!("../Sources/Guest.swift").contains("VZNATNetworkDeviceForwardingRules"));
-    assert!(include_str!("../Sources/Guest.swift").contains("192.168.64."));
-    assert!(include_str!("../Sources/Guest.swift").contains("% 253"));
-    assert!(include_str!("../Sources/Guest.swift").contains("ConnectTimeout=1"));
-    assert!(include_str!("../Sources/Guest.swift").contains("terminationHandler"));
+    assert!(include_str!("../src/ssh.rs").contains("192.168.64."));
+    assert!(include_str!("../src/ssh.rs").contains("% 253"));
+    assert!(include_str!("../src/ssh.rs").contains("ConnectTimeout=1"));
+    assert!(include_str!("../Sources/QuickStart.swift").contains("terminationHandler"));
+    assert!(include_str!("../Sources/QuickStart.swift").contains("[\"ssh\", \"--disk\", disk.path]"));
     assert!(include_str!("../Sources/Install.swift").contains("self.watchSSH()"));
     assert!(include_str!("../Sources/Install.swift").contains("A saved snapshot is the artifact"));
     assert!(!include_str!("../Sources/Install.swift").contains("login file was removed"));

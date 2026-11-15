@@ -33,7 +33,6 @@ pub const SNAPSHOT: &str = "snapshots/debian";
 pub const GUEST: u64 = 16 * 1024 * 1024 * 1024;
 
 pub const USER: &str = "debian";
-pub const SSH_PORT: u16 = 22;
 /// Written into the guest so the host can log in without a password.
 pub const AUTHORIZED: &str = "authorized_keys";
 
@@ -988,7 +987,10 @@ menuentry 'Graphical install' {
         let (prepared, patched) = prepare(&iso, &dir).unwrap();
         assert!(patched);
         assert_eq!(prepared.disk, dir.join(SNAPSHOT).join(DISK));
-        assert!(!dir.join("machines").exists(), "the install disk is not a machine");
+        assert!(
+            !dir.join("machines").exists(),
+            "the install disk is not a machine"
+        );
         assert_eq!(prepared.disk.metadata().unwrap().len(), GUEST);
         assert_eq!(prepared.key, dir.join("ssh").join(AUTHORIZED));
         assert!(dir.join(DIR).join(FILE).is_file());

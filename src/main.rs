@@ -584,6 +584,12 @@ enum Command {
         #[arg(long, value_name = "NAME")]
         name: Option<String>,
     },
+    /// One SSH attempt. A closed port is not a finished install.
+    Ssh {
+        /// Guest disk whose host key should log in.
+        #[arg(long, value_name = "PATH")]
+        disk: PathBuf,
+    },
 }
 
 fn main() {
@@ -613,6 +619,17 @@ fn main() {
             let support = dir.unwrap_or_else(support_dir);
             match snapshot::clone_machine(&support, name.as_deref()) {
                 Ok(saved) => emit_saved("clone", &saved),
+                Err(err) => die(err),
+            }
+        }
+        Command::Ssh { disk } => {
+            ssh::own_group();
+            match ssh::probe_disk(&disk) {
+                Ok(true) => emit!("ssh", state: Some("done")),
+                Ok(false) => {
+                    emit!("ssh", state: Some("wait"));
+                    std::process::exit(1);
+                }
                 Err(err) => die(err),
             }
         }

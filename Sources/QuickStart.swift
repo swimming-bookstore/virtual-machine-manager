@@ -1,6 +1,7 @@
 import Foundation
 import SwiftUI
 import AppKit
+import Darwin
 
 struct WizardStep: Identifiable {
     var id: String
@@ -385,6 +386,39 @@ enum Worker {
         return .success(disk)
     }
 
+    /// One SSH attempt in the worker. A closed port is not a finished install.
+    /// `cancel` is set when the app closes so a scan cannot keep the next open on "Checking SSH".
+    static func probe(disk: URL, cancel: @escaping () -> Bool) -> Bool {
+        guard let url = WorkerPath.url() else { return false }
+        let process = Process()
+        process.executableURL = url
+        process.arguments = ["ssh", "--disk", disk.path]
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        let scan = ProbeScan.shared
+        let token = scan.begin(process)
+        defer { scan.end(process) }
+        guard (try? process.run()) != nil else { return false }
+        if cancel() || scan.cancelled(token) {
+            scan.kill(process)
+            return false
+        }
+        let finished = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in finished.signal() }
+        while finished.wait(timeout: .now() + 0.2) == .timedOut {
+            if cancel() || scan.cancelled(token) {
+                scan.kill(process)
+                _ = finished.wait(timeout: .now() + 1)
+                return false
+            }
+        }
+        return !scan.cancelled(token) && process.terminationStatus == 0
+    }
+
+    static func stopProbe() {
+        ProbeScan.shared.stop()
+    }
+
     private static func run(_ args: [String]) -> (Int32, String) {
         guard let url = WorkerPath.url() else {
             return (1, "The worker is not built. Run cargo build --release, then try again.")
@@ -426,6 +460,53 @@ enum Worker {
             }
         }
         return nil
+    }
+}
+
+/// The worker Verify with host key is waiting on. Closing the app must kill it, or the next open stays on that row.
+final class ProbeScan: @unchecked Sendable {
+    static let shared = ProbeScan()
+    private let lock = NSLock()
+    private var running: [Process] = []
+    private var epoch = 0
+
+    func begin(_ process: Process) -> Int {
+        lock.lock()
+        let token = epoch
+        running.append(process)
+        lock.unlock()
+        return token
+    }
+
+    func end(_ process: Process) {
+        lock.lock()
+        running.removeAll { $0 === process }
+        lock.unlock()
+    }
+
+    func cancelled(_ token: Int) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return token != epoch
+    }
+
+    func kill(_ process: Process) {
+        let pid = process.processIdentifier
+        if pid > 0 { kill(-pid, SIGTERM) }
+        if process.isRunning { process.terminate() }
+    }
+
+    /// Kill the login that is still running. A login that starts a moment later sees the new epoch and exits.
+    /// The next open starts a new check.
+    func stop() {
+        lock.lock()
+        epoch += 1
+        let pending = running
+        running = []
+        lock.unlock()
+        for process in pending {
+            kill(process)
+        }
     }
 }
 

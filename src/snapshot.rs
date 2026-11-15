@@ -10,12 +10,10 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, bail, Result};
 
 use crate::preseed::{DISK, GUEST, MACHINE, SNAPSHOT};
+use crate::ssh;
 
 #[cfg(test)]
 use crate::preseed;
-
-#[path = "ssh.rs"]
-mod ssh;
 
 const READY: &str = "ready";
 const NVRAM: &str = "nvram.bin";
@@ -420,7 +418,10 @@ mod tests {
 
         // Deleting the snapshot removes the disk the installer wrote. There is no second copy to restore.
         fs::remove_dir_all(dir.join(SNAPSHOT)).unwrap();
-        assert!(save(&dir).unwrap_err().to_string().contains("guest disk is missing"));
+        assert!(save(&dir)
+            .unwrap_err()
+            .to_string()
+            .contains("guest disk is missing"));
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -83,6 +83,7 @@ enum Guest {
 
 /// The host key. The install is finished only after this key logs in.
 /// The proof sits beside the disk it reached. One app-wide file would still say "ok" after that disk was deleted.
+/// The worker walks ARP and a short run of 192.168.64.2–254. Swift only starts that process and can kill it.
 enum GuestSSH {
     static func dir(beside disk: URL) -> URL {
         disk.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
@@ -112,161 +113,15 @@ enum GuestSSH {
 
     /// One attempt. A closed port is not a finished install.
     /// `cancel` is set when the app closes so a scan cannot keep the next open on "Checking SSH".
-    /// One call tries the ARP match and a short run of addresses. The next call continues, so a quit is not stuck in a 254-host walk.
     static func probe(beside disk: URL, cancel: @escaping () -> Bool = { false }) -> Bool {
         if cancel() { return false }
         if loggedIn(beside: disk) { return true }
-        let folder = dir(beside: disk)
-        let key = folder.appendingPathComponent("id_ed25519")
-        guard FileManager.default.isReadableFile(atPath: key.path) else { return false }
-        for host in nextHosts(matching: Guest.macString(for: disk)) {
-            if cancel() { return false }
-            if login(key: key, host: host, cancel: cancel) {
-                if cancel() { return false }
-                let line = "\(Guest.user) ok\n"
-                try? line.write(to: proof(beside: disk), atomically: true, encoding: .utf8)
-                try? line.write(to: folder.appendingPathComponent("ssh-ok"), atomically: true, encoding: .utf8)
-                return true
-            }
-        }
-        return false
+        return Worker.probe(disk: disk, cancel: cancel)
     }
 
     /// Quit in the middle of Verify with host key. The login still running would block the next open on that row.
     static func stop() {
-        LoginScan.shared.stop()
-    }
-
-    /// ARP first, then the next slice of 192.168.64.2–254. 192.168.64.1 is the host gateway, not the guest.
-    /// DHCP is not limited to .2–.8, so one probe must not stop there, and it must not walk the whole subnet before it can be cancelled.
-    private static let cursorLock = NSLock()
-    private static var nextOctet = 2
-
-    private static func nextHosts(matching mac: String) -> [String] {
-        let want = normalizeMAC(mac)
-        var batch: [String] = []
-        for (host, seen) in arpGuests() where seen == want {
-            batch.append(host)
-        }
-        cursorLock.lock()
-        let start = nextOctet
-        nextOctet = 2 + (nextOctet - 2 + 12) % 253
-        cursorLock.unlock()
-        for offset in 0..<12 {
-            let n = 2 + (start - 2 + offset) % 253
-            batch.append("192.168.64.\(n)")
-        }
-        var seen = Set<String>()
-        return batch.filter { seen.insert($0).inserted }
-    }
-
-    private static func arpGuests() -> [(String, String)] {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/sbin/arp")
-        process.arguments = ["-an"]
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = FileHandle.nullDevice
-        guard (try? process.run()) != nil else { return [] }
-        process.waitUntilExit()
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        guard let text = String(data: data, encoding: .utf8) else { return [] }
-        var found: [(String, String)] = []
-        for line in text.split(separator: "\n") {
-            guard let open = line.firstIndex(of: "("), let close = line.firstIndex(of: ")"), open < close else { continue }
-            let host = String(line[line.index(after: open)..<close])
-            guard host.hasPrefix("192.168.64."), host != "192.168.64.1" else { continue }
-            let mac = line.split(separator: " ").first { part in
-                part.split(separator: ":").count == 6
-            }.map { normalizeMAC(String($0)) } ?? ""
-            found.append((host, mac))
-        }
-        return found
-    }
-
-    private static func normalizeMAC(_ text: String) -> String {
-        text.split(separator: ":").map { part in
-            String(format: "%02x", UInt8(part, radix: 16) ?? 0)
-        }.joined(separator: ":")
-    }
-
-    private static func login(key: URL, host: String, cancel: @escaping () -> Bool) -> Bool {
-        if cancel() { return false }
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
-        process.arguments = [
-            "-o", "BatchMode=yes",
-            "-o", "StrictHostKeyChecking=no",
-            "-o", "UserKnownHostsFile=/dev/null",
-            "-o", "ConnectTimeout=1",
-            "-p", String(Guest.sshPort),
-            "-i", key.path,
-            "-l", Guest.user,
-            host,
-            "true",
-        ]
-        process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
-        let scan = LoginScan.shared
-        let token = scan.begin(process)
-        defer { scan.end(process) }
-        guard (try? process.run()) != nil else { return false }
-        if cancel() || scan.cancelled(token) {
-            if process.isRunning { process.terminate() }
-            return false
-        }
-        let finished = DispatchSemaphore(value: 0)
-        process.terminationHandler = { _ in finished.signal() }
-        let deadline = Date().addingTimeInterval(3)
-        while finished.wait(timeout: .now() + 0.2) == .timedOut {
-            if cancel() || scan.cancelled(token) || Date() >= deadline {
-                process.terminate()
-                _ = finished.wait(timeout: .now() + 1)
-                return false
-            }
-        }
-        return !scan.cancelled(token) && process.terminationStatus == 0
-    }
-}
-
-/// The ssh process Verify with host key is waiting on. Closing the app must kill it, or the next open stays on that row.
-final class LoginScan: @unchecked Sendable {
-    static let shared = LoginScan()
-    private let lock = NSLock()
-    private var running: [Process] = []
-    private var epoch = 0
-
-    func begin(_ process: Process) -> Int {
-        lock.lock()
-        let token = epoch
-        running.append(process)
-        lock.unlock()
-        return token
-    }
-
-    func end(_ process: Process) {
-        lock.lock()
-        running.removeAll { $0 === process }
-        lock.unlock()
-    }
-
-    func cancelled(_ token: Int) -> Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return token != epoch
-    }
-
-    /// Kill the login that is still running. A login that starts a moment later sees the new epoch and exits.
-    /// The next open starts a new check.
-    func stop() {
-        lock.lock()
-        epoch += 1
-        let pending = running
-        running = []
-        lock.unlock()
-        for process in pending where process.isRunning {
-            process.terminate()
-        }
+        Worker.stopProbe()
     }
 }
 
