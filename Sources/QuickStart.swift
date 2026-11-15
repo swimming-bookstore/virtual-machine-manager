@@ -492,7 +492,7 @@ final class ProbeScan: @unchecked Sendable {
 
     func kill(_ process: Process) {
         let pid = process.processIdentifier
-        if pid > 0 { kill(-pid, SIGTERM) }
+        if pid > 0 { Darwin.kill(-pid, SIGTERM) }
         if process.isRunning { process.terminate() }
     }
 
