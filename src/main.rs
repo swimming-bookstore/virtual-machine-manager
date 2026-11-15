@@ -1,6 +1,9 @@
 //! Quick start's disk worker. One JSON object per line. The signature is checked
 //! before the ISO is downloaded, and the checksum is checked after.
 
+mod preseed;
+mod snapshot;
+mod ssh;
 mod verify;
 
 use std::env;
@@ -14,7 +17,9 @@ use anyhow::{anyhow, bail, Result};
 use clap::{Parser, Subcommand};
 use serde::Serialize;
 
-const STEPS: [&str; 6] = ["key", "sums", "sign", "check", "download", "verify"];
+const STEPS: [&str; 10] = [
+    "key", "sums", "sign", "check", "download", "verify", "sshkey", "preseed", "disk", "patch",
+];
 
 enum OrderMsg {
     Set(&'static str, &'static str, Sender<Result<()>>),
@@ -36,6 +41,10 @@ struct Event<'a> {
     total: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    disk: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    key: Option<String>,
 }
 
 fn blank(event: &str) -> Event<'_> {
@@ -47,6 +56,8 @@ fn blank(event: &str) -> Event<'_> {
         received: None,
         total: None,
         path: None,
+        disk: None,
+        key: None,
     }
 }
 
@@ -75,7 +86,7 @@ fn fail(err: anyhow::Error, order: &Sender<OrderMsg>) -> ! {
 }
 
 /// A step may run only after every earlier step has finished, and a finished step cannot start again.
-fn check_order(order: &mut [&'static str; 6], id: &str, state: &str) -> Result<()> {
+fn check_order(order: &mut [&'static str], id: &str, state: &str) -> Result<()> {
     let Some(index) = STEPS.iter().position(|item| *item == id) else {
         bail!("unknown step {id}");
     };
@@ -120,7 +131,7 @@ fn check_order(order: &mut [&'static str; 6], id: &str, state: &str) -> Result<(
 }
 
 fn order_loop(rx: Receiver<OrderMsg>) {
-    let mut order = ["wait"; 6];
+    let mut order = ["wait"; STEPS.len()];
     while let Ok(msg) = rx.recv() {
         match msg {
             OrderMsg::Set(id, state, reply) => {
@@ -137,7 +148,45 @@ fn order_loop(rx: Receiver<OrderMsg>) {
     }
 }
 
-fn step(id: &'static str, state: &'static str, detail: &str, order: &Sender<OrderMsg>) {
+/// True when this step's file is on disk. Signature check has no file of its own.
+fn wrote(dir: &Path, cache: &Path, id: &str) -> bool {
+    let has = |path: &Path| path.is_file();
+    match id {
+        "key" => has(&cache.join(verify::key_file())),
+        "sums" => has(&cache.join("SHA512SUMS")),
+        "sign" => has(&cache.join("SHA512SUMS.sign")),
+        "check" => true,
+        "download" => cached_iso(cache, guest_arch().unwrap_or("amd64")).is_ok(),
+        "verify" => has(&cache.join("manifest.json")),
+        "sshkey" => {
+            has(&dir.join("ssh").join("id_ed25519"))
+                && has(&dir.join("ssh").join("id_ed25519.pub"))
+                && has(&dir.join("ssh").join(preseed::AUTHORIZED))
+        }
+        "preseed" => has(&dir.join(preseed::DIR).join(preseed::FILE)),
+        "disk" => has(&dir.join(preseed::SNAPSHOT).join(preseed::DISK)),
+        "patch" => has(&dir.join(preseed::DIR).join(preseed::BOOT)),
+        _ => false,
+    }
+}
+
+/// Writes until the step's file is still there. One delete during the write is not a failed run.
+fn keep(
+    dir: &Path,
+    cache: &Path,
+    id: &'static str,
+    mut write: impl FnMut() -> Result<()>,
+) -> Result<()> {
+    for _ in 0..4 {
+        write()?;
+        if wrote(dir, cache, id) {
+            return Ok(());
+        }
+    }
+    bail!("{id} file is missing");
+}
+
+fn step(id: &'static str, state: &'static str, order: &Sender<OrderMsg>) {
     let (tx, rx) = mpsc::channel();
     if order.send(OrderMsg::Set(id, state, tx)).is_err() {
         fail(anyhow!("step order closed"), order);
@@ -148,7 +197,7 @@ fn step(id: &'static str, state: &'static str, detail: &str, order: &Sender<Orde
     {
         fail(err, order);
     }
-    emit!("step", step: Some(id), state: Some(state), detail: Some(detail.to_string()));
+    emit!("step", step: Some(id), state: Some(state));
 }
 
 fn support_dir() -> PathBuf {
@@ -295,68 +344,38 @@ fn hold_lock(cache: &Path) -> Result<File> {
     Ok(file)
 }
 
-fn run(dir: &Path, order: &Sender<OrderMsg>) -> Result<()> {
-    let arch = guest_arch()?;
-    let cache = dir.join("cache");
-    fs::create_dir_all(&cache)
-        .map_err(|err| anyhow!("cannot create {}: {err}", cache.display()))?;
-    let _lock = hold_lock(&cache)?;
-    let agent = verify::agent();
-    let base = verify::current_dir(arch)?;
-    let key_name = verify::key_file();
-
-    step("key", "now", key_name, order);
-    let key = verify::fetch_key(&agent)?;
-    verify::debian_key(&key)?;
-    fs::write(cache.join(key_name), &key)?;
-    step("key", "done", key_name, order);
-
-    step("sums", "now", "SHA512SUMS", order);
-    let sums = verify::fetch(&agent, &format!("{base}/SHA512SUMS"))?;
-    fs::write(cache.join("SHA512SUMS"), &sums)?;
-    step("sums", "done", "SHA512SUMS", order);
-
-    step("sign", "now", "SHA512SUMS.sign", order);
-    let signature = verify::fetch(&agent, &format!("{base}/SHA512SUMS.sign"))?;
-    fs::write(cache.join("SHA512SUMS.sign"), &signature)?;
-    step("sign", "done", "SHA512SUMS.sign", order);
-
-    step("check", "now", "SHA512SUMS.sign", order);
-    let published = verify::published(arch, &key, &sums, &signature)?;
-    step("check", "done", "Signature is valid", order);
-
-    emit!("detail", step: Some("download"), detail: Some(published.name.clone()));
-    let url = verify::image_url(&published.version, arch, &published.name);
-    let dest = cache.join(&published.name);
-    let partial = cache.join(format!("{}.partial", published.name));
-    step("download", "now", &published.name, order);
-    if !dest.is_file() {
-        download(&agent, &url, &partial)?;
-        fs::rename(&partial, &dest)?;
+fn read_cached(path: &Path) -> Result<Vec<u8>> {
+    let bytes = fs::read(path).map_err(|err| anyhow!("cannot read {}: {err}", path.display()))?;
+    if bytes.is_empty() {
+        bail!("{} is empty", path.display());
     }
-    step("download", "done", &published.name, order);
-
-    step("verify", "now", "SHA512SUMS", order);
-    let mut progress = Progress::new("verify");
-    let got = verify::hash_file(&dest, &mut |done, total| progress.tick(done, total, false))?;
-    let size = dest.metadata().map(|meta| meta.len()).unwrap_or(0);
-    progress.tick(size, size, true);
-    if got != published.sha512 {
-        let _ = fs::remove_file(&dest);
-        bail!(
-            "the download did not match SHA512SUMS for {}",
-            published.name
-        );
-    }
-    finish(&url, &published, &dest, order)
+    Ok(bytes)
 }
 
-fn finish(
-    url: &str,
-    published: &verify::Published,
-    dest: &Path,
-    order: &Sender<OrderMsg>,
-) -> Result<()> {
+fn cached_iso(cache: &Path, arch: &str) -> Result<PathBuf> {
+    let suffix = format!("-{arch}-netinst.iso");
+    let mut found = Vec::new();
+    let entries =
+        fs::read_dir(cache).map_err(|err| anyhow!("cannot read {}: {err}", cache.display()))?;
+    for entry in entries {
+        let path = entry
+            .map_err(|err| anyhow!("cannot read {}: {err}", cache.display()))?
+            .path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if name.starts_with("debian-") && name.ends_with(&suffix) && path.is_file() {
+            found.push(path);
+        }
+    }
+    match found.len() {
+        1 => Ok(found.remove(0)),
+        0 => bail!("installer image is missing"),
+        _ => bail!("more than one installer image in {}", cache.display()),
+    }
+}
+
+fn write_manifest(url: &str, published: &verify::Published, dest: &Path) -> Result<()> {
     let bytes = dest.metadata()?.len();
     let cache = dest
         .parent()
@@ -373,8 +392,159 @@ fn finish(
     let tmp = cache.join("manifest.json.partial");
     fs::write(&tmp, serde_json::to_string_pretty(&manifest)? + "\n")?;
     fs::rename(&tmp, cache.join("manifest.json"))?;
-    step("verify", "done", "Checksum matches", order);
-    emit!("ready", step: Some("verify"), state: Some("done"), detail: Some("Checksum matches".to_string()), received: Some(bytes), total: Some(bytes), path: Some(dest.display().to_string()));
+    Ok(())
+}
+
+/// Reset keeps the download cache and does every later step again, the way Packer rebuilds an image.
+/// The signed ISO, checksums, and keyring stay. Preseed, the guest disk, the installer copy, and the snapshot do not.
+fn clear_for_rebuild(dir: &Path) -> Result<()> {
+    for path in [
+        dir.join(preseed::DIR),
+        dir.join("ssh"),
+        dir.join(preseed::SNAPSHOT),
+    ] {
+        if path.exists() {
+            fs::remove_dir_all(&path)
+                .map_err(|err| anyhow!("cannot remove {}: {err}", path.display()))?;
+        }
+    }
+    Ok(())
+}
+
+fn emit_ready(dest: &Path, prepared: &preseed::Prepared) -> Result<()> {
+    let bytes = dest.metadata()?.len();
+    emit!("ready", step: Some("patch"), state: Some("done"), received: Some(bytes), total: Some(bytes), path: Some(dest.display().to_string()), disk: Some(prepared.disk.display().to_string()), key: Some(prepared.key.display().to_string()));
+    Ok(())
+}
+
+fn run(dir: &Path, order: &Sender<OrderMsg>) -> Result<()> {
+    let arch = guest_arch()?;
+    let cache = dir.join("cache");
+    fs::create_dir_all(&cache)
+        .map_err(|err| anyhow!("cannot create {}: {err}", cache.display()))?;
+    let _lock = hold_lock(&cache)?;
+    // Every run starts at the first step. A file already in the cache is not fetched again.
+    let agent = verify::agent();
+    let base = verify::current_dir(arch)?;
+    let key_name = verify::key_file();
+
+    step("key", "now", order);
+    let key = {
+        keep(dir, &cache, "key", || {
+            if !wrote(dir, &cache, "key") {
+                let fetched = verify::fetch_key(&agent)?;
+                verify::debian_key(&fetched)?;
+                fs::write(cache.join(key_name), &fetched)?;
+            }
+            Ok(())
+        })?;
+        read_cached(&cache.join(key_name))?
+    };
+    step("key", "done", order);
+
+    step("sums", "now", order);
+    let sums = {
+        keep(dir, &cache, "sums", || {
+            if !wrote(dir, &cache, "sums") {
+                let fetched = verify::fetch(&agent, &format!("{base}/SHA512SUMS"))?;
+                fs::write(cache.join("SHA512SUMS"), &fetched)?;
+            }
+            Ok(())
+        })?;
+        read_cached(&cache.join("SHA512SUMS"))?
+    };
+    step("sums", "done", order);
+
+    step("sign", "now", order);
+    let signature = {
+        keep(dir, &cache, "sign", || {
+            if !wrote(dir, &cache, "sign") {
+                let fetched = verify::fetch(&agent, &format!("{base}/SHA512SUMS.sign"))?;
+                fs::write(cache.join("SHA512SUMS.sign"), &fetched)?;
+            }
+            Ok(())
+        })?;
+        read_cached(&cache.join("SHA512SUMS.sign"))?
+    };
+    step("sign", "done", order);
+
+    step("check", "now", order);
+    let published = verify::published(arch, &key, &sums, &signature)?;
+    step("check", "done", order);
+
+    let url = verify::image_url(&published.version, arch, &published.name);
+    let dest = cache.join(&published.name);
+    step("download", "now", order);
+    if !dest.is_file() {
+        keep(dir, &cache, "download", || {
+            let partial = cache.join(format!("{}.partial", published.name));
+            download(&agent, &url, &partial)?;
+            fs::rename(&partial, &dest)?;
+            Ok(())
+        })?;
+    }
+    step("download", "done", order);
+
+    // Verify checksum is an action. The ISO path is the previous row, not this one.
+    step("verify", "now", order);
+    let mut progress = Progress::new("verify");
+    let got = verify::hash_file(&dest, &mut |done, total| progress.tick(done, total, false))?;
+    let size = dest.metadata().map(|meta| meta.len()).unwrap_or(0);
+    progress.tick(size, size, true);
+    if got != published.sha512 {
+        let _ = fs::remove_file(&dest);
+        bail!(
+            "the download did not match SHA512SUMS for {}",
+            published.name
+        );
+    }
+    if !wrote(dir, &cache, "verify") {
+        keep(dir, &cache, "verify", || {
+            write_manifest(&url, &published, &dest)?;
+            Ok(())
+        })?;
+    }
+    step("verify", "done", order);
+
+    // The host key, the answer disk, the empty guest disk, and the installer copy are separate steps.
+    let ssh = dir.join("ssh");
+    step("sshkey", "now", order);
+    if !wrote(dir, &cache, "sshkey") {
+        keep(dir, &cache, "sshkey", || {
+            ssh::ensure(&ssh)?;
+            Ok(())
+        })?;
+    }
+    step("sshkey", "done", order);
+    step("preseed", "now", order);
+    if !wrote(dir, &cache, "preseed") {
+        keep(dir, &cache, "preseed", || {
+            preseed::write_preseed(dir)?;
+            Ok(())
+        })?;
+    }
+    step("preseed", "done", order);
+    step("disk", "now", order);
+    if !wrote(dir, &cache, "disk") {
+        keep(dir, &cache, "disk", || {
+            preseed::write_guest_disk(dir)?;
+            Ok(())
+        })?;
+    }
+    step("disk", "done", order);
+    step("patch", "now", order);
+    if !wrote(dir, &cache, "patch") {
+        keep(dir, &cache, "patch", || {
+            preseed::prepare_installer(&dest, dir)?;
+            Ok(())
+        })?;
+    }
+    step("patch", "done", order);
+    let prepared = preseed::Prepared {
+        disk: dir.join(preseed::SNAPSHOT).join(preseed::DISK),
+        key: dir.join("ssh").join(preseed::AUTHORIZED),
+    };
+    emit_ready(&dest, &prepared)?;
     Ok(())
 }
 
@@ -392,28 +562,100 @@ struct Cli {
 enum Command {
     /// Download the Debian 13 installer and check its signature.
     Download {
-        /// Cache parent. The installer is written to PATH/cache. Defaults to the app support directory.
+        /// Support directory. Downloads go in PATH/cache. preseed.img and boot.iso go in PATH/installer. Defaults to the app support directory.
         #[arg(long, value_name = "PATH")]
         dir: Option<PathBuf>,
+        /// Rebuild the image. Only the download cache is kept. Preseed, the guest disk, and the snapshot are done again.
+        #[arg(long)]
+        rebuild: bool,
+    },
+    /// Copy a finished install so later machines skip the installer.
+    Snapshot {
+        /// Support directory that contains snapshots/debian. Defaults to the app support directory.
+        #[arg(long, value_name = "PATH")]
+        dir: Option<PathBuf>,
+    },
+    /// Clone the snapshot into a new machine directory.
+    Clone {
+        /// Support directory. Defaults to the app support directory.
+        #[arg(long, value_name = "PATH")]
+        dir: Option<PathBuf>,
+        /// Directory name under machines/. Defaults to the next debian-N.
+        #[arg(long, value_name = "NAME")]
+        name: Option<String>,
+    },
+    /// One SSH attempt. A closed port is not a finished install.
+    Ssh {
+        /// Guest disk whose host key should log in.
+        #[arg(long, value_name = "PATH")]
+        disk: PathBuf,
     },
 }
 
 fn main() {
     let cli = Cli::try_parse().unwrap_or_else(|err| err.exit());
-    let Command::Download { dir } = cli.command;
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || order_loop(rx));
-    if let Err(err) = run(dir.as_deref().unwrap_or(&support_dir()), &tx) {
-        fail(err, &tx);
+    match cli.command {
+        Command::Download { dir, rebuild } => {
+            let (tx, rx) = mpsc::channel();
+            std::thread::spawn(move || order_loop(rx));
+            let support = dir.unwrap_or_else(support_dir);
+            if rebuild {
+                if let Err(err) = clear_for_rebuild(&support) {
+                    fail(err, &tx);
+                }
+            }
+            if let Err(err) = run(&support, &tx) {
+                fail(err, &tx);
+            }
+        }
+        Command::Snapshot { dir } => {
+            let support = dir.unwrap_or_else(support_dir);
+            match snapshot::save(&support) {
+                Ok(saved) => emit_saved("snapshot", &saved),
+                Err(err) => die(err),
+            }
+        }
+        Command::Clone { dir, name } => {
+            let support = dir.unwrap_or_else(support_dir);
+            match snapshot::clone_machine(&support, name.as_deref()) {
+                Ok(saved) => emit_saved("clone", &saved),
+                Err(err) => die(err),
+            }
+        }
+        Command::Ssh { disk } => {
+            ssh::own_group();
+            match ssh::probe_disk(&disk) {
+                Ok(true) => emit!("ssh", state: Some("done")),
+                Ok(false) => {
+                    emit!("ssh", state: Some("wait"));
+                    std::process::exit(1);
+                }
+                Err(err) => die(err),
+            }
+        }
+    }
+}
+
+fn die(err: anyhow::Error) -> ! {
+    emit!("error", detail: Some(err.to_string()));
+    std::process::exit(1);
+}
+
+fn emit_saved(event: &str, saved: &snapshot::Saved) {
+    let path = saved.dir.display().to_string();
+    let disk = saved.disk.display().to_string();
+    match event {
+        "clone" => emit!("clone", state: Some("done"), path: Some(path), disk: Some(disk)),
+        _ => emit!("snapshot", state: Some("done"), path: Some(path), disk: Some(disk)),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::check_order;
+    use super::{check_order, STEPS};
 
     fn run_seq(seq: &[(&str, &str)]) -> anyhow::Result<()> {
-        let mut order = ["wait"; 6];
+        let mut order = ["wait"; STEPS.len()];
         for (id, state) in seq {
             check_order(&mut order, id, state)?;
         }
@@ -421,10 +663,13 @@ mod tests {
     }
 
     fn full() -> Vec<(&'static str, &'static str)> {
-        ["key", "sums", "sign", "check", "download", "verify"]
-            .into_iter()
-            .flat_map(|id| [(id, "now"), (id, "done")])
-            .collect()
+        [
+            "key", "sums", "sign", "check", "download", "verify", "sshkey", "preseed", "disk",
+            "patch",
+        ]
+        .into_iter()
+        .flat_map(|id| [(id, "now"), (id, "done")])
+        .collect()
     }
 
     #[test]

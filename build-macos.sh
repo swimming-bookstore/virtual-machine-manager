@@ -18,8 +18,9 @@ cp Info.plist "$APP/Contents/Info.plist"
 swiftc -parse-as-library -O \
   -target "$(uname -m)-apple-macosx14.0" \
   -framework SwiftUI \
+  -framework Virtualization \
   -o "$APP/Contents/MacOS/virtual-machine-manager" \
-  Sources/App.swift Sources/Welcome.swift Sources/QuickStart.swift
+  Sources/App.swift Sources/Welcome.swift Sources/QuickStart.swift Sources/Guest.swift Sources/Install.swift
 chmod +x "$APP/Contents/MacOS/virtual-machine-manager"
 WORKER=""
 for candidate in target/release/virtual-machine-worker target/debug/virtual-machine-worker; do
@@ -34,5 +35,5 @@ if [ -n "$WORKER" ]; then
 else
   echo "No virtual-machine-worker binary. Quick start cannot download until: cargo build --release" >&2
 fi
-codesign --force --deep --sign - "$APP"
+codesign --force --deep --sign - --entitlements virtual-machine-manager.entitlements "$APP"
 echo "Built $APP. Open it with: open $APP"
