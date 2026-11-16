@@ -399,8 +399,8 @@ enum Worker {
     /// The address ARP has for this disk. Nil when the guest is off or still booting.
     static func address(disk: URL) -> String? {
         let (code, text) = run(["address", "--disk", disk.path])
-        guard code == 0 else { return nil }
-        return message(text).filter { $0.contains(".") }
+        guard code == 0, let detail = message(text), detail.contains(".") else { return nil }
+        return detail
     }
 
     /// One SSH attempt in the worker. A closed port is not a finished install.
