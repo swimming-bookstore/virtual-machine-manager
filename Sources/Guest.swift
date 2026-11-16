@@ -30,6 +30,10 @@ enum Guest {
         let config = VZVirtualMachineConfiguration()
         config.cpuCount = 2
         config.memorySize = 2 * 1024 * 1024 * 1024
+        // A pause save is tied to this identifier. A fresh one makes restore fail with an invalid argument.
+        let platform = VZGenericPlatformConfiguration()
+        platform.machineIdentifier = try machineIdentifier(beside: disk)
+        config.platform = platform
         let loader = VZEFIBootLoader()
         loader.variableStore = try efiStore(beside: disk)
         config.bootLoader = loader
@@ -70,6 +74,17 @@ enum Guest {
         return try VZEFIVariableStore(creatingVariableStoreAt: url, options: [])
     }
 
+    /// The identifier the pause save was written with. A new one is stored beside the disk.
+    private static func machineIdentifier(beside disk: URL) throws -> VZGenericMachineIdentifier {
+        let url = disk.deletingLastPathComponent().appendingPathComponent("machine-id")
+        if let data = try? Data(contentsOf: url), let id = VZGenericMachineIdentifier(dataRepresentation: data) {
+            return id
+        }
+        let id = VZGenericMachineIdentifier()
+        try id.dataRepresentation.write(to: url, options: .atomic)
+        return id
+    }
+
     private static func usb(_ url: URL, readOnly: Bool) throws -> VZUSBMassStorageDeviceConfiguration {
         let attachment = try VZDiskImageStorageDeviceAttachment(url: url, readOnly: readOnly)
         return VZUSBMassStorageDeviceConfiguration(attachment: attachment)
@@ -107,12 +122,11 @@ enum GuestSSH {
     /// The disk is gone, so the old login is not a finished install.
     static func forget(beside disk: URL) {
         for url in [proof(beside: disk), dir(beside: disk).appendingPathComponent("ssh-ok")] {
-            try? FileManager.default.removeItem(at: url)
+            _ = try? FileManager.default.removeItem(at: url)
         }
     }
 
     /// One attempt. A closed port is not a finished install.
-    /// `cancel` is set when the app closes so a scan cannot keep the next open on "Checking SSH".
     static func probe(beside disk: URL, cancel: @escaping () -> Bool = { false }) -> Bool {
         if cancel() { return false }
         if loggedIn(beside: disk) { return true }
@@ -125,13 +139,43 @@ enum GuestSSH {
     }
 }
 
+/// Pause files beside a clone. The save is Virtualization state; the marker is written after it.
+enum GuestPause {
+    static func state(beside disk: URL) -> URL {
+        disk.deletingLastPathComponent().appendingPathComponent("paused.vzvmsave")
+    }
+
+    /// Last guest frame, written before the paused machine is stopped.
+    static func preview(beside disk: URL) -> URL {
+        disk.deletingLastPathComponent().appendingPathComponent("paused.png")
+    }
+
+    static func isPaused(beside disk: URL) -> Bool {
+        let dir = disk.deletingLastPathComponent()
+        return FileManager.default.fileExists(atPath: dir.appendingPathComponent("paused").path)
+            && FileManager.default.fileExists(atPath: state(beside: disk).path)
+    }
+
+    /// The save is only valid for the identifier written beside the disk. An older save has none.
+    static func hasMachineID(beside disk: URL) -> Bool {
+        FileManager.default.fileExists(atPath: disk.deletingLastPathComponent().appendingPathComponent("machine-id").path)
+    }
+
+    static func forget(beside disk: URL) {
+        let dir = disk.deletingLastPathComponent()
+        _ = try? FileManager.default.removeItem(at: dir.appendingPathComponent("paused"))
+        _ = try? FileManager.default.removeItem(at: state(beside: disk))
+        _ = try? FileManager.default.removeItem(at: preview(beside: disk))
+    }
+}
+
 /// A disk the installer already wrote. An empty sparse file is not that disk.
 /// A partition table is not an SSH login. It only means the next boot is the disk alone.
 enum InstalledDisk {
     static func looksInstalled(_ path: String) -> Bool {
         let url = URL(fileURLWithPath: path)
         guard let handle = try? FileHandle(forReadingFrom: url) else { return false }
-        defer { try? handle.close() }
+        defer { _ = try? handle.close() }
         guard let sector = try? handle.read(upToCount: 512), sector.count == 512 else { return false }
         return sector[510] == 0x55 && sector[511] == 0xaa
     }

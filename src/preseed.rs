@@ -192,12 +192,10 @@ fn write_image(dest: &Path, body: &[u8]) -> Result<PathBuf> {
     let mut file = File::create(&tmp)?;
     file.write_all(body)?;
     file.sync_all()?;
-    drop(file);
     fs::rename(&tmp, dest)?;
     Ok(dest.to_path_buf())
 }
 
-/// Copies the verified ISO and applies the guide's boot edit. The signed file is not rewritten.
 fn write_boot(iso: &Path, dest: &Path, public_key: &str) -> Result<bool> {
     if already_patched(dest, public_key) {
         return Ok(false);
@@ -318,16 +316,13 @@ fn patch_menu(file: &mut File, install: &str) -> Result<()> {
             &vec![0u8; body.len() - next.len()],
         )?;
     }
-    let new_size = next.len() as u32;
-    for item in &hits {
-        if item.extent == hit.extent && item.size == hit.size {
-            let mut size = [0u8; 8];
-            size[..4].copy_from_slice(&new_size.to_le_bytes());
-            size[4..].copy_from_slice(&new_size.to_be_bytes());
-            write_at(file, item.at + 10, &size)?;
-        }
-    }
-    Ok(())
+    write_size(file, &hits, hit.extent, hit.size, next.len() as u32, None)
+}
+
+fn named(file: &mut File, extent: u32, size: u32, joliet: bool, want: &str, dir: bool) -> Result<Option<Hit>> {
+    Ok(read_dir(file, extent, size, joliet)?.into_iter().find(|hit| {
+        hit.is_dir == dir && hit.name.eq_ignore_ascii_case(want)
+    }))
 }
 
 fn grub_cfgs(file: &mut File) -> Result<Vec<Hit>> {
@@ -336,20 +331,14 @@ fn grub_cfgs(file: &mut File) -> Result<Vec<Hit>> {
         let Ok((extent, size, is_joliet)) = root_of(file, joliet) else {
             continue;
         };
-        for boot in read_dir(file, extent, size, is_joliet)? {
-            if !boot.is_dir || !boot.name.eq_ignore_ascii_case("boot") {
-                continue;
-            }
-            for grub in read_dir(file, boot.extent, boot.size, is_joliet)? {
-                if !grub.is_dir || !grub.name.eq_ignore_ascii_case("grub") {
-                    continue;
-                }
-                for cfg in read_dir(file, grub.extent, grub.size, is_joliet)? {
-                    if !cfg.is_dir && cfg.name.eq_ignore_ascii_case("grub.cfg") {
-                        hits.push(cfg);
-                    }
-                }
-            }
+        let Some(boot) = named(file, extent, size, is_joliet, "boot", true)? else {
+            continue;
+        };
+        let Some(grub) = named(file, boot.extent, boot.size, is_joliet, "grub", true)? else {
+            continue;
+        };
+        if let Some(cfg) = named(file, grub.extent, grub.size, is_joliet, "grub.cfg", false)? {
+            hits.push(cfg);
         }
     }
     Ok(hits)
@@ -530,16 +519,7 @@ fn append_preseed(file: &mut File, install: &str, public_key: &str) -> Result<()
     }
     let at = extent as u64 * SECTOR + old as u64;
     write_at(file, at, &extra)?;
-    let new_size = old + extra.len() as u32;
-    for hit in &hits {
-        if hit.extent == extent && hit.size == old && hit.name.eq_ignore_ascii_case("initrd.gz") {
-            let mut size = [0u8; 8];
-            size[..4].copy_from_slice(&new_size.to_le_bytes());
-            size[4..].copy_from_slice(&new_size.to_be_bytes());
-            write_at(file, hit.at + 10, &size)?;
-        }
-    }
-    Ok(())
+    write_size(file, &hits, extent, old, old + extra.len() as u32, Some("initrd.gz"))
 }
 
 fn sector_slack(size: u32) -> u32 {
@@ -606,10 +586,7 @@ fn walk_install(file: &mut File, install: &str) -> Result<Vec<Hit>> {
         let Ok((extent, size, is_joliet)) = root_of(file, joliet) else {
             continue;
         };
-        for entry in read_dir(file, extent, size, is_joliet)? {
-            if !entry.is_dir || !entry.name.eq_ignore_ascii_case(install) {
-                continue;
-            }
+        if let Some(entry) = named(file, extent, size, is_joliet, install, true)? {
             hits.extend(read_dir(file, entry.extent, entry.size, is_joliet)?);
         }
     }
@@ -700,13 +677,24 @@ fn decode_name(raw: &[u8], joliet: bool) -> String {
 
 fn read_at(file: &mut File, at: u64, buf: &mut [u8]) -> Result<()> {
     file.seek(SeekFrom::Start(at))?;
-    file.read_exact(buf)
-        .map_err(|err| anyhow!("installer image is truncated: {err}"))
+    file.read_exact(buf).map_err(|err| anyhow!("installer image is truncated: {err}"))
 }
 
 fn write_at(file: &mut File, at: u64, buf: &[u8]) -> Result<()> {
     file.seek(SeekFrom::Start(at))?;
     file.write_all(buf)?;
+    Ok(())
+}
+
+fn write_size(file: &mut File, hits: &[Hit], extent: u32, old: u32, new_size: u32, name: Option<&str>) -> Result<()> {
+    let mut size = [0u8; 8];
+    size[..4].copy_from_slice(&new_size.to_le_bytes());
+    size[4..].copy_from_slice(&new_size.to_be_bytes());
+    for hit in hits {
+        if hit.extent == extent && hit.size == old && name.is_none_or(|want| hit.name.eq_ignore_ascii_case(want)) {
+            write_at(file, hit.at + 10, &size)?;
+        }
+    }
     Ok(())
 }
 

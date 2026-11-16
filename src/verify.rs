@@ -22,10 +22,6 @@ pub fn key_file() -> &'static str {
     KEY_FILE
 }
 
-fn key_url() -> &'static str {
-    KEY_URL
-}
-
 pub fn agent() -> ureq::Agent {
     ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(30))
@@ -47,7 +43,7 @@ pub fn image_url(version: &str, arch: &str, name: &str) -> String {
 }
 
 pub fn fetch_key(agent: &ureq::Agent) -> Result<Vec<u8>> {
-    let url = key_url();
+    let url = KEY_URL;
     let body = fetch(agent, url)?;
     if std::str::from_utf8(&body).is_ok_and(|text| text.contains("BEGIN PGP PUBLIC KEY BLOCK")) {
         Ok(body)
@@ -271,10 +267,7 @@ mod tests {
     #[test]
     fn key_file_matches_the_published_key_id() {
         assert_eq!(key_file(), "key-DA87E80D6294BE9B.txt");
-        assert_eq!(
-            key_url(),
-            "https://www.debian.org/CD/key-DA87E80D6294BE9B.txt"
-        );
+        assert_eq!(KEY_URL, "https://www.debian.org/CD/key-DA87E80D6294BE9B.txt");
         assert_eq!(
             &fingerprint()[fingerprint().len() - 16..],
             "da87e80d6294be9b"

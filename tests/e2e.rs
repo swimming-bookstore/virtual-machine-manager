@@ -2,6 +2,7 @@
 //! The signature is checked before the ISO is fetched.
 //! Quick start is replayed from that JSON so the window stays tied to it.
 
+use std::collections::HashMap;
 use std::io::{BufRead, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -369,6 +370,20 @@ fn clap_parses_download_and_rejects_unknown_args() {
         String::from_utf8_lossy(&clone.stderr)
     );
     assert!(String::from_utf8_lossy(&clone.stdout).contains("--name"));
+    let pause = cli(&["pause", "--help"]);
+    assert!(
+        pause.status.success(),
+        "{}",
+        String::from_utf8_lossy(&pause.stderr)
+    );
+    assert!(String::from_utf8_lossy(&pause.stdout).contains("--disk"));
+    let unpause = cli(&["unpause", "--help"]);
+    assert!(
+        unpause.status.success(),
+        "{}",
+        String::from_utf8_lossy(&unpause.stderr)
+    );
+    assert!(String::from_utf8_lossy(&unpause.stdout).contains("--disk"));
     let ssh = cli(&["ssh", "--help"]);
     assert!(
         ssh.status.success(),
@@ -1597,11 +1612,33 @@ fn snapshot_waits_for_ssh_then_clones() {
     assert_eq!(cloned_machine.disk.as_deref(), event["disk"].as_str());
     assert!(cloned_machine.error.is_none());
     let machine = open_clone(event["disk"].as_str().unwrap());
+    // Adding the next machine is a new detail view. The clone that was started must keep running.
+    let mut library = Library {
+        machines: vec![event["disk"].as_str().unwrap().to_string()],
+        selected: Some(event["disk"].as_str().unwrap().to_string()),
+        sessions: HashMap::new(),
+    };
+    library.show();
+    library.session(event["disk"].as_str().unwrap()).boot_disk(event["disk"].as_str().unwrap(), true);
+    let next_disk = dir.join("machines/debian-3/disk.img").display().to_string();
+    library.hide();
+    library.clone_new(next_disk.clone());
+    library.show();
+    assert!(
+        !library.session(event["disk"].as_str().unwrap()).stopped,
+        "the worker clone must stay running when the library adds another machine"
+    );
+    assert_eq!(library.selected.as_deref(), Some(next_disk.as_str()));
     assert_eq!(machine.title, "Debian");
-    assert!(machine.captures_pointer());
+    assert!(!machine.captures_pointer());
     assert!(!machine.shows_installer());
     assert_eq!(machine.thumbnail_row(), None, "a clone is a machine, not the install thumbnail");
-    assert_eq!(machine.headline.as_deref(), Some("Starting Debian."));
+    assert_eq!(
+        machine.headline.as_deref(),
+        Some("Debian is stopped. The guest disk is the installed system.")
+    );
+    assert!(machine.stopped);
+    assert!(!machine.paused);
     assert_eq!(machine.buttons(), [] as [&str; 0]);
 
     let next = cli(&["clone", "--dir", dir.to_str().unwrap()]);
@@ -1615,12 +1652,81 @@ fn snapshot_waits_for_ssh_then_clones() {
         dir.join("machines/debian-3/disk.img").display().to_string()
     );
 
+    let mut started = open_clone(event["disk"].as_str().unwrap());
+    started.boot_disk(event["disk"].as_str().unwrap(), true);
+    assert!(!started.stopped);
+    assert!(!started.paused);
+    assert!(started.captures_pointer());
+    assert_eq!(started.headline.as_deref(), Some("Starting Debian."));
+
     // The install disk is the snapshot. A broken copy cannot be rebuilt from a second file.
     std::fs::write(dir.join("snapshots/debian/ready"), b"nope").unwrap();
     std::fs::write(dir.join("snapshots/debian/disk.img"), b"short").unwrap();
     let replaced = cli(&["snapshot", "--dir", dir.to_str().unwrap()]);
     assert!(!replaced.status.success());
     assert!(String::from_utf8_lossy(&replaced.stdout).contains("guest disk is"));
+}
+
+/// Pause files sit beside the guest disk so a later open can resume instead of a cold boot.
+#[test]
+fn pause_marks_a_save_beside_the_disk() {
+    let dir = dir();
+    let disk = dir.join("machines/lab/disk.img");
+    std::fs::create_dir_all(disk.parent().unwrap()).unwrap();
+    std::fs::write(&disk, b"disk").unwrap();
+    let missing = cli(&["pause", "--disk", disk.to_str().unwrap()]);
+    assert!(!missing.status.success());
+    assert!(
+        String::from_utf8_lossy(&missing.stdout).contains("pause state"),
+        "{}",
+        String::from_utf8_lossy(&missing.stdout)
+    );
+    std::fs::write(disk.parent().unwrap().join("paused.vzvmsave"), b"vz").unwrap();
+    let saved = cli(&["pause", "--disk", disk.to_str().unwrap()]);
+    assert!(
+        saved.status.success(),
+        "{}",
+        String::from_utf8_lossy(&saved.stdout)
+    );
+    let event = one_event(&saved.stdout);
+    assert_eq!(event["event"], "pause");
+    assert_eq!(event["state"], "done");
+    assert!(dir.join("machines/lab/paused").is_file());
+    std::fs::write(dir.join("machines/lab/paused.png"), b"png").unwrap();
+    let machine = open_clone(disk.to_str().unwrap());
+    assert!(machine.paused);
+    assert!(machine.pause_preview);
+    assert!(machine.stopped);
+    assert!(!machine.captures_pointer());
+    assert_eq!(machine.headline.as_deref(), Some("Debian is paused."));
+    assert_eq!(machine.buttons(), [] as [&str; 0]);
+
+    let mut resumed = open_clone(disk.to_str().unwrap());
+    resumed.boot_disk(disk.to_str().unwrap(), true);
+    assert!(!resumed.paused);
+    assert!(!resumed.pause_preview);
+    assert!(!resumed.stopped);
+    assert!(resumed.captures_pointer());
+    assert_eq!(
+        resumed.headline.as_deref(),
+        Some("Debian is running from the guest disk.")
+    );
+
+    let cleared = cli(&["unpause", "--disk", disk.to_str().unwrap()]);
+    assert!(
+        cleared.status.success(),
+        "{}",
+        String::from_utf8_lossy(&cleared.stdout)
+    );
+    assert!(!dir.join("machines/lab/paused").exists());
+    assert!(!dir.join("machines/lab/paused.vzvmsave").exists());
+    assert!(!dir.join("machines/lab/paused.png").exists());
+    let again = open_clone(disk.to_str().unwrap());
+    assert!(!again.paused);
+    assert_eq!(
+        again.headline.as_deref(),
+        Some("Debian is stopped. The guest disk is the installed system.")
+    );
 }
 
 fn one_event(stdout: &[u8]) -> Value {
@@ -2573,6 +2679,8 @@ struct Setup {
     show_window: bool,
     started: bool,
     checking: bool,
+    paused: bool,
+    pause_preview: bool,
     /// Disks attached for a fresh install. Empty unless the installer starts. The signed ISO is not one of them.
     attached: Vec<String>,
 }
@@ -2615,6 +2723,8 @@ fn setup_page(from_snapshot: bool) -> Setup {
         show_window: false,
         started: false,
         checking: false,
+        paused: false,
+        pause_preview: false,
         attached: Vec::new(),
     }
 }
@@ -2644,7 +2754,7 @@ impl Setup {
     }
 
     fn captures_pointer(&self) -> bool {
-        self.from_snapshot
+        self.from_snapshot && !self.stopped
     }
 
     fn mark(&mut self, id: &str, state: &str) {
@@ -2674,6 +2784,23 @@ impl Setup {
 
     /// Deleting a file does not start a step again. Reset is the only restart.
 
+    fn hold_clone(&mut self, disk: &str) {
+        if self.started && !self.stopped {
+            return;
+        }
+        self.started = true;
+        self.stopped = true;
+        self.installed = true;
+        self.checking = false;
+        self.paused = pause_ready(Path::new(disk));
+        self.pause_preview = self.paused && Path::new(disk).parent().unwrap().join("paused.png").is_file();
+        self.headline = Some(if self.paused {
+            "Debian is paused.".into()
+        } else {
+            "Debian is stopped. The guest disk is the installed system.".into()
+        });
+    }
+
     fn hold_finished(&mut self, disk: &str) {
         self.started = true;
         self.stopped = true;
@@ -2696,7 +2823,7 @@ impl Setup {
         if self.snapshot_ready && !self.from_snapshot {
             self.hold_finished(disk);
         } else if self.from_snapshot {
-            self.boot_disk(disk, true);
+            self.hold_clone(disk);
         } else {
             self.start(iso, disk);
         }
@@ -2729,13 +2856,12 @@ impl Setup {
     }
 
     fn boot_disk(&mut self, disk: &str, pointer: bool) {
-        if self.started {
+        if self.started && !self.stopped {
             return;
         }
         self.started = true;
         self.installed = true;
         self.logged_in = guest_logged_in(Path::new(disk)) || self.from_snapshot;
-        self.checking = true;
         self.stopped = false;
         self.error = None;
         if !self.from_snapshot && snapshot_ready(Path::new(disk)) {
@@ -2743,19 +2869,29 @@ impl Setup {
             return;
         }
         let _ = pointer;
+        if self.from_snapshot && (self.paused || pause_ready(Path::new(disk))) {
+            self.checking = false;
+            self.paused = false;
+            self.pause_preview = false;
+            self.headline = Some("Debian is running from the guest disk.".into());
+            return;
+        }
+        self.checking = !self.from_snapshot;
+        self.paused = false;
+        self.pause_preview = false;
         self.headline = Some(if self.from_snapshot {
             "Starting Debian.".into()
         } else {
             "Debian is already installed. Checking SSH.".into()
         });
         self.mark("partition", "done");
-        self.mark("ssh", "now");
+        self.mark("ssh", if self.checking { "now" } else { "done" });
     }
 
     fn buttons(&self) -> Vec<&'static str> {
         let mut buttons = Vec::new();
         if self.stopped {
-            if !self.snapshot_ready {
+            if !self.from_snapshot && !self.snapshot_ready {
                 buttons.push(if self.installed {
                     "Start Debian"
                 } else {
@@ -2773,6 +2909,18 @@ impl Setup {
             }
         }
         buttons
+    }
+
+    fn stop(&mut self) {
+        self.stopped = true;
+    }
+
+    /// Install.onDisappear. The library keeps clone sessions, so this is a no-op for fromSnapshot.
+    fn disappear(&mut self) {
+        if self.from_snapshot {
+            return;
+        }
+        self.stop();
     }
 }
 
@@ -2804,9 +2952,159 @@ fn open_setup(screen: &Screen, dir: &Path) -> Setup {
 fn open_clone(disk: &str) -> Setup {
     let mut page = setup_page(true);
     page.snapshot_ready = false;
-    page.headline = Some("Starting Debian.".into());
+    page.stopped = true;
+    page.headline = Some("Debian is stopped. The guest disk is the installed system.".into());
     page.appear("", disk);
     page
+}
+
+/// Same as Welcome.swift LibraryModel. The detail view is one machine; sessions keep the others.
+struct Library {
+    machines: Vec<String>,
+    selected: Option<String>,
+    sessions: HashMap<String, Setup>,
+}
+
+impl Library {
+    fn refresh(&mut self, disks: &[String]) {
+        self.machines = disks.to_vec();
+        self.sessions.retain(|disk, session| {
+            if disks.iter().any(|live| live == disk) {
+                true
+            } else {
+                session.stop();
+                false
+            }
+        });
+        if self
+            .selected
+            .as_ref()
+            .map_or(true, |sel| !disks.iter().any(|disk| disk == sel))
+        {
+            self.selected = disks.first().cloned();
+        }
+    }
+
+    fn session(&mut self, disk: &str) -> &mut Setup {
+        if !self.sessions.contains_key(disk) {
+            let mut page = setup_page(true);
+            page.hold_clone(disk);
+            self.sessions.insert(disk.to_string(), page);
+        }
+        self.sessions.get_mut(disk).unwrap()
+    }
+
+    fn clone_new(&mut self, disk: String) {
+        let mut disks = self.machines.clone();
+        disks.push(disk.clone());
+        self.refresh(&disks);
+        self.selected = Some(disk);
+    }
+
+    fn show(&mut self) {
+        let Some(disk) = self.selected.clone() else {
+            return;
+        };
+        self.session(&disk).appear("", &disk);
+    }
+
+    fn hide(&mut self) {
+        let Some(disk) = self.selected.clone() else {
+            return;
+        };
+        self.session(&disk).disappear();
+    }
+}
+
+#[test]
+fn adding_a_library_machine_does_not_stop_a_running_clone() {
+    let dir = dir();
+    let first = dir.join("machines/debian/disk.img");
+    let second = dir.join("machines/debian-2/disk.img");
+    std::fs::create_dir_all(first.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(second.parent().unwrap()).unwrap();
+    std::fs::write(&first, b"disk").unwrap();
+    std::fs::write(&second, b"disk").unwrap();
+    let first = first.to_str().unwrap().to_string();
+    let second = second.to_str().unwrap().to_string();
+
+    let mut library = Library {
+        machines: Vec::new(),
+        selected: None,
+        sessions: HashMap::new(),
+    };
+    library.refresh(&[first.clone()]);
+    library.show();
+    library.session(&first).boot_disk(&first, true);
+    assert!(!library.session(&first).stopped);
+    assert!(library.session(&first).captures_pointer());
+
+    library.hide();
+    library.clone_new(second.clone());
+    library.show();
+    assert_eq!(library.selected.as_deref(), Some(second.as_str()));
+    assert!(
+        !library.session(&first).stopped,
+        "the running clone must stay up after a new machine is added"
+    );
+    assert!(library.session(&first).captures_pointer());
+    assert!(library.session(&second).stopped);
+    assert!(!library.session(&second).captures_pointer());
+    assert_eq!(
+        library.session(&second).headline.as_deref(),
+        Some("Debian is stopped. The guest disk is the installed system.")
+    );
+
+    library.hide();
+    library.selected = Some(first.clone());
+    library.show();
+    assert!(!library.session(&first).stopped);
+    assert_eq!(
+        library.session(&first).headline.as_deref(),
+        Some("Starting Debian.")
+    );
+
+    library.refresh(&[second.clone()]);
+    assert!(!library.sessions.contains_key(&first));
+    assert_eq!(library.selected.as_deref(), Some(second.as_str()));
+}
+
+#[test]
+fn a_clone_view_does_not_stop_on_disappear() {
+    let dir = dir();
+    let disk = dir.join("machines/lab/disk.img");
+    std::fs::create_dir_all(disk.parent().unwrap()).unwrap();
+    std::fs::write(&disk, b"disk").unwrap();
+    let disk = disk.to_str().unwrap();
+    let mut clone = open_clone(disk);
+    clone.boot_disk(disk, true);
+    clone.disappear();
+    assert!(!clone.stopped);
+    assert!(clone.captures_pointer());
+
+    let mut setup = setup_page(false);
+    setup.start(
+        dir.join("cache/iso").to_str().unwrap(),
+        dir.join("snapshots/debian/disk.img").to_str().unwrap(),
+    );
+    assert!(!setup.stopped);
+    setup.disappear();
+    assert!(setup.stopped);
+
+    // The worker's ready line is what opens Debian setup. That page still stops when it disappears.
+    let (base, _) = serve(SUMS, SIGN, ISO, KEY, false, false, false);
+    let (status, events, work) = run(&base);
+    assert_eq!(status, 0, "{events:?}");
+    let screen = finish(&events, status);
+    let mut opened = open_setup(&screen, &work);
+    assert!(!opened.stopped);
+    assert!(opened.shows_installer());
+    opened.disappear();
+    assert!(opened.stopped);
+    let mut again = open_clone(disk);
+    again.boot_disk(disk, true);
+    again.disappear();
+    assert!(!again.stopped, "a started clone stays running after the view disappears");
 }
 
 #[test]
@@ -3025,6 +3323,11 @@ fn support_of(disk: &std::path::Path) -> std::path::PathBuf {
         .to_path_buf()
 }
 
+fn pause_ready(disk: &std::path::Path) -> bool {
+    let dir = disk.parent().unwrap();
+    dir.join("paused").is_file() && dir.join("paused.vzvmsave").is_file()
+}
+
 fn snapshot_ready(disk: &std::path::Path) -> bool {
     let snap = support_of(disk).join("snapshots/debian");
     snap.join("disk.img").is_file()
@@ -3241,7 +3544,7 @@ fn quick_start_swift_gates_the_bar_on_a_real_download() {
         include_str!("../Sources/Install.swift").contains("SupportDir.snapshotReady")
     );
     assert!(include_str!("../Sources/Install.swift")
-        .contains("GuestSession(fromSnapshot: fromSnapshot, diskWritten: false, snapshotSaved: snapshotSaved, loggedIn: loggedIn)"));
+        .contains("GuestSession(fromSnapshot: fromSnapshot, diskWritten: false, snapshotSaved: snapshotSaved, loggedIn: loggedIn, paused: paused)"));
     assert!(!include_str!("../Sources/Install.swift").contains("GuestSession(fromSnapshot: loggedIn"));
     assert!(!src.contains("Button(\"Open"));
     assert!(!include_str!("../Sources/Install.swift").contains("SupportDir.open()"));
@@ -3250,7 +3553,7 @@ fn quick_start_swift_gates_the_bar_on_a_real_download() {
     assert!(src.contains("static let preseed"));
     assert!(include_str!("../Sources/Install.swift").contains("Debian setup"));
     assert!(src.contains("private var showsInstaller: Bool"));
-    assert!(include_str!("../Sources/Install.swift").contains("if !guest.snapshotReady {"));
+    assert!(include_str!("../Sources/Install.swift").contains("if !fromSnapshot && !guest.snapshotReady {"));
     assert!(include_str!("../Sources/Install.swift").contains("GuestMirror"));
     assert!(
         include_str!("../Sources/Install.swift").contains("func attach(_ screen: InstallScreen)")
@@ -3262,7 +3565,7 @@ fn quick_start_swift_gates_the_bar_on_a_real_download() {
     assert!(include_str!("../Sources/Install.swift").contains("frame(width: setup ? 440 : 848"));
     assert!(!include_str!("../Sources/Install.swift").contains("frame(height: 96)"));
     assert!(include_str!("../Sources/Install.swift")
-        .contains("private var capturePointer: Bool { fromSnapshot }"));
+        .contains("private var capturePointer: Bool { fromSnapshot && !guest.stopped }"));
     assert!(include_str!("../Sources/Install.swift").contains("pointer: false"));
     assert!(include_str!("../Sources/Guest.swift").contains("pointer: Bool = false"));
     assert!(!include_str!("../Sources/Install.swift").contains("InstalledDisk.looksInstalled"));
@@ -3282,7 +3585,7 @@ fn quick_start_swift_gates_the_bar_on_a_real_download() {
     assert!(include_str!("../src/ssh.rs").contains("ConnectTimeout=1"));
     assert!(include_str!("../Sources/QuickStart.swift").contains("terminationHandler"));
     assert!(include_str!("../Sources/QuickStart.swift").contains("[\"ssh\", \"--disk\", disk.path]"));
-    assert!(include_str!("../Sources/Install.swift").contains("self.watchSSH()"));
+    assert!(include_str!("../Sources/Install.swift").contains("watchSSH()"));
     assert!(include_str!("../Sources/Install.swift").contains("A saved snapshot is the artifact"));
     assert!(!include_str!("../Sources/Install.swift").contains("login file was removed"));
     assert!(!include_str!("../Sources/Install.swift").contains("machine?.state == .running"));
@@ -3300,7 +3603,51 @@ fn quick_start_swift_gates_the_bar_on_a_real_download() {
     );
     assert!(!include_str!("../Sources/Welcome.swift").contains("New Debian"));
     assert!(include_str!("../Sources/Welcome.swift").contains("Quick start"));
-    assert!(include_str!("../Sources/App.swift").contains("id: \"debian\""));
+    assert!(include_str!("../Sources/Welcome.swift").contains("Text(\"Welcome\")"));
+    assert!(include_str!("../Sources/Welcome.swift").contains("Download Debian 13 for this Mac."));
+    assert!(include_str!("../Sources/Welcome.swift").contains("desktopcomputer"));
+    assert!(include_str!("../Sources/Welcome.swift").contains("library.snapshotReady"));
+    assert!(include_str!("../Sources/Welcome.swift").contains("NavigationSplitView"));
+    assert!(include_str!("../Sources/Welcome.swift").contains("Worker.cloneMachine"));
+    assert!(include_str!("../Sources/Welcome.swift").contains("fromSnapshot: true"));
+    assert!(include_str!("../Sources/Welcome.swift").contains("GuestPause.isPaused"));
+    assert!(include_str!("../Sources/Guest.swift").contains("func preview(beside"));
+    assert!(!include_str!("../Sources/Welcome.swift").contains("Image(nsImage: image)"));
+    assert!(!include_str!("../Sources/Welcome.swift").contains("Text(\"Paused\")"));
+    assert!(include_str!("../Sources/Welcome.swift").contains("libraryDidChange"));
+    assert!(!include_str!("../Sources/App.swift").contains("id: \"debian\""));
+    assert!(include_str!("../Sources/Welcome.swift").contains("func cloneNew()"));
+    assert!(include_str!("../Sources/Welcome.swift").contains("New virtual machine"));
+    assert!(include_str!("../Sources/Welcome.swift").contains("func session(for"));
+    assert!(include_str!("../Sources/Welcome.swift").contains("session: library.session(for: disk)"));
+    assert!(include_str!("../Sources/Install.swift").contains("if fromSnapshot { return }"));
+    assert!(!include_str!("../Sources/Install.swift").contains("keepRunning"));
+    assert!(include_str!("../Sources/Install.swift").contains("openWindow(id: \"main\")"));
+    assert!(include_str!("../Sources/Install.swift").contains("var fill = false"));
+    assert!(include_str!("../Sources/Install.swift").contains("private var filled"));
+    assert!(include_str!("../Sources/Install.swift").contains("guest.pausePreview"));
+    assert!(include_str!("../Sources/Install.swift").contains("GuestView stays mounted under that frame"));
+    assert!(include_str!("../Sources/Install.swift").contains("func snapshot()"));
+    assert!(include_str!("../Sources/Install.swift").contains("cacheDisplay"));
+    assert!(!include_str!("../Sources/Install.swift").contains("Text(\"Paused\")"));
+    assert!(include_str!("../Sources/Install.swift").contains("Button(\"Stop\") { guest.halt() }"));
+    assert!(include_str!("../Sources/Install.swift").contains("Button(\"Pause\") { guest.pauseGuest() }"));
+    assert!(include_str!("../Sources/Install.swift").contains("func publishLibrary"));
+    assert!(include_str!("../Sources/Install.swift").contains("self.publishLibrary()"));
+    assert!(include_str!("../Sources/Install.swift").contains("func halt()"));
+    assert!(include_str!("../Sources/Install.swift").contains("func pauseGuest()"));
+    assert!(include_str!("../Sources/Install.swift").contains("func holdClone"));
+    assert!(include_str!("../Sources/Install.swift").contains("restoreMachineStateFrom"));
+    assert!(include_str!("../Sources/Guest.swift").contains("enum GuestPause"));
+    assert!(include_str!("../Sources/Install.swift").contains("view.snapshot()"));
+    assert!(include_str!("../Sources/Install.swift").contains("pausePreview = frame"));
+    assert!(include_str!("../Sources/Guest.swift").contains("func preview(beside"));
+    assert!(include_str!("../src/pause.rs").contains("paused.png"));
+    assert!(include_str!("../src/pause.rs").contains("preview(disk)"));
+    assert!(include_str!("../Sources/Guest.swift").contains("VZGenericMachineIdentifier"));
+    assert!(include_str!("../Sources/Guest.swift").contains("machine-id"));
+    assert!(include_str!("../Sources/QuickStart.swift").contains("[\"pause\", \"--disk\", disk.path]"));
+    assert!(include_str!("../Sources/QuickStart.swift").contains("[\"unpause\", \"--disk\", disk.path]"));
     assert!(!src.contains("wizard.downloading && wizard.total > 0"));
     assert!(src.contains("Connecting..."));
     assert!(src.contains("scaleEffect(x: wizard.fraction"));

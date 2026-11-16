@@ -1,4 +1,6 @@
 import SwiftUI
+import AppKit
+import CoreGraphics
 import Virtualization
 
 /// The screen after the download. The installer writes the snapshot disk.
@@ -22,15 +24,18 @@ struct Install: View {
     var slot: InstallSlotModel? = nil
     /// Reset is building a new image. A snapshot already on disk must not skip the installer.
     var freshInstall = false
+    /// The library window fills with the guest. A clone window keeps the fixed page.
+    var fill = false
     @StateObject private var guest: GuestSession
     @Environment(\.openWindow) private var openWindow
 
-    init(iso: String, disk: String, fromSnapshot: Bool = false, embedded: Bool = false, freshInstall: Bool = false, steps: Binding<[WizardStep]>? = nil, slot: InstallSlotModel? = nil) {
+    init(iso: String, disk: String, fromSnapshot: Bool = false, embedded: Bool = false, freshInstall: Bool = false, fill: Bool = false, session: GuestSession? = nil, steps: Binding<[WizardStep]>? = nil, slot: InstallSlotModel? = nil) {
         self.iso = iso
         self.disk = disk
         self.fromSnapshot = fromSnapshot
         self.embedded = embedded
         self.freshInstall = freshInstall
+        self.fill = fill
         self.steps = steps
         self.slot = slot
         let loggedIn = fromSnapshot || GuestSSH.loggedIn(beside: URL(fileURLWithPath: disk))
@@ -39,20 +44,23 @@ struct Install: View {
         // Reset does not skip it. That run is a new image, the way Packer rebuilds.
         // loggedIn is not a clone. Passing it as fromSnapshot skipped Create snapshot after the files were removed.
         let snapshotSaved = !fromSnapshot && !freshInstall && SupportDir.snapshotReady
-        _guest = StateObject(wrappedValue: GuestSession(fromSnapshot: fromSnapshot, diskWritten: false, snapshotSaved: snapshotSaved, loggedIn: loggedIn))
+        let paused = fromSnapshot && GuestPause.isPaused(beside: URL(fileURLWithPath: disk))
+        _guest = StateObject(wrappedValue: session ?? GuestSession(fromSnapshot: fromSnapshot, diskWritten: false, snapshotSaved: snapshotSaved, loggedIn: loggedIn, paused: paused))
     }
 
     /// Quick start stays the download-sized wizard. A clone is the machine window.
     private var setup: Bool { !fromSnapshot }
 
-    /// A clone captures. Quick start does not, including the installer window opened from the thumbnail.
-    private var capturePointer: Bool { fromSnapshot }
+    /// A clone captures while it is running. Quick start does not, including the installer window opened from the thumbnail.
+    private var capturePointer: Bool { fromSnapshot && !guest.stopped }
 
     var body: some View {
         Group {
             if embedded {
                 // Quick start draws the screen and the steps. This copy only keeps the guest running.
                 Color.clear
+            } else if fill {
+                filled
             } else {
                 page
             }
@@ -71,7 +79,7 @@ struct Install: View {
         }
         .onDisappear {
             // Closing the wizard mid-install must not stop the guest. The scene still owns this session.
-            // A clone window is the only one that stops its machine when it goes away.
+            // A library clone is owned by LibraryModel, so adding a machine does not stop this one.
             // Verify with host key is different: its login scan outlives the window. Stop that scan.
             // The next wizard run starts the installer again. It does not resume the disk alone.
             if embedded {
@@ -83,6 +91,7 @@ struct Install: View {
                 }
                 return
             }
+            if fromSnapshot { return }
             if slot?.session === guest { slot?.session = nil }
             guest.stop()
         }
@@ -99,9 +108,35 @@ struct Install: View {
             } else if guest.leaving && !fromSnapshot {
                 guest.resumeHostKey()
             } else if fromSnapshot {
-                guest.bootDisk(disk, pointer: true)
+                guest.holdClone(disk)
             } else {
                 guest.start(iso: iso, disk: disk)
+            }
+        }
+        .onChange(of: guest.snapshotReady) { _, ready in
+            // The library is the machine window. Do not open a second guest page.
+            if ready, !fromSnapshot { showLibrary() }
+        }
+    }
+
+    private var filled: some View {
+        ZStack {
+            guestScreen
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(.black)
+                .allowsHitTesting(!guest.stopped)
+            if let error = guest.error {
+                Text(error).font(.callout).foregroundStyle(.red).padding()
+            }
+        }
+        .toolbar {
+            ToolbarItemGroup(placement: .primaryAction) {
+                Button("Start") { guest.bootDisk(disk, pointer: true) }
+                    .disabled(!guest.stopped)
+                Button("Pause") { guest.pauseGuest() }
+                    .disabled(guest.stopped)
+                Button("Stop") { guest.halt() }
+                    .disabled(guest.stopped && !guest.paused)
             }
         }
     }
@@ -122,6 +157,18 @@ struct Install: View {
         }
         .padding(24)
         .frame(width: setup ? 440 : 848, alignment: .topLeading)
+        .toolbar {
+            if fromSnapshot {
+                ToolbarItemGroup(placement: .primaryAction) {
+                    Button("Start") { guest.bootDisk(disk, pointer: true) }
+                        .disabled(!guest.stopped)
+                    Button("Pause") { guest.pauseGuest() }
+                        .disabled(guest.stopped)
+                    Button("Stop") { guest.halt() }
+                        .disabled(guest.stopped && !guest.paused)
+                }
+            }
+        }
     }
 
     private var header: some View {
@@ -135,8 +182,11 @@ struct Install: View {
     }
 
     /// The guest screen. A clone window shows this at 800 by 500. Quick start uses a thumbnail on the step instead.
+    /// A pause keeps the last frame, the way UTM caches the view before the machine is stopped.
+    /// GuestView stays mounted under that frame. Replacing it unhooks the virtual machine view, and the next pause has nothing to snapshot.
+    /// The still is an AppKit sibling on top of the Metal guest. A SwiftUI Image in the ZStack does not cover it.
     private var guestScreen: some View {
-        GuestView(session: guest, capture: capturePointer)
+        GuestView(session: guest, capture: capturePointer, preview: guest.pausePreview)
             .background(.black, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
             .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
     }
@@ -159,7 +209,7 @@ struct Install: View {
             if guest.stopped {
                 // The installer disk is the snapshot being built. Starting it again is not a machine the user runs.
                 // New virtual machine clones that snapshot. Start Debian stays for a disk that still needs the SSH check.
-                if !guest.snapshotReady {
+                if !fromSnapshot && !guest.snapshotReady {
                     Button(guest.installed ? "Start Debian" : "Start from the guest disk") {
                         guest.startInstalled()
                     }
@@ -217,6 +267,7 @@ struct Install: View {
         }
     }
 
+    /// Copy the snapshot into the library. That window is the machine; a second guest window is not.
     private func newMachine() {
         guest.cloning = true
         let dir = SupportDir.url
@@ -226,12 +277,22 @@ struct Install: View {
                 guest.cloning = false
                 switch result {
                 case .success(let path):
-                    openWindow(id: "debian", value: path)
+                    showLibrary(select: path)
                 case .failure(let message):
                     guest.error = message
                 }
             }
         }
+    }
+
+    private func showLibrary(select disk: String? = nil) {
+        NotificationCenter.default.post(name: .libraryDidChange, object: disk)
+        if let window = NSApp.windows.first(where: { AppWindow.isMain($0) }) {
+            window.makeKeyAndOrderFront(nil)
+        } else {
+            openWindow(id: "main")
+        }
+        AppWindow.closeQuickStart()
     }
 }
 
@@ -253,7 +314,112 @@ struct InstallGuest: View {
     }
 }
 
-final class GuestSession: NSObject, ObservableObject, VZVirtualMachineDelegate {
+private func failureText(_ error: Error?) -> String? {
+    error?.localizedDescription
+}
+
+private func failureText(_ result: Result<Void, Error>) -> String? {
+    if case .failure(let error) = result { return error.localizedDescription }
+    return nil
+}
+
+private func pngData(_ image: NSImage) -> Data? {
+    var rect = NSRect(origin: .zero, size: image.size)
+    if let cg = image.cgImage(forProposedRect: &rect, context: nil, hints: nil) {
+        if let data = NSBitmapImageRep(cgImage: cg).representation(using: .png, properties: [:]) {
+            return data
+        }
+    }
+    guard let tiff = image.tiffRepresentation, let rep = NSBitmapImageRep(data: tiff) else { return nil }
+    return rep.representation(using: .png, properties: [:])
+}
+
+/// Copy cacheDisplay into our own bitmap so the pause still is not tied to the view.
+private func ownedImage(_ image: CGImage, size: CGSize) -> NSImage {
+    let width = image.width
+    let height = image.height
+    guard width > 0, height > 0, let ctx = CGContext(
+        data: nil,
+        width: width,
+        height: height,
+        bitsPerComponent: 8,
+        bytesPerRow: 0,
+        space: CGColorSpaceCreateDeviceRGB(),
+        bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+    ) else {
+        return NSImage(cgImage: image, size: size)
+    }
+    ctx.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+    guard let copy = ctx.makeImage() else {
+        return NSImage(cgImage: image, size: size)
+    }
+    return NSImage(cgImage: copy, size: size)
+}
+
+/// cacheDisplay of a Metal guest is often fully transparent. That is not a frame.
+private func visiblePixels(_ image: NSImage) -> Bool {
+    var rect = NSRect(origin: .zero, size: image.size)
+    guard let cg = image.cgImage(forProposedRect: &rect, context: nil, hints: nil), cg.width > 1, cg.height > 1 else {
+        return false
+    }
+    switch cg.alphaInfo {
+    case .none, .noneSkipLast, .noneSkipFirst:
+        return true
+    default:
+        break
+    }
+    let pixel = UnsafeMutablePointer<UInt8>.allocate(capacity: 4)
+    defer { pixel.deallocate() }
+    guard let ctx = CGContext(
+        data: pixel,
+        width: 1,
+        height: 1,
+        bitsPerComponent: 8,
+        bytesPerRow: 4,
+        space: CGColorSpaceCreateDeviceRGB(),
+        bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+    ) else {
+        return true
+    }
+    let stepX = max(cg.width / 8, 1)
+    let stepY = max(cg.height / 8, 1)
+    var y = 0
+    while y < cg.height {
+        var x = 0
+        while x < cg.width {
+            pixel.update(repeating: 0, count: 4)
+            ctx.clear(CGRect(x: 0, y: 0, width: 1, height: 1))
+            ctx.draw(cg, in: CGRect(x: -x, y: -y, width: cg.width, height: cg.height))
+            if pixel[3] > 8 { return true }
+            x += stepX
+        }
+        y += stepY
+    }
+    return false
+}
+
+/// Forwards Virtualization callbacks. GuestSession is not an NSObject, so a completion cannot erase it to NSObject.
+final class MachineDelegate: NSObject, VZVirtualMachineDelegate {
+    weak var session: GuestSession?
+    var token = 0
+
+    func guestDidStop(_: VZVirtualMachine) {
+        deliver(token, nil)
+    }
+
+    func virtualMachine(_: VZVirtualMachine, didStopWithError error: Error) {
+        deliver(token, error.localizedDescription)
+    }
+
+    private func deliver(_ token: Int, _ message: String?) {
+        let session = session
+        DispatchQueue.main.async {
+            session?.stoppedFromDelegate(token, message: message)
+        }
+    }
+}
+
+final class GuestSession: ObservableObject {
     @Published var headline: String
     @Published var error: String?
     @Published var installed: Bool
@@ -264,9 +430,16 @@ final class GuestSession: NSObject, ObservableObject, VZVirtualMachineDelegate {
     @Published var showWindow = false
     @Published var cloning = false
     @Published var setupSteps = WizardStep.setup
+    /// A pause save beside this disk. Start restores it instead of a cold boot.
+    @Published var paused = false
+    /// Last guest frame at pause. Shown while the machine is stopped.
+    @Published var pausePreview: NSImage?
     /// Quick start passes its own list. A clone keeps the rows on this session.
     var steps: Binding<[WizardStep]>?
     let view = InstallScreen()
+    private let callbacks = MachineDelegate()
+    /// Bumped when the running machine changes, so a late callback cannot act on the next boot.
+    private var generation = 0
     private var machine: VZVirtualMachine?
     private var diskURL: URL?
     private var started = false
@@ -290,28 +463,46 @@ final class GuestSession: NSObject, ObservableObject, VZVirtualMachineDelegate {
     /// The installer image is attached. Verify with host key is not this.
     var installingGuest: Bool { installing }
 
-    init(fromSnapshot: Bool = false, diskWritten: Bool = false, snapshotSaved: Bool = false, loggedIn: Bool = false) {
+    init(fromSnapshot: Bool = false, diskWritten: Bool = false, snapshotSaved: Bool = false, loggedIn: Bool = false, paused: Bool = false) {
         installed = fromSnapshot || diskWritten || snapshotSaved
         self.loggedIn = fromSnapshot || snapshotSaved || loggedIn
         fromSnapshotBoot = fromSnapshot
         snapshotReady = snapshotSaved
         saved = snapshotSaved
+        self.paused = paused
         headline = if snapshotSaved && !fromSnapshot {
             "Debian is installed and shut down. A snapshot is saved for new machines."
         } else if fromSnapshot {
-            "Starting Debian."
+            paused ? "Debian is paused." : "Debian is stopped. The guest disk is the installed system."
         } else if diskWritten {
             "Debian is already installed. Checking SSH."
         } else {
             "Starting the installer."
         }
-        super.init()
+        callbacks.session = self
         if snapshotSaved && !fromSnapshot {
             stopped = true
             markSetup("partition", state: "done")
             markSetup("ssh", state: "done")
             markSetup("snapshot", state: "done")
+        } else if fromSnapshot {
+            stopped = true
         }
+    }
+
+    /// A clone stays off until Start. A pause save is restored then, not on open.
+    func holdClone(_ path: String) {
+        if started && !stopped { return }
+        diskURL = URL(fileURLWithPath: path)
+        installing = false
+        checking = false
+        stopped = true
+        installed = true
+        started = true
+        error = nil
+        paused = GuestPause.isPaused(beside: diskURL!)
+        pausePreview = paused ? NSImage(contentsOf: GuestPause.preview(beside: diskURL!)) : nil
+        headline = paused ? "Debian is paused." : "Debian is stopped. The guest disk is the installed system."
     }
 
     /// Quick start came back after the snapshot. Do not start the installer virtual machine.
@@ -360,8 +551,9 @@ final class GuestSession: NSObject, ObservableObject, VZVirtualMachineDelegate {
     }
 
     func bootDisk(_ path: String, pointer: Bool) {
-        guard !started else { return }
+        guard !started || stopped else { return }
         started = true
+        leaving = false
         installed = true
         loggedIn = fromSnapshotBoot || GuestSSH.loggedIn(beside: URL(fileURLWithPath: path))
         installing = false
@@ -373,12 +565,140 @@ final class GuestSession: NSObject, ObservableObject, VZVirtualMachineDelegate {
             holdFinished(path)
             return
         }
-        // A partition table is not a finished install. SSH is. The probe only runs while this is set.
-        checking = true
+        if fromSnapshotBoot, paused, let vm = machine {
+            resumePaused(vm, disk: diskURL!)
+            return
+        }
+        if fromSnapshotBoot && (paused || GuestPause.isPaused(beside: diskURL!)) {
+            restorePaused(pointer: pointer)
+            return
+        }
+        // A clone is already installed. Do not probe SSH or save a snapshot; that path powers the guest off.
+        checking = !fromSnapshotBoot
+        paused = false
+        pausePreview = nil
         headline = fromSnapshotBoot ? "Starting Debian." : "Debian is already installed. Checking SSH."
         markSetup("partition", state: "done")
-        markSetup("ssh", state: "now")
+        markSetup("ssh", state: checking ? "now" : "done")
         boot { try Guest.boot(disk: diskURL!, pointer: pointer) }
+    }
+
+    /// Resume a clone that is still paused in memory. Restoring the save would start a second machine on the same disk.
+    private func resumePaused(_ vm: VZVirtualMachine, disk: URL) {
+        paused = true
+        headline = "Resuming Debian."
+        let token = generation
+        let resumed: (String?) -> Void = { [weak self] message in
+            DispatchQueue.main.async { self?.resumeFinished(token, disk: disk, message: message) }
+        }
+        vm.resume { result in
+            resumed(failureText(result))
+        }
+    }
+
+    /// Restore a pause save, then resume. A save with no machine identifier cannot match and is dropped.
+    private func restorePaused(pointer: Bool) {
+        guard let disk = diskURL else { return }
+        if !GuestPause.hasMachineID(beside: disk) {
+            dropUnrestorablePause(disk, pointer: pointer)
+            return
+        }
+        paused = true
+        headline = "Resuming Debian."
+        let vm: VZVirtualMachine
+        do {
+            vm = try Guest.boot(disk: disk, pointer: pointer)
+        } catch {
+            paused = true
+            stopped = true
+            fail(error.localizedDescription)
+            headline = "Debian is paused."
+            return
+        }
+        bind(vm)
+        let token = generation
+        let failed: (String) -> Void = { [weak self] message in
+            DispatchQueue.main.async { self?.restoreFailed(token, message) }
+        }
+        let resumed: (String?) -> Void = { [weak self] message in
+            DispatchQueue.main.async { self?.resumeFinished(token, disk: disk, message: message) }
+        }
+        vm.restoreMachineStateFrom(url: GuestPause.state(beside: disk)) { (error: Error?) in
+            if let message = failureText(error) {
+                failed(message)
+                return
+            }
+            vm.resume { result in
+                resumed(failureText(result))
+            }
+        }
+    }
+
+    /// A pause from before the identifier was stored cannot be restored. Start the disk instead.
+    private func dropUnrestorablePause(_ disk: URL, pointer: Bool) {
+        paused = false
+        pausePreview = nil
+        GuestPause.forget(beside: disk)
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            _ = Worker.clearPaused(disk: disk)
+            DispatchQueue.main.async { self?.publishLibrary() }
+        }
+        checking = false
+        headline = "Starting Debian."
+        boot { try Guest.boot(disk: disk, pointer: pointer) }
+    }
+
+    private func restoreFailed(_ token: Int, _ message: String) {
+        guard token == generation else { return }
+        paused = true
+        stopped = true
+        dropMachine()
+        error = message
+        headline = "Debian is paused."
+    }
+
+    private func resumeFinished(_ token: Int, disk: URL, message: String?) {
+        guard token == generation, machine != nil else { return }
+        if let message {
+            paused = true
+            stopped = true
+            error = message
+            headline = "Debian is paused."
+            return
+        }
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let err = Worker.clearPaused(disk: disk)
+            DispatchQueue.main.async {
+                guard let self, token == self.generation else { return }
+                if let err { self.error = err }
+                self.paused = false
+                self.pausePreview = nil
+                self.stopped = false
+                self.headline = "Debian is running from the guest disk."
+                self.publishLibrary()
+            }
+        }
+    }
+
+    private func dropMachine() {
+        generation += 1
+        callbacks.token = generation
+        let running = machine
+        machine = nil
+        running?.delegate = nil
+        // Leaving the Metal view attached draws black over the pause still after stop.
+        if view.virtualMachine === running {
+            view.virtualMachine = nil
+        }
+    }
+
+    private func bind(_ vm: VZVirtualMachine) {
+        generation += 1
+        callbacks.token = generation
+        vm.delegate = callbacks
+        view.virtualMachine = vm
+        view.capture = false
+        machine = vm
     }
 
     /// The installer powers off when the preseed check passes. The next start is the disk it wrote.
@@ -403,7 +723,7 @@ final class GuestSession: NSObject, ObservableObject, VZVirtualMachineDelegate {
         checking = true
         loggedIn = GuestSSH.loggedIn(beside: disk)
         watch?.invalidate()
-        machine = nil
+        dropMachine()
         // This boot only checks SSH. A pointer here is what captures the cursor in the popup.
         boot { try Guest.boot(disk: disk, pointer: false) }
     }
@@ -418,9 +738,8 @@ final class GuestSession: NSObject, ObservableObject, VZVirtualMachineDelegate {
         watch = nil
         GuestSSH.stop()
         let running = machine
-        machine = nil
+        dropMachine()
         stopped = true
-        running?.delegate = nil
         running?.stop { _ in }
     }
 
@@ -431,15 +750,158 @@ final class GuestSession: NSObject, ObservableObject, VZVirtualMachineDelegate {
         watch = nil
         // The host-key login is still running. Kill it, or the next open stays on Verify with host key.
         GuestSSH.stop()
-        machine?.stop { _ in }
+        stopped = true
+        let running = machine
+        dropMachine()
+        running?.stop { _ in }
+    }
+
+    /// Stop a running clone. Start boots the same disk again. A pause save is dropped.
+    func halt() {
+        guard fromSnapshotBoot, (!stopped || paused) else { return }
+        probing = false
+        watch?.invalidate()
+        watch = nil
+        stopped = true
+        headline = "Debian stopped. The guest disk is the installed system."
+        let running = machine
+        dropMachine()
+        running?.stop { _ in }
+        guard let disk = diskURL else {
+            paused = false
+            pausePreview = nil
+            return
+        }
+        let drop = paused || GuestPause.isPaused(beside: disk)
+        paused = false
+        pausePreview = nil
+        if drop {
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                _ = Worker.clearPaused(disk: disk)
+                DispatchQueue.main.async { self?.publishLibrary() }
+            }
+        }
+    }
+
+    /// Pause a running clone and keep the save beside the disk. Quit can resume it.
+    func pauseGuest() {
+        guard fromSnapshotBoot, !stopped, !paused, machine != nil, let disk = diskURL else { return }
+        headline = "Pausing Debian."
+        let token = generation
+        let failed: (String) -> Void = { [weak self] message in
+            DispatchQueue.main.async { self?.pauseFailed(token, message) }
+        }
+        // Last guest pixels before pause. cacheDisplay is often empty for Metal; then the paused machine keeps the frame.
+        let earlier = view.snapshot()
+        // Capture self here. A nested [weak self] in the pause block disagrees with that block's capture.
+        let pausedVM: () -> Void = { [weak self] in
+            DispatchQueue.main.async {
+                guard let self, token == self.generation else { return }
+                let shot = [earlier, self.view.cachedPixels()].compactMap { $0 }.first(where: visiblePixels)
+                // Pin the frame now. Saving state takes a moment, and the Metal guest goes black after that.
+                if let shot {
+                    self.pausePreview = shot
+                    if let pane = self.view.superview as? GuestPane {
+                        pane.show(shot)
+                    }
+                    self.view.virtualMachine = nil
+                }
+                self.writePause(token, disk: disk, frame: shot)
+            }
+        }
+        guard let vm = machine else { return }
+        vm.pause { result in
+            if let message = failureText(result) {
+                failed(message)
+                return
+            }
+            pausedVM()
+        }
+    }
+
+    private func pauseFailed(_ token: Int, _ message: String) {
+        guard token == generation, machine != nil else { return }
+        error = message
+        headline = "Debian is running from the guest disk."
+    }
+
+    private func writePause(_ token: Int, disk: URL, frame: NSImage?) {
+        guard token == generation, let vm = machine else { return }
+        let url = GuestPause.state(beside: disk)
+        _ = try? FileManager.default.removeItem(at: url)
+        let saved: (String?) -> Void = { [weak self] message in
+            DispatchQueue.main.async { self?.pauseSaved(token, disk: disk, url: url, frame: frame, message: message) }
+        }
+        vm.saveMachineStateTo(url: url) { (error: Error?) in
+            saved(failureText(error))
+        }
+    }
+
+    private func pauseSaved(_ token: Int, disk: URL, url: URL, frame: NSImage?, message: String?) {
+        guard token == generation, let vm = machine else { return }
+        if let message {
+            error = message
+            headline = "Debian is running from the guest disk."
+            pausePreview = nil
+            view.virtualMachine = vm
+            (view.superview as? GuestPane)?.show(nil)
+            vm.resume { _ in }
+            return
+        }
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let err = Worker.markPaused(disk: disk)
+            DispatchQueue.main.async {
+                guard let self, token == self.generation, self.machine != nil else { return }
+                if let err {
+                    self.error = err
+                    self.headline = "Debian is running from the guest disk."
+                    self.pausePreview = nil
+                    self.view.virtualMachine = self.machine
+                    (self.view.superview as? GuestPane)?.show(nil)
+                    self.machine?.resume { _ in }
+                    _ = try? FileManager.default.removeItem(at: url)
+                    return
+                }
+                self.paused = true
+                self.stopped = true
+                let shot = [frame, self.pausePreview, self.view.cachedPixels()].compactMap { $0 }.first(where: visiblePixels)
+                self.pausePreview = shot
+                // pausePreview = frame is the still GuestPane shows over the Metal guest.
+                if let shot, let png = pngData(shot) {
+                    let preview = GuestPause.preview(beside: disk)
+                    try? png.write(to: preview, options: .atomic)
+                    if let diskImage = NSImage(contentsOf: preview) {
+                        self.pausePreview = diskImage
+                    }
+                }
+                self.view.virtualMachine = nil
+                if let pane = self.view.superview as? GuestPane {
+                    pane.show(self.pausePreview)
+                }
+                self.headline = "Debian is paused."
+                self.publishLibrary()
+                // A visible still can cover the guest. Without one, keep the paused machine so Metal still shows the last frame.
+                if self.pausePreview != nil {
+                    let running = self.machine
+                    self.dropMachine()
+                    running?.stop { _ in }
+                }
+            }
+        }
+    }
+
+    /// The guest pane reads pause files. The sidebar does not, so a pause must not rebuild that list.
+    fileprivate func publishLibrary() {
+        NotificationCenter.default.post(name: .libraryDidChange, object: nil)
     }
 
     deinit {
         leaving = true
         watch?.invalidate()
         GuestSSH.stop()
-        machine?.delegate = nil
-        machine?.stop { _ in }
+        let running = machine
+        dropMachine()
+        running?.stop { _ in }
     }
 
     /// The app was closed on Verify with host key. The next wizard run starts the installer again.
@@ -460,7 +922,7 @@ final class GuestSession: NSObject, ObservableObject, VZVirtualMachineDelegate {
         showWindow = false
         probing = false
         installed = false
-        machine = nil
+        dropMachine()
         started = false
         let installer = disk.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
             .appendingPathComponent("installer/boot.iso")
@@ -468,22 +930,11 @@ final class GuestSession: NSObject, ObservableObject, VZVirtualMachineDelegate {
         start(iso: installer.path, disk: disk.path)
     }
 
-    func guestDidStop(_ virtualMachine: VZVirtualMachine) {
-        DispatchQueue.main.async {
-            // A host-key pause stops the old machine. Its callback must not boot over the one the next open started.
-            guard virtualMachine === self.machine else { return }
-            self.noteStopped()
-        }
-    }
-
-    func virtualMachine(_ virtualMachine: VZVirtualMachine, didStopWithError err: Error) {
-        DispatchQueue.main.async {
-            guard virtualMachine === self.machine else { return }
-            let message = err.localizedDescription
-            self.noteStopped()
-            if !self.snapshotReady && self.error == nil && !self.checking {
-                self.fail(message)
-            }
+    fileprivate func stoppedFromDelegate(_ token: Int, message: String?) {
+        guard token == generation else { return }
+        noteStopped()
+        if let message, !snapshotReady, error == nil, !checking {
+            fail(message)
         }
     }
 
@@ -533,13 +984,13 @@ final class GuestSession: NSObject, ObservableObject, VZVirtualMachineDelegate {
         if savingSnapshot {
             stopped = true
             watch?.invalidate()
-            machine = nil
+            dropMachine()
             return
         }
         guard !stopped else { return }
         stopped = true
         watch?.invalidate()
-        machine = nil
+        dropMachine()
         if installing {
             installing = false
             installed = true
@@ -603,15 +1054,16 @@ final class GuestSession: NSObject, ObservableObject, VZVirtualMachineDelegate {
         savingSnapshot = true
         error = nil
         if let machine, !stopped {
-            machine.stop { [weak self] _ in
+            let stoppedCopy: () -> Void = { [weak self] in
                 DispatchQueue.main.async {
                     guard let self else { return }
                     self.stopped = true
                     self.watch?.invalidate()
-                    self.machine = nil
+                    self.dropMachine()
                     self.copySnapshot(disk)
                 }
             }
+            machine.stop { _ in stoppedCopy() }
             return
         }
         copySnapshot(disk)
@@ -637,6 +1089,7 @@ final class GuestSession: NSObject, ObservableObject, VZVirtualMachineDelegate {
                     self.snapshotReady = true
                     self.stopped = true
                     self.headline = "Debian is installed and shut down. A snapshot is saved for new machines."
+                    self.publishLibrary()
                 }
             }
         }
@@ -651,51 +1104,54 @@ final class GuestSession: NSObject, ObservableObject, VZVirtualMachineDelegate {
 
     private func boot(_ make: () throws -> VZVirtualMachine) {
         do {
-            let machine = try make()
-            machine.delegate = self
-            view.virtualMachine = machine
-            view.capture = false
-            self.machine = machine
+            let vm = try make()
+            bind(vm)
+            let token = generation
             let installed = installed
-            machine.start { [weak self] result in
+            let started: (String?) -> Void = { [weak self] message in
                 DispatchQueue.main.async {
-                    // A close during Verify with host key stops this machine. Ignore a start that lost the race.
-                    guard let self, self.machine === machine else { return }
-                    switch result {
-                    case .success:
-                        self.stopped = false
-                        if installed {
-                            // The already-installed boot is waiting on SSH. Do not replace that with a boot headline.
-                            // A clone is a machine the user is running, so it keeps the running headline.
-                            if self.checking && !self.fromSnapshotBoot {
-                                self.headline = "Debian is already installed. Checking SSH."
-                                self.markSetup("ssh", state: "now")
-                            } else {
-                                self.headline = "Debian is running from the guest disk."
-                            }
-                            // start() can report success before state becomes .running. Probe from here.
-                            // A saved snapshot is the artifact. Do not probe it again.
-                            if self.checking && !self.snapshotReady {
-                                self.watchSSH()
-                            }
-                        } else {
-                            self.markSetup("partition", state: "now")
-                            self.headline = "The installer starts on its own and installs Debian."
-                        }
-                    case .failure(let err):
-                        self.stopped = true
-                        if self.checking, !self.leaving, !self.snapshotReady {
-                            self.retrySSH()
-                        } else {
-                            if !installed { self.failSetup() }
-                            self.fail(err.localizedDescription)
-                        }
-                    }
+                    self?.bootFinished(token, installed: installed, message: message)
                 }
+            }
+            vm.start { result in
+                started(failureText(result))
             }
         } catch {
             stopped = true
             fail(error.localizedDescription)
+        }
+    }
+
+    private func bootFinished(_ token: Int, installed: Bool, message: String?) {
+        guard token == generation, machine != nil else { return }
+        if let message {
+            stopped = true
+            if checking, !leaving, !snapshotReady {
+                retrySSH()
+            } else {
+                if !installed { failSetup() }
+                fail(message)
+            }
+            return
+        }
+        stopped = false
+        if installed {
+            // The already-installed boot is waiting on SSH. Do not replace that with a boot headline.
+            // A clone is a machine the user is running, so it keeps the running headline.
+            if checking && !fromSnapshotBoot {
+                headline = "Debian is already installed. Checking SSH."
+                markSetup("ssh", state: "now")
+            } else {
+                headline = "Debian is running from the guest disk."
+            }
+            // start() can report success before state becomes .running. Probe from here.
+            // A saved snapshot is the artifact. Do not probe it again.
+            if checking && !snapshotReady {
+                watchSSH()
+            }
+        } else {
+            markSetup("partition", state: "now")
+            headline = "The installer starts on its own and installs Debian."
         }
     }
 
@@ -829,27 +1285,99 @@ private final class PanelClose: NSObject, NSWindowDelegate {
 struct GuestView: NSViewRepresentable {
     let session: GuestSession
     var capture: Bool
+    var preview: NSImage? = nil
 
-    func makeNSView(context: Context) -> InstallScreen {
+    func makeNSView(context: Context) -> GuestPane {
+        let pane = GuestPane()
+        pane.embed(session.view)
         session.view.capture = capture
         // The view's own size guess is a tiny blank. The slot proposes the real size.
         session.view.setContentHuggingPriority(.defaultLow, for: .horizontal)
         session.view.setContentHuggingPriority(.defaultLow, for: .vertical)
         session.view.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         session.view.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
-        return session.view
+        pane.show(preview)
+        return pane
     }
 
-    func updateNSView(_ nsView: InstallScreen, context: Context) {
-        nsView.capture = capture
+    func updateNSView(_ nsView: GuestPane, context: Context) {
+        nsView.embed(session.view)
+        session.view.capture = capture
+        // A paused still must not be cleared by a SwiftUI pass that still has a nil preview.
+        if let preview {
+            nsView.show(preview)
+        } else if !session.paused {
+            nsView.show(nil)
+        }
     }
 
     /// Take the size SwiftUI proposes. A missing width is not zero, so closing the wizard does not blank the guest.
-    func sizeThatFits(_ proposal: ProposedViewSize, nsView: InstallScreen, context: Context) -> CGSize? {
+    func sizeThatFits(_ proposal: ProposedViewSize, nsView: GuestPane, context: Context) -> CGSize? {
         let width = proposal.width.flatMap { $0.isFinite && $0 > 1 ? $0 : nil } ?? 800
         let height = proposal.height.flatMap { $0.isFinite && $0 > 1 ? $0 : nil } ?? width * 10.0 / 16.0
         return CGSize(width: width, height: height)
     }
+}
+
+/// GuestView stays mounted under that frame. The still is an NSImageView above the Metal guest.
+/// guest.pausePreview is this overlay. A SwiftUI Image in a ZStack does not cover VZVirtualMachineView.
+final class GuestPane: NSView {
+    let still = NSImageView()
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer?.backgroundColor = NSColor.black.cgColor
+        still.imageScaling = .scaleProportionallyUpOrDown
+        still.wantsLayer = true
+        still.layer?.backgroundColor = NSColor.black.cgColor
+        still.layer?.zPosition = 10
+        addSubview(still)
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    func embed(_ screen: InstallScreen) {
+        if screen.superview !== self {
+            screen.removeFromSuperview()
+            addSubview(screen, positioned: .below, relativeTo: still)
+        }
+        still.layer?.zPosition = 10
+    }
+
+    func show(_ image: NSImage?) {
+        still.image = image
+        still.isHidden = image == nil
+        still.alphaValue = 1
+        still.layer?.zPosition = 10
+        var rect = NSRect(origin: .zero, size: image?.size ?? .zero)
+        still.layer?.contents = image?.cgImage(forProposedRect: &rect, context: nil, hints: nil)
+        if let screen = subviews.first(where: { $0 is InstallScreen }) as? InstallScreen {
+            // Hide the Metal guest while a still is up. Otherwise it draws on top of the image.
+            screen.isHidden = image != nil
+            screen.alphaValue = image == nil ? 1 : 0
+            addSubview(still, positioned: .above, relativeTo: screen)
+        }
+        needsLayout = true
+        layoutSubtreeIfNeeded()
+    }
+
+    override func layout() {
+        super.layout()
+        let frozen = still.image != nil && !still.isHidden
+        for child in subviews where child !== still {
+            child.frame = bounds
+            // Stop can unhide the Metal guest. Keep it covered while the still is up.
+            if frozen {
+                child.isHidden = true
+                child.alphaValue = 0
+            }
+        }
+        still.frame = bounds
+        still.layer?.zPosition = 10
+    }
+
+    override var isOpaque: Bool { true }
 }
 
 /// Second view of the same guest, used only by the installer window.
@@ -887,6 +1415,21 @@ final class InstallScreen: VZVirtualMachineView {
 
     var capture = false {
         didSet { applyCapture() }
+    }
+
+    /// Last pixels of the guest. Pause writes this before the machine is stopped.
+    func snapshot() -> NSImage? {
+        cachedPixels()
+    }
+
+    /// cacheDisplay of a Metal guest is often fully transparent. That is not a frame.
+    func cachedPixels() -> NSImage? {
+        let rect = bounds
+        guard rect.width > 1, rect.height > 1, let rep = bitmapImageRepForCachingDisplay(in: rect) else { return nil }
+        cacheDisplay(in: rect, to: rep)
+        guard let cg = rep.cgImage else { return nil }
+        let cached = ownedImage(cg, size: rect.size)
+        return visiblePixels(cached) ? cached : nil
     }
 
     override var intrinsicContentSize: NSSize { drawn }
@@ -971,7 +1514,7 @@ final class InstallScreen: VZVirtualMachineView {
             disarm()
             window?.makeFirstResponder(nil)
             NSCursor.unhide()
-            CGAssociateMouseAndMouseCursorPosition(1)
+            _ = CGAssociateMouseAndMouseCursorPosition(1)
         }
         window?.invalidateCursorRects(for: self)
     }
