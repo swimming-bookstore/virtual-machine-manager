@@ -18,7 +18,7 @@ final class LibraryModel: ObservableObject {
     @Published var error: String?
     @Published var cloning = false
     @Published var snapshotReady = SupportDir.snapshotReady
-    /// Guest IP by disk, once ARP has the MAC. Empty while the machine is off.
+    /// Guest IP by disk. Empty while the machine is off.
     @Published var addresses: [String: String] = [:]
     /// Running clones. The detail view is one machine; this keeps the others alive.
     private var sessions: [String: GuestSession] = [:]

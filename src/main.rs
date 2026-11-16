@@ -512,7 +512,7 @@ enum Command {
         #[arg(long, value_name = "PATH")]
         disk: PathBuf,
     },
-    /// The guest address ARP has for this disk. Empty when the VM is off.
+    /// Guest IP for this disk. Empty when the VM is off.
     Address {
         /// Guest disk whose MAC should be looked up.
         #[arg(long, value_name = "PATH")]

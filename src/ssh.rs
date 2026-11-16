@@ -2,10 +2,12 @@
 
 use std::collections::HashSet;
 use std::fs::{self, File};
-use std::net::{SocketAddr, TcpStream};
+use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Result};
@@ -162,43 +164,221 @@ fn arp_guests() -> Vec<(String, String)> {
     parse_arp(&arp_output())
 }
 
-/// The NAT address for this disk's MAC. ARP first, then `/var/db/dhcpd_leases`.
+/// Guest IP for this disk, the way UTM labels it.
+/// UTM calls the guest agent, matches `hardwareAddress` to the NIC, and skips loopback.
+/// Virtualization has no guest-agent port, so this asks the guest with `ip addr` and uses that filter.
+/// The NAT subnet is not always 192.168.64. ARP stays empty until the host asks, so a miss probes the bridge.
 /// Nothing, if the guest is off or still booting.
 pub fn guest_address(disk: &Path) -> Option<String> {
     let want = assigned_mac(disk).unwrap_or_else(|| normalize_mac(&mac_string(disk)));
     if want.is_empty() {
         return None;
     }
-    if let Some(host) = address_for_mac(&want, &arp_guests()).or_else(|| lease_address(&want, &lease_text())) {
-        return Some(host);
+    if let Some(host) = address_for_mac(&want, &arp_guests()) {
+        return Some(reported_or(disk, &want, &host));
     }
-    // vmnet often never writes the lease where we can read it, and ARP stays empty until the host connects.
-    // The address SSH can log into is the one to show.
-    ssh_host(disk)
+    prime_arp(&nat_prefixes(&ifconfig_text()));
+    if let Some(host) = address_for_mac(&want, &arp_guests()) {
+        return Some(reported_or(disk, &want, &host));
+    }
+    let host = lease_address(&want, &lease_text())?;
+    Some(reported_or(disk, &want, &host))
 }
 
-fn ssh_host(disk: &Path) -> Option<String> {
+/// Prefer the address the guest reports for this MAC. ARP is the same address once the host has asked.
+fn reported_or(disk: &Path, want: &str, host: &str) -> String {
+    guest_reported(disk, want, host).unwrap_or_else(|| host.to_string())
+}
+
+fn guest_reported(disk: &Path, want: &str, host: &str) -> Option<String> {
     let guest = disk.parent()?;
     let support = guest.parent()?.parent()?;
     let private = support.join("ssh").join(PRIVATE);
     if !private.is_file() {
         return None;
     }
-    let mac = mac_string(disk);
-    let dir = support.join("ssh");
-    for host in next_hosts(&dir, &mac, &arp_guests()) {
-        if tcp_open(&host) && login(&private, &host).ok()? {
-            return Some(host);
-        }
-    }
-    None
+    let text = ssh_capture(&private, host, "ip addr")?;
+    guest_ip(want, &text)
 }
 
-fn tcp_open(host: &str) -> bool {
-    let Ok(addr) = format!("{host}:{SSH_PORT}").parse::<SocketAddr>() else {
-        return false;
-    };
-    TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok()
+/// UTM keeps an IPv4 that does not start with 127, else an IPv6 that is not loopback.
+/// The first IPv4 is the one to log in to.
+fn guest_ip(want: &str, text: &str) -> Option<String> {
+    let want = normalize_mac(want);
+    if want.is_empty() {
+        return None;
+    }
+    let mut current = String::new();
+    let mut macs = Vec::new();
+    let mut addrs: Vec<(String, String, bool)> = Vec::new();
+    for raw in text.lines() {
+        let line = raw.trim().trim_end_matches('\\').trim();
+        if line.is_empty() || line == "---" {
+            continue;
+        }
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        if tokens.len() >= 2 {
+            let index = tokens[0].trim_end_matches(':');
+            if index.parse::<u32>().is_ok() {
+                current = tokens[1].trim_end_matches(':').to_string();
+            }
+        }
+        if let Some(i) = tokens.iter().position(|token| *token == "link/ether") {
+            if let Some(mac) = tokens.get(i + 1) {
+                if !current.is_empty() {
+                    macs.push((current.clone(), normalize_mac(mac)));
+                }
+            }
+        }
+        if let Some(i) = tokens.iter().position(|token| *token == "inet" || *token == "inet6") {
+            let v6 = tokens[i] == "inet6";
+            if let Some(raw_ip) = tokens.get(i + 1) {
+                let ip = raw_ip.split('/').next().unwrap_or(raw_ip);
+                if !current.is_empty() && usable_guest_ip(ip, v6) {
+                    addrs.push((current.clone(), ip.to_string(), v6));
+                }
+            }
+        }
+    }
+    let iface = macs.into_iter().find(|(_, mac)| mac == &want)?.0;
+    addrs
+        .iter()
+        .find(|(name, _, v6)| name == &iface && !*v6)
+        .or_else(|| addrs.iter().find(|(name, _, v6)| name == &iface && *v6))
+        .map(|(_, ip, _)| ip.clone())
+}
+
+fn usable_guest_ip(ip: &str, v6: bool) -> bool {
+    if v6 {
+        return ip != "::1" && ip != "0:0:0:0:0:0:0:1";
+    }
+    usable_ipv4(ip)
+}
+
+/// vmnet shared networks are bridge interfaces. The host address on that bridge is `.1`.
+/// A miss falls back to 192.168.64, the first subnet Apple hands out.
+fn nat_prefixes(text: &str) -> Vec<[u8; 3]> {
+    let mut found = Vec::new();
+    let mut name = "";
+    for line in text.lines() {
+        if !line.starts_with('\t') && !line.starts_with(' ') {
+            name = line.split(':').next().unwrap_or("");
+        }
+        let bridge = name.starts_with("bridge") || name.starts_with("vmnet") || name.starts_with("vmenet");
+        if !bridge {
+            continue;
+        }
+        let Some(inet) = line.split_whitespace().skip_while(|word| *word != "inet").nth(1) else {
+            continue;
+        };
+        let mut parts = inet.split('.');
+        let Some(a) = parts.next().and_then(|part| part.parse::<u8>().ok()) else {
+            continue;
+        };
+        let Some(b) = parts.next().and_then(|part| part.parse::<u8>().ok()) else {
+            continue;
+        };
+        let Some(c) = parts.next().and_then(|part| part.parse::<u8>().ok()) else {
+            continue;
+        };
+        let Some(d) = parts.next().and_then(|part| part.parse::<u8>().ok()) else {
+            continue;
+        };
+        if a != 192 || b != 168 || c < 64 || d != 1 || parts.next().is_some() {
+            continue;
+        }
+        let prefix = [a, b, c];
+        if !found.contains(&prefix) {
+            found.push(prefix);
+        }
+    }
+    if found.is_empty() {
+        found.push([192, 168, 64]);
+    }
+    found
+}
+
+fn ifconfig_text() -> String {
+    for bin in ["/sbin/ifconfig", "/usr/sbin/ifconfig", "ifconfig"] {
+        if let Ok(out) = Command::new(bin)
+            .arg("-a")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+        {
+            let text = String::from_utf8_lossy(&out.stdout).into_owned();
+            if !text.is_empty() {
+                return text;
+            }
+        }
+    }
+    String::new()
+}
+
+/// Ask the bridge for every address so the guest answers ARP. The cache stays empty until then.
+fn prime_arp(prefixes: &[[u8; 3]]) {
+    let jobs: Vec<SocketAddr> = prefixes
+        .iter()
+        .flat_map(|prefix| {
+            (2..=254).map(|n| {
+                SocketAddr::from((Ipv4Addr::new(prefix[0], prefix[1], prefix[2], n), SSH_PORT))
+            })
+        })
+        .collect();
+    let jobs = Arc::new(Mutex::new(jobs.into_iter()));
+    let mut threads = Vec::new();
+    for _ in 0..64 {
+        let jobs = Arc::clone(&jobs);
+        threads.push(thread::spawn(move || {
+            loop {
+                let next = jobs.lock().ok().and_then(|mut queue| queue.next());
+                let Some(addr) = next else {
+                    break;
+                };
+                let _ = TcpStream::connect_timeout(&addr, Duration::from_millis(150));
+            }
+        }));
+    }
+    for worker in threads {
+        let _ = worker.join();
+    }
+}
+
+fn ssh_capture(private: &Path, host: &str, command: &str) -> Option<String> {
+    let port = SSH_PORT.to_string();
+    let out = Command::new("ssh")
+        .args([
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            "UserKnownHostsFile=/dev/null",
+            "-o",
+            "IdentitiesOnly=yes",
+            "-o",
+            "ConnectTimeout=1",
+            "-p",
+            &port,
+            "-i",
+        ])
+        .arg(private)
+        .args(["-l", USER, host, command])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    if text.trim().is_empty() {
+        None
+    } else {
+        Some(text)
+    }
 }
 
 fn assigned_mac(disk: &Path) -> Option<String> {
@@ -297,8 +477,26 @@ fn lease_field(line: &str) -> Option<(String, String)> {
     Some((key.to_string(), value.to_string()))
 }
 
+/// Not the host gateway (`.1`), loopback, or a broadcast. The subnet is whichever bridge vmnet chose.
 fn is_guest_host(host: &str) -> bool {
-    host.starts_with("192.168.64.") && host != "192.168.64.1" && host.split('.').count() == 4
+    usable_ipv4(host)
+}
+
+fn usable_ipv4(host: &str) -> bool {
+    let mut parts = host.split('.');
+    let Some(a) = parts.next().and_then(|part| part.parse::<u8>().ok()) else {
+        return false;
+    };
+    let Some(_) = parts.next().and_then(|part| part.parse::<u8>().ok()) else {
+        return false;
+    };
+    let Some(_) = parts.next().and_then(|part| part.parse::<u8>().ok()) else {
+        return false;
+    };
+    let Some(d) = parts.next().and_then(|part| part.parse::<u8>().ok()) else {
+        return false;
+    };
+    parts.next().is_none() && a != 0 && a != 127 && a < 224 && d != 0 && d != 1 && d != 255
 }
 
 fn address_for(disk: &Path, arp: &[(String, String)]) -> Option<String> {
@@ -341,7 +539,7 @@ fn parse_arp(text: &str) -> Vec<(String, String)> {
             continue;
         }
         let host = &line[open + 1..close];
-        if !host.starts_with("192.168.64.") || host == "192.168.64.1" {
+        if !usable_ipv4(host) {
             continue;
         }
         let mac = line
@@ -449,7 +647,10 @@ mod tests {
 ";
         assert_eq!(
             parse_arp(text),
-            vec![("192.168.64.7".into(), "02:56:4d:4d:09:35".into())]
+            vec![
+                ("192.168.64.7".into(), "02:56:4d:4d:09:35".into()),
+                ("10.0.0.2".into(), "02:56:4d:4d:09:35".into()),
+            ]
         );
         let disk = Path::new("/tmp/vmm/snapshots/debian/disk.img");
         assert_eq!(
@@ -467,7 +668,15 @@ mod tests {
         assert_eq!(lease_address("02:00:00:00:00:01", text), None);
         assert_eq!(
             parse_leases("ip_address=10.0.0.2\nhw_address=1,02:56:4d:4d:09:35\n"),
+            vec![("10.0.0.2".into(), "02:56:4d:4d:09:35".into())]
+        );
+        assert_eq!(
+            parse_leases("ip_address=127.0.0.1\nhw_address=1,02:56:4d:4d:09:35\n"),
             vec![]
+        );
+        assert_eq!(
+            lease_address(mac, "ip_address=192.168.65.4\nhw_address=1,02:56:4d:4d:09:35\n"),
+            Some("192.168.65.4".into())
         );
     }
 
@@ -504,5 +713,39 @@ mod tests {
         record_login(&root.join("ssh")).unwrap();
         assert!(probe_disk(&disk).unwrap());
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn guest_ip_matches_the_nic_and_skips_loopback() {
+        let text = "\
+1: lo: <LOOPBACK,UP> mtu 65536 qdisc noqueue state UNKNOWN mode DEFAULT group default qlen 1000
+    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00
+    inet 127.0.0.1/8 scope host lo
+    inet6 ::1/128 scope host
+2: enp0s1: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc fq_codel state UP mode DEFAULT group default qlen 1000
+    link/ether 02:56:4D:4D:09:35 brd ff:ff:ff:ff:ff:ff
+    inet 192.168.65.4/24 brd 192.168.65.255 scope global dynamic enp0s1
+    inet6 fe80::1/64 scope link
+    inet6 ::1/128 scope host
+";
+        assert_eq!(guest_ip("02:56:4d:4d:09:35", text), Some("192.168.65.4".into()));
+        assert_eq!(guest_ip("02:00:00:00:00:01", text), None);
+        assert_eq!(guest_ip("02:56:4d:4d:09:35", "2: enp0s1\n    inet 127.0.0.1/8\n"), None);
+    }
+
+    #[test]
+    fn nat_prefixes_are_the_bridge_gateways() {
+        let text = "\
+en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+	inet 192.168.1.23 netmask 0xffffff00 broadcast 192.168.1.255
+bridge0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+	inet 192.168.1.1 netmask 0xffffff00 broadcast 192.168.1.255
+bridge100: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+	inet 192.168.65.1 netmask 0xffffff00 broadcast 192.168.65.255
+vmnet1: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+	inet 192.168.66.1 netmask 0xffffff00 broadcast 192.168.66.255
+";
+        assert_eq!(nat_prefixes(text), vec![[192, 168, 65], [192, 168, 66]]);
+        assert_eq!(nat_prefixes(""), vec![[192, 168, 64]]);
     }
 }

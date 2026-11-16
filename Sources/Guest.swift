@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 import Virtualization
 
 /// Boots the patched netinst, then the disk the installer writes.
@@ -26,8 +27,9 @@ enum Guest {
         return String(format: "02:56:4d:4d:%02x:%02x", UInt8(sum >> 8), UInt8(truncatingIfNeeded: sum))
     }
 
-    /// Address for this disk's MAC. ARP first, then the DHCP lease. Nil when the guest is off or still booting.
-    /// The MAC written at boot is the one vmnet recorded. A recomputed one misses the lease if Virtualization kept its own.
+    /// Address on this disk's NIC. Nil when the guest is off or still booting.
+    /// UTM asks the guest agent and matches hardwareAddress. This matches the MAC the attachment wrote.
+    /// ARP stays empty until the host asks, and the subnet is not always 192.168.64.
     static func natAddress(disk: URL) -> String? {
         let want = normalizeMAC(assignedMAC(disk: disk) ?? macString(for: disk))
         guard !want.isEmpty else { return nil }
@@ -38,7 +40,14 @@ enum Guest {
         if let text = arpText(), let host = address(in: text, mac: want) {
             return host
         }
-        return leaseAddress(mac: want)
+        if let host = leaseAddress(mac: want) {
+            return host
+        }
+        primeArp()
+        if let text = arpText(), let host = address(in: text, mac: want) {
+            return host
+        }
+        return nil
     }
 
     private static func address(in text: String, mac want: String) -> String? {
@@ -46,11 +55,11 @@ enum Guest {
             guard let open = line.firstIndex(of: "("),
                   let close = line[open...].firstIndex(of: ")"),
                   open < close else { continue }
-            let host = line[line.index(after: open)..<close]
-            guard host.hasPrefix("192.168.64."), host != "192.168.64.1" else { continue }
+            let host = String(line[line.index(after: open)..<close])
+            guard isGuestHost(host) else { continue }
             guard let mac = line.split(whereSeparator: \.isWhitespace).first(where: { $0.split(separator: ":").count == 6 }),
                   normalizeMAC(String(mac)) == want else { continue }
-            return String(host)
+            return host
         }
         return nil
     }
@@ -178,7 +187,79 @@ enum Guest {
     }
 
     private static func isGuestHost(_ host: String) -> Bool {
-        host.hasPrefix("192.168.64.") && host != "192.168.64.1" && host.split(separator: ".").count == 4
+        let parts = host.split(separator: ".")
+        guard parts.count == 4,
+              let a = Int(parts[0]), let d = Int(parts[3]),
+              parts[1].allSatisfy(\.isNumber), parts[2].allSatisfy(\.isNumber) else { return false }
+        return a != 0 && a != 127 && a < 224 && d != 0 && d != 1 && d != 255
+    }
+
+    /// vmnet's bridge is `.1`. Ask that subnet so the guest answers ARP. 192.168.64 is Apple's first subnet.
+    private static func natPrefixes() -> [String] {
+        var found: [String] = []
+        let text = commandText("/sbin/ifconfig", ["-a"]) ?? commandText("/usr/sbin/ifconfig", ["-a"]) ?? ""
+        var name = ""
+        for raw in text.split(whereSeparator: \.isNewline) {
+            let line = String(raw)
+            if !line.hasPrefix("\t") && !line.hasPrefix(" ") {
+                name = String(line.split(separator: ":").first ?? "")
+            }
+            let bridge = name.hasPrefix("bridge") || name.hasPrefix("vmnet") || name.hasPrefix("vmenet")
+            guard bridge else { continue }
+            let words = line.split(whereSeparator: \.isWhitespace).map(String.init)
+            guard let inet = words.firstIndex(of: "inet"), words.count > inet + 1 else { continue }
+            let parts = words[inet + 1].split(separator: ".")
+            guard parts.count == 4, parts[3] == "1",
+                  let third = Int(parts[2]), third >= 64,
+                  parts[0] == "192", parts[1] == "168" else { continue }
+            let prefix = parts.prefix(3).joined(separator: ".")
+            if !found.contains(prefix) { found.append(prefix) }
+        }
+        if found.isEmpty { found.append("192.168.64") }
+        return found
+    }
+
+    /// ARP stays empty until the host asks. One short connect per address is enough for the cache.
+    private static func primeArp() {
+        let prefixes = natPrefixes()
+        let group = DispatchGroup()
+        let queue = DispatchQueue(label: "guest-arp", attributes: .concurrent)
+        for prefix in prefixes {
+            for n in 2...254 {
+                group.enter()
+                queue.async {
+                    poke("\(prefix).\(n)")
+                    group.leave()
+                }
+            }
+        }
+        _ = group.wait(timeout: .now() + 1.5)
+    }
+
+    private static func poke(_ host: String) {
+        let fd = socket(AF_INET, SOCK_STREAM, 0)
+        if fd < 0 { return }
+        defer { close(fd) }
+        let flags = fcntl(fd, F_GETFL, 0)
+        if flags >= 0 { _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK) }
+        var addr = sockaddr_in()
+        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = in_port_t(22).bigEndian
+        let parsed: Int32 = host.withCString { cstr in
+            withUnsafeMutableBytes(of: &addr.sin_addr) { raw in
+                inet_pton(AF_INET, cstr, raw.baseAddress)
+            }
+        }
+        if parsed != 1 { return }
+        let started = withUnsafePointer(to: &addr) { ptr -> Int32 in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                Darwin.connect(fd, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        if started == 0 { return }
+        var pfd = pollfd(fd: fd, events: Int16(POLLOUT), revents: 0)
+        _ = Darwin.poll(&pfd, nfds_t(1), 150)
     }
 
     private static func commandText(_ path: String, _ args: [String]) -> String? {
@@ -261,7 +342,7 @@ enum Guest {
     }
 
     /// `VZNATNetworkDeviceAttachment()` takes no arguments. There is no forwarding-rules type.
-    /// The host is the gateway for 192.168.64.0/24 and reaches sshd on the guest address, port 22.
+    /// The host is `.1` on the vmnet bridge. sshd is on the guest address, port 22. The subnet is not always 192.168.64.
     private static func network(disk: URL) -> VZVirtioNetworkDeviceConfiguration {
         let network = VZVirtioNetworkDeviceConfiguration()
         network.attachment = VZNATNetworkDeviceAttachment()

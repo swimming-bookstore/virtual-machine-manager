@@ -120,23 +120,20 @@ struct Install: View {
     }
 
     private var filled: some View {
-        ZStack {
-            guestScreen
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .background(.black)
-                .allowsHitTesting(!guest.stopped)
-            if let error = guest.error {
-                Text(error).font(.callout).foregroundStyle(.red).padding()
+        VStack(spacing: 0) {
+            ZStack {
+                guestScreen
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .background(.black)
+                    .allowsHitTesting(!guest.stopped)
+                if let error = guest.error {
+                    Text(error).font(.callout).foregroundStyle(.red).padding()
+                }
             }
+            guestIPRow
         }
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
-                if let address = guest.address {
-                    Text(address)
-                        .font(.body.monospaced())
-                        .textSelection(.enabled)
-                        .fixedSize()
-                }
                 Button("Start") { guest.bootDisk(disk, pointer: true) }
                     .disabled(!guest.stopped)
                 Button("Pause") { guest.pauseGuest() }
@@ -150,6 +147,24 @@ struct Install: View {
         .onAppear { guest.refreshAddress() }
     }
 
+    /// Same row UTM puts under the screenshot. A toolbar label becomes the overflow menu, so the IP never shows.
+    private var guestIPRow: some View {
+        Group {
+            if let address = guest.address {
+                HStack(spacing: 8) {
+                    Label("Guest IP", systemImage: "network.badge.shield.half.filled")
+                        .foregroundStyle(.secondary)
+                    Spacer(minLength: 12)
+                    Text(address)
+                        .font(.body.monospaced())
+                        .textSelection(.enabled)
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 8)
+            }
+        }
+    }
+
     private var page: some View {
         VStack(alignment: .leading, spacing: 18) {
             header
@@ -158,6 +173,7 @@ struct Install: View {
                     .frame(width: 800, height: 500)
             }
             if setup { stepList }
+            guestIPRow
             WrappingPath(text: disk)
             if let error = guest.error {
                 Text(error).font(.callout).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true)
@@ -169,12 +185,6 @@ struct Install: View {
         .toolbar {
             if fromSnapshot {
                 ToolbarItemGroup(placement: .primaryAction) {
-                    if let address = guest.address {
-                        Text(address)
-                            .font(.body.monospaced())
-                            .textSelection(.enabled)
-                            .fixedSize()
-                    }
                     Button("Start") { guest.bootDisk(disk, pointer: true) }
                         .disabled(!guest.stopped)
                     Button("Pause") { guest.pauseGuest() }
@@ -449,7 +459,7 @@ final class GuestSession: ObservableObject {
     @Published var paused = false
     /// Last guest frame at pause. Shown while the machine is stopped.
     @Published var pausePreview: NSImage?
-    /// NAT address for this disk. Empty until ARP sees the guest MAC.
+    /// NAT address for this disk. Empty until the guest reports it, the way UTM waits for the guest agent.
     @Published var address: String?
     /// Quick start passes its own list. A clone keeps the rows on this session.
     var steps: Binding<[WizardStep]>?
@@ -467,6 +477,8 @@ final class GuestSession: ObservableObject {
     private var saved = false
     private var watch: Timer?
     private var addressWatch: Timer?
+    private var addressMisses = 0
+    private var addressGeneration = 0
     private var probing = false
     private var savingSnapshot = false
     /// Boots of the installed disk while Verify with host key has not logged in. A quit used to leave that row waiting.
@@ -508,12 +520,16 @@ final class GuestSession: ObservableObject {
         }
     }
 
-    /// ARP for this disk's MAC. The address is shown only while the guest is running.
+    /// Ask the guest for the address on this NIC. Shown only while the guest is running.
+    /// UTM polls every 10 seconds and clears the row when the machine is not started.
     func refreshAddress() {
         addressWatch?.invalidate()
         addressWatch = nil
+        addressGeneration += 1
+        let token = addressGeneration
         guard fromSnapshotBoot, !stopped, !paused, let disk = diskURL else {
             address = nil
+            addressMisses = 0
             postAddress(nil)
             return
         }
@@ -521,10 +537,13 @@ final class GuestSession: ObservableObject {
         DispatchQueue.global(qos: .utility).async {
             let found = Worker.guestAddress(disk: path) ?? Guest.natAddress(disk: path)
             DispatchQueue.main.async {
-                guard self.diskURL == path, !self.stopped, !self.paused else { return }
+                guard token == self.addressGeneration, self.diskURL == path, !self.stopped, !self.paused else { return }
                 if let found {
+                    self.addressMisses = 0
                     self.address = found
                     self.postAddress(found)
+                } else {
+                    self.addressMisses += 1
                 }
                 self.armAddressWatch()
             }
@@ -547,10 +566,12 @@ final class GuestSession: ObservableObject {
         )
     }
 
-    /// DHCP can answer after the window is already open. Keep looking until ARP has the MAC.
+    /// UTM waits 10 seconds between guest-agent queries. Look sooner until the first address arrives.
     private func armAddressWatch() {
-        guard address == nil, !stopped, !paused else { return }
-        let timer = Timer(timeInterval: 2, repeats: false) { [weak self] _ in
+        guard !stopped, !paused else { return }
+        addressWatch?.invalidate()
+        let wait: TimeInterval = address == nil && addressMisses < 5 ? 2 : 10
+        let timer = Timer(timeInterval: wait, repeats: false) { [weak self] _ in
             self?.refreshAddress()
         }
         RunLoop.main.add(timer, forMode: .common)
