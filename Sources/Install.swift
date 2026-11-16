@@ -131,6 +131,11 @@ struct Install: View {
         }
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
+                if let address = guest.address {
+                    Text(address)
+                        .font(.body.monospaced())
+                        .textSelection(.enabled)
+                }
                 Button("Start") { guest.bootDisk(disk, pointer: true) }
                     .disabled(!guest.stopped)
                 Button("Pause") { guest.pauseGuest() }

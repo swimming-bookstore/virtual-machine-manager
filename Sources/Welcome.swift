@@ -241,7 +241,6 @@ struct Welcome: View {
                 }
             }
             .navigationTitle("Virtual Machine Manager")
-            .modifier(GuestSubtitle(text: library.addresses[library.selected ?? ""] ?? ""))
         }
         .frame(minWidth: 900, idealWidth: 1100, maxWidth: .infinity, minHeight: 560, idealHeight: 720, maxHeight: .infinity)
     }
@@ -251,19 +250,6 @@ struct Welcome: View {
         DispatchQueue.main.async {
             dismissWindow(id: "main")
             AppWindow.closeMain()
-        }
-    }
-}
-
-/// Under the window title, and only once ARP has an address. Empty adds nothing.
-private struct GuestSubtitle: ViewModifier {
-    var text: String
-
-    @ViewBuilder func body(content: Content) -> some View {
-        if text.isEmpty {
-            content
-        } else {
-            content.navigationSubtitle(text)
         }
     }
 }

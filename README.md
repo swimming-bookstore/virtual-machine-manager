@@ -22,7 +22,7 @@ The private key is:
 ~/Library/Application Support/virtual-machine-manager/ssh/id_ed25519
 ```
 
-Start the machine. The IP shows under the window title and beside the machine name. `.1` is this Mac. If it is still blank, the guest is still booting.
+Start the machine. The IP is beside Start, and beside the machine name. `.1` is this Mac. If both stay blank, the guest is still booting.
 
 ```sh
 ssh -i ~/Library/Application\ Support/virtual-machine-manager/ssh/id_ed25519 -o IdentitiesOnly=yes debian@192.168.64.N

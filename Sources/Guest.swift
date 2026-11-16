@@ -26,10 +26,16 @@ enum Guest {
         return String(format: "02:56:4d:4d:%02x:%02x", UInt8(sum >> 8), UInt8(truncatingIfNeeded: sum))
     }
 
-    /// Address ARP already has for this disk's MAC. Nil when the guest is off or still booting.
+    /// Address for this disk's MAC. ARP first, then the DHCP lease. Nil when the guest is off or still booting.
     static func natAddress(disk: URL) -> String? {
         let want = macString(for: disk)
-        guard let text = arpText() else { return nil }
+        if let text = arpText(), let host = address(in: text, mac: want) {
+            return host
+        }
+        return leaseAddress(mac: want)
+    }
+
+    private static func address(in text: String, mac want: String) -> String? {
         for line in text.split(separator: "\n") {
             guard let open = line.firstIndex(of: "("),
                   let close = line[open...].firstIndex(of: ")"),
@@ -45,17 +51,66 @@ enum Guest {
 
     private static func arpText() -> String? {
         for path in ["/usr/sbin/arp", "/usr/bin/arp"] {
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: path)
-            process.arguments = ["-an"]
-            let pipe = Pipe()
-            process.standardOutput = pipe
-            process.standardError = FileHandle.nullDevice
-            guard (try? process.run()) != nil else { continue }
-            process.waitUntilExit()
-            return String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)
+            if let text = commandText(path, ["-an"]) {
+                return text
+            }
         }
         return nil
+    }
+
+    /// vmnet writes the lease here. ARP stays empty until the host has talked to the guest.
+    private static func leaseAddress(mac want: String) -> String? {
+        let root = URL(fileURLWithPath: "/var/db/dhcpd_leases", isDirectory: true)
+        guard let names = try? FileManager.default.contentsOfDirectory(atPath: root.path) else { return nil }
+        for name in names where name.hasSuffix(".lease") || name.hasSuffix(".plist") {
+            guard let text = try? String(contentsOf: root.appendingPathComponent(name), encoding: .utf8) else { continue }
+            if let host = leaseHost(text, mac: want) {
+                return host
+            }
+        }
+        return nil
+    }
+
+    private static func leaseHost(_ text: String, mac want: String) -> String? {
+        var ip: String?
+        var mac: String?
+        for raw in text.split(separator: "\n") {
+            let line = raw.trimmingCharacters(in: .whitespaces)
+            if line == "{" {
+                ip = nil
+                mac = nil
+                continue
+            }
+            if line == "}" {
+                if let ip, let mac, normalizeMAC(mac) == want, ip.hasPrefix("192.168.64."), ip != "192.168.64.1" {
+                    return ip
+                }
+                ip = nil
+                mac = nil
+                continue
+            }
+            let parts = line.split(whereSeparator: \.isWhitespace).map(String.init)
+            guard parts.count >= 2 else { continue }
+            let key = parts[0].trimmingCharacters(in: CharacterSet(charactersIn: "\"="))
+            let value = parts[1].trimmingCharacters(in: CharacterSet(charactersIn: "\";"))
+            if key == "ip_address" || key == "ip-address" { ip = value }
+            if key == "hw_address" || key == "hw-address" {
+                mac = parts.last.map { $0.trimmingCharacters(in: CharacterSet(charactersIn: "\";")) }
+            }
+        }
+        return nil
+    }
+
+    private static func commandText(_ path: String, _ args: [String]) -> String? {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: path)
+        process.arguments = args
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
+        guard (try? process.run()) != nil else { return nil }
+        process.waitUntilExit()
+        return String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)
     }
 
     private static func normalizeMAC(_ text: String) -> String {
