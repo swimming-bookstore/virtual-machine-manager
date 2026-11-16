@@ -499,11 +499,6 @@ fn usable_ipv4(host: &str) -> bool {
     parts.next().is_none() && a != 0 && a != 127 && a < 224 && d != 0 && d != 1 && d != 255
 }
 
-fn address_for(disk: &Path, arp: &[(String, String)]) -> Option<String> {
-    let want = assigned_mac(disk).unwrap_or_else(|| normalize_mac(&mac_string(disk)));
-    address_for_mac(&want, arp)
-}
-
 fn address_for_mac(want: &str, arp: &[(String, String)]) -> Option<String> {
     if want.is_empty() {
         return None;
@@ -652,12 +647,12 @@ mod tests {
                 ("10.0.0.2".into(), "02:56:4d:4d:09:35".into()),
             ]
         );
-        let disk = Path::new("/tmp/vmm/snapshots/debian/disk.img");
+        let mac = "02:56:4d:4d:09:35";
         assert_eq!(
-            address_for(disk, &parse_arp(text)),
+            address_for_mac(mac, &parse_arp(text)),
             Some("192.168.64.7".into())
         );
-        assert_eq!(address_for(disk, &[]), None);
+        assert_eq!(address_for_mac(mac, &[]), None);
     }
 
     #[test]
