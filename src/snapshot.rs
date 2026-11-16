@@ -17,6 +17,7 @@ use crate::preseed;
 
 const READY: &str = "ready";
 const NVRAM: &str = "nvram.bin";
+const MACHINE_ID: &str = "machine-id";
 const SEEK_DATA: i32 = 3;
 const SEEK_HOLE: i32 = 4;
 const ENXIO: i32 = 6;
@@ -44,13 +45,7 @@ pub fn save(support: &Path) -> Result<Saved> {
     }
     fs::create_dir_all(&dest).map_err(|err| anyhow!("cannot create {}: {err}", dest.display()))?;
     // The installer writes snapshots/debian/disk.img. That file is the snapshot, so it is not copied onto itself.
-    if disk != dest.join(DISK) {
-        place(&disk, &dest.join(DISK))?;
-    }
-    let nvram = guest.join(NVRAM);
-    if nvram.is_file() && nvram != dest.join(NVRAM) {
-        place(&nvram, &dest.join(NVRAM))?;
-    }
+    copy_beside(&guest, &dest, &[DISK, NVRAM, MACHINE_ID])?;
     write_ready(&dest.join(READY))?;
     Ok(saved(&dest))
 }
@@ -79,13 +74,20 @@ pub fn clone_machine(support: &Path, name: Option<&str>) -> Result<Saved> {
     let _ = fs::remove_dir_all(&stage);
     fs::create_dir_all(&stage)
         .map_err(|err| anyhow!("cannot create {}: {err}", stage.display()))?;
-    place(&src.join(DISK), &stage.join(DISK))?;
-    let nvram = src.join(NVRAM);
-    if nvram.is_file() {
-        place(&nvram, &stage.join(NVRAM))?;
-    }
+    copy_beside(&src, &stage, &[DISK, NVRAM, MACHINE_ID])?;
     fs::rename(&stage, &dest)?;
     Ok(saved(&dest))
+}
+
+fn copy_beside(src: &Path, dest: &Path, names: &[&str]) -> Result<()> {
+    for name in names {
+        let from = src.join(name);
+        let to = dest.join(name);
+        if from.is_file() && from != to {
+            place(&from, &to)?;
+        }
+    }
+    Ok(())
 }
 
 fn saved(dir: &Path) -> Saved {
@@ -129,28 +131,33 @@ fn installed(disk: &Path) -> Result<()> {
     Ok(())
 }
 
-fn write_ready(dest: &Path) -> Result<()> {
+fn atomic(dest: &Path, write: impl FnOnce(&Path) -> Result<()>) -> Result<()> {
     let tmp = dest.with_extension("partial");
-    let mut file = File::create(&tmp)?;
-    file.write_all(b"ssh-ok\n")?;
-    file.sync_all()?;
-    drop(file);
+    if tmp.exists() {
+        fs::remove_file(&tmp)?;
+    }
+    write(&tmp)?;
     fs::rename(&tmp, dest)?;
     Ok(())
+}
+
+fn write_ready(dest: &Path) -> Result<()> {
+    atomic(dest, |tmp| {
+        let mut file = File::create(tmp)?;
+        file.write_all(b"ssh-ok\n")?;
+        file.sync_all()?;
+        Ok(())
+    })
 }
 
 fn place(src: &Path, dest: &Path) -> Result<()> {
     if dest.is_file() {
         fs::remove_file(dest)?;
     }
-    let tmp = dest.with_extension("partial");
-    if tmp.exists() {
-        fs::remove_file(&tmp)?;
-    }
-    copy_sparse(src, &tmp)
-        .map_err(|err| anyhow!("cannot copy {} to {}: {err}", src.display(), dest.display()))?;
-    fs::rename(&tmp, dest)?;
-    Ok(())
+    atomic(dest, |tmp| {
+        copy_sparse(src, tmp)
+            .map_err(|err| anyhow!("cannot copy {} to {}: {err}", src.display(), dest.display()))
+    })
 }
 
 fn machine_name(name: &str) -> Result<()> {
@@ -365,6 +372,7 @@ mod tests {
 
         mark_installed(&prepared.disk);
         fs::write(prepared.disk.parent().unwrap().join(NVRAM), b"efi-vars").unwrap();
+        fs::write(prepared.disk.parent().unwrap().join(MACHINE_ID), b"machine").unwrap();
         assert!(save(&dir)
             .unwrap_err()
             .to_string()
@@ -376,6 +384,7 @@ mod tests {
         assert_eq!(saved.disk.metadata().unwrap().len(), GUEST);
         assert!(saved.disk.metadata().unwrap().blocks() < 256);
         assert_eq!(fs::read(saved.dir.join(NVRAM)).unwrap(), b"efi-vars");
+        assert_eq!(fs::read(saved.dir.join(MACHINE_ID)).unwrap(), b"machine");
         assert!(fs::read_to_string(saved.dir.join(READY))
             .unwrap()
             .starts_with("ssh-ok"));
@@ -403,6 +412,7 @@ mod tests {
         assert_eq!(cloned.disk.metadata().unwrap().len(), GUEST);
         assert!(cloned.disk.metadata().unwrap().blocks() < 256);
         assert_eq!(fs::read(cloned.dir.join(NVRAM)).unwrap(), b"efi-vars");
+        assert_eq!(fs::read(cloned.dir.join(MACHINE_ID)).unwrap(), b"machine");
         let mut cloned_buf = [0u8; 6];
         let mut cloned_disk = File::open(&cloned.disk).unwrap();
         cloned_disk.seek(SeekFrom::Start(600)).unwrap();

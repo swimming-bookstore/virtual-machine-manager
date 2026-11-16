@@ -213,7 +213,7 @@ final class Wizard: ObservableObject {
     private func reap(_ done: Process?) {
         guard done == nil || process === done else { return }
         output?.readabilityHandler = nil
-        try? output?.close()
+        _ = try? output?.close()
         output = nil
         process = nil
     }
@@ -375,6 +375,16 @@ enum Worker {
         return code == 0 ? nil : (message(text) ?? "Could not save the snapshot.")
     }
 
+    static func markPaused(disk: URL) -> String? {
+        let (code, text) = run(["pause", "--disk", disk.path])
+        return code == 0 ? nil : (message(text) ?? "Could not pause.")
+    }
+
+    static func clearPaused(disk: URL) -> String? {
+        let (code, text) = run(["unpause", "--disk", disk.path])
+        return code == 0 ? nil : (message(text) ?? "Could not clear the pause.")
+    }
+
     static func cloneMachine(dir: URL) -> ClonedDisk {
         let (code, text) = run(["clone", "--dir", dir.path])
         if code != 0 {
@@ -492,7 +502,7 @@ final class ProbeScan: @unchecked Sendable {
 
     func kill(_ process: Process) {
         let pid = process.processIdentifier
-        if pid > 0 { Darwin.kill(-pid, SIGTERM) }
+        if pid > 0 { _ = Darwin.kill(-pid, SIGTERM) }
         if process.isRunning { process.terminate() }
     }
 

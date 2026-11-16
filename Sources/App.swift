@@ -24,19 +24,14 @@ struct VirtualMachinesApp: App {
     @StateObject private var quickStart = QuickStartModel()
 
     var body: some Scene {
-        WindowGroup("Virtual Machine Manager") { Welcome() }
-            .windowResizability(.contentSize)
+        WindowGroup("Virtual Machine Manager", id: "main") { Welcome() }
+            .windowResizability(.automatic)
+            .defaultSize(width: 1100, height: 720)
         Window("Quick start", id: "quick-start") {
             QuickStart(wizard: quickStart.wizard, installSlot: quickStart.installSlot)
         }
             // The list scrolls inside the window. Do not size the window to the full list.
             .windowResizability(.automatic)
             .defaultSize(width: 440, height: 640)
-        WindowGroup(id: "debian", for: String.self) { $disk in
-            if let disk {
-                Install(iso: "", disk: disk, fromSnapshot: true)
-            }
-        }
-        .windowResizability(.contentSize)
     }
 }

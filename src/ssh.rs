@@ -2,7 +2,6 @@
 
 use std::collections::HashSet;
 use std::fs::{self, File};
-use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -250,10 +249,8 @@ fn login(private: &Path, host: &str) -> Result<bool> {
 
 fn write_new(dest: &Path, body: &[u8]) -> Result<()> {
     let tmp = dest.with_extension("partial");
-    let mut file = File::create(&tmp)?;
-    file.write_all(body)?;
-    file.sync_all()?;
-    drop(file);
+    fs::write(&tmp, body)?;
+    File::open(&tmp)?.sync_all()?;
     fs::rename(&tmp, dest)?;
     Ok(())
 }
