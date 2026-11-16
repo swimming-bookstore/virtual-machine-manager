@@ -131,8 +131,8 @@ struct Install: View {
         }
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
-                if !guest.stopped && !guest.paused {
-                    Text(guest.address ?? "…")
+                if let address = guest.address {
+                    Text(address)
                         .font(.body.monospaced())
                         .textSelection(.enabled)
                         .fixedSize()
@@ -169,8 +169,8 @@ struct Install: View {
         .toolbar {
             if fromSnapshot {
                 ToolbarItemGroup(placement: .primaryAction) {
-                    if !guest.stopped && !guest.paused {
-                        Text(guest.address ?? "…")
+                    if let address = guest.address {
+                        Text(address)
                             .font(.body.monospaced())
                             .textSelection(.enabled)
                             .fixedSize()
@@ -196,18 +196,12 @@ struct Install: View {
         }
     }
 
-    /// Shown above the guest while it is running. An ellipsis means the lease is not in yet.
-    private var guestAddressLine: String? {
-        guard fromSnapshot, !guest.stopped, !guest.paused else { return nil }
-        return guest.address ?? "…"
-    }
-
     /// The guest screen. A clone window shows this at 800 by 500. Quick start uses a thumbnail on the step instead.
     /// A pause keeps the last frame, the way UTM caches the view before the machine is stopped.
     /// GuestView stays mounted under that frame. Replacing it unhooks the virtual machine view, and the next pause has nothing to snapshot.
     /// The still is an AppKit sibling on top of the Metal guest. A SwiftUI Image in the ZStack does not cover it.
     private var guestScreen: some View {
-        GuestView(session: guest, capture: capturePointer, preview: guest.pausePreview, address: guestAddressLine)
+        GuestView(session: guest, capture: capturePointer, preview: guest.pausePreview)
             .background(.black, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
             .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
     }
@@ -525,7 +519,7 @@ final class GuestSession: ObservableObject {
         }
         let path = disk
         DispatchQueue.global(qos: .utility).async {
-            let found = Guest.natAddress(disk: path)
+            let found = Worker.guestAddress(disk: path) ?? Guest.natAddress(disk: path)
             DispatchQueue.main.async {
                 guard self.diskURL == path, !self.stopped, !self.paused else { return }
                 if let found {
@@ -1365,12 +1359,10 @@ struct GuestView: NSViewRepresentable {
     let session: GuestSession
     var capture: Bool
     var preview: NSImage? = nil
-    var address: String? = nil
 
     func makeNSView(context: Context) -> GuestPane {
         let pane = GuestPane()
         pane.embed(session.view)
-        pane.showAddress(address)
         session.view.capture = capture
         // The view's own size guess is a tiny blank. The slot proposes the real size.
         session.view.setContentHuggingPriority(.defaultLow, for: .horizontal)
@@ -1390,7 +1382,6 @@ struct GuestView: NSViewRepresentable {
         } else if !session.paused {
             nsView.show(nil)
         }
-        nsView.showAddress(address)
     }
 
     /// Take the size SwiftUI proposes. A missing width is not zero, so closing the wizard does not blank the guest.
@@ -1405,7 +1396,6 @@ struct GuestView: NSViewRepresentable {
 /// guest.pausePreview is this overlay. A SwiftUI Image in a ZStack does not cover VZVirtualMachineView.
 final class GuestPane: NSView {
     let still = NSImageView()
-    let addressLabel = NSTextField(labelWithString: "")
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -1415,19 +1405,7 @@ final class GuestPane: NSView {
         still.wantsLayer = true
         still.layer?.backgroundColor = NSColor.black.cgColor
         still.layer?.zPosition = 10
-        addressLabel.font = .monospacedSystemFont(ofSize: 15, weight: .semibold)
-        addressLabel.alignment = .center
-        addressLabel.isEditable = false
-        addressLabel.isSelectable = true
-        addressLabel.isBezeled = false
-        addressLabel.drawsBackground = true
-        addressLabel.backgroundColor = .windowBackgroundColor
-        addressLabel.textColor = .labelColor
-        addressLabel.isHidden = true
-        addressLabel.wantsLayer = true
-        addressLabel.layer?.zPosition = 40
         addSubview(still)
-        addSubview(addressLabel)
     }
 
     required init?(coder: NSCoder) { nil }
@@ -1457,33 +1435,19 @@ final class GuestPane: NSView {
         layoutSubtreeIfNeeded()
     }
 
-    func showAddress(_ address: String?) {
-        let text = address?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        if addressLabel.stringValue != text { addressLabel.stringValue = text }
-        addressLabel.isHidden = text.isEmpty
-        needsLayout = true
-    }
-
     override func layout() {
         super.layout()
         let frozen = still.image != nil && !still.isHidden
-        // The Metal guest draws over siblings. Leave a strip above it so the IP is not covered.
-        let bar: CGFloat = addressLabel.isHidden ? 0 : 32
-        let guest = NSRect(x: 0, y: 0, width: bounds.width, height: max(0, bounds.height - bar))
-        for child in subviews where child !== still && child !== addressLabel {
-            child.frame = guest
+        for child in subviews where child !== still {
+            child.frame = bounds
             // Stop can unhide the Metal guest. Keep it covered while the still is up.
             if frozen {
                 child.isHidden = true
                 child.alphaValue = 0
             }
         }
-        still.frame = frozen ? bounds : guest
+        still.frame = bounds
         still.layer?.zPosition = 10
-        if !addressLabel.isHidden {
-            addressLabel.frame = NSRect(x: 0, y: bounds.height - bar, width: bounds.width, height: bar)
-            addSubview(addressLabel, positioned: .above, relativeTo: nil)
-        }
     }
 
     override var isOpaque: Bool { true }

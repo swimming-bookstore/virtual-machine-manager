@@ -31,9 +31,6 @@ enum Guest {
     static func natAddress(disk: URL) -> String? {
         let want = normalizeMAC(assignedMAC(disk: disk) ?? macString(for: disk))
         guard !want.isEmpty else { return nil }
-        if let host = lookup(mac: want) { return host }
-        // The host ARP table stays empty until this Mac talks to the guest. A short ping fills it.
-        nudgeARP()
         return lookup(mac: want)
     }
 
@@ -212,9 +209,6 @@ enum Guest {
 
     private static var assigned: [String: String] = [:]
     private static let macLock = NSLock()
-    private static var nudgeCursor = 2
-    private static var nudging = false
-
     /// The MAC the attachment actually uses. Written beside the disk so the next lookup matches the lease.
     static func noteMAC(_ mac: VZMACAddress, disk: URL) {
         let text = mac.string.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -236,37 +230,6 @@ enum Guest {
         let mac = text.trimmingCharacters(in: .whitespacesAndNewlines)
         return mac.contains(":") || mac.contains("-") ? mac : nil
     }
-
-    /// Ask 192.168.64.2–254 who is home, a slice at a time, so ARP learns the guest MAC.
-    private static func nudgeARP() {
-        macLock.lock()
-        if nudging {
-            macLock.unlock()
-            return
-        }
-        nudging = true
-        let start = nudgeCursor
-        nudgeCursor = 2 + (start - 2 + 24) % 253
-        macLock.unlock()
-        for offset in 0..<24 {
-            let n = 2 + (start - 2 + offset) % 253
-            spawn("/sbin/ping", ["-c", "1", "-W", "200", "-q", "192.168.64.\(n)"])
-        }
-        Thread.sleep(forTimeInterval: 0.35)
-        macLock.lock()
-        nudging = false
-        macLock.unlock()
-    }
-
-    private static func spawn(_ path: String, _ args: [String]) {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: path)
-        process.arguments = args
-        process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
-        try? process.run()
-    }
-
 
     private static func machine(disk: URL, extra: [URL], pointer: Bool) throws -> VZVirtualMachine {
         let config = VZVirtualMachineConfiguration()

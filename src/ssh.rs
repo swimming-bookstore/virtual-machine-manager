@@ -2,9 +2,11 @@
 
 use std::collections::HashSet;
 use std::fs::{self, File};
+use std::net::{SocketAddr, TcpStream};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use anyhow::{anyhow, bail, Result};
 
@@ -167,7 +169,36 @@ pub fn guest_address(disk: &Path) -> Option<String> {
     if want.is_empty() {
         return None;
     }
-    address_for_mac(&want, &arp_guests()).or_else(|| lease_address(&want, &lease_text()))
+    if let Some(host) = address_for_mac(&want, &arp_guests()).or_else(|| lease_address(&want, &lease_text())) {
+        return Some(host);
+    }
+    // vmnet often never writes the lease where we can read it, and ARP stays empty until the host connects.
+    // The address SSH can log into is the one to show.
+    ssh_host(disk)
+}
+
+fn ssh_host(disk: &Path) -> Option<String> {
+    let guest = disk.parent()?;
+    let support = guest.parent()?.parent()?;
+    let private = support.join("ssh").join(PRIVATE);
+    if !private.is_file() {
+        return None;
+    }
+    let mac = mac_string(disk);
+    let dir = support.join("ssh");
+    for host in next_hosts(&dir, &mac, &arp_guests()) {
+        if tcp_open(&host) && login(&private, &host).ok()? {
+            return Some(host);
+        }
+    }
+    None
+}
+
+fn tcp_open(host: &str) -> bool {
+    let Ok(addr) = format!("{host}:{SSH_PORT}").parse::<SocketAddr>() else {
+        return false;
+    };
+    TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok()
 }
 
 fn assigned_mac(disk: &Path) -> Option<String> {

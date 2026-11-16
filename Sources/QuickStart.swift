@@ -398,6 +398,13 @@ enum Worker {
 
     /// One SSH attempt in the worker. A closed port is not a finished install.
     /// `cancel` is set when the app closes so a scan cannot keep the next open on "Checking SSH".
+    /// The address the host key can log into. Empty when the guest is still booting.
+    static func guestAddress(disk: URL) -> String? {
+        let (code, text) = run(["address", "--disk", disk.path])
+        guard code == 0, let host = message(text), host.hasPrefix("192.168.64."), host != "192.168.64.1" else { return nil }
+        return host
+    }
+
     static func probe(disk: URL, cancel: @escaping () -> Bool) -> Bool {
         guard let url = WorkerPath.url() else { return false }
         let process = Process()
