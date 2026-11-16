@@ -26,6 +26,44 @@ enum Guest {
         return String(format: "02:56:4d:4d:%02x:%02x", UInt8(sum >> 8), UInt8(truncatingIfNeeded: sum))
     }
 
+    /// Address ARP already has for this disk's MAC. Nil when the guest is off or still booting.
+    static func natAddress(disk: URL) -> String? {
+        let want = macString(for: disk)
+        guard let text = arpText() else { return nil }
+        for line in text.split(separator: "\n") {
+            guard let open = line.firstIndex(of: "("),
+                  let close = line[open...].firstIndex(of: ")"),
+                  open < close else { continue }
+            let host = line[line.index(after: open)..<close]
+            guard host.hasPrefix("192.168.64."), host != "192.168.64.1" else { continue }
+            guard let mac = line.split(whereSeparator: \.isWhitespace).first(where: { $0.split(separator: ":").count == 6 }),
+                  normalizeMAC(String(mac)) == want else { continue }
+            return String(host)
+        }
+        return nil
+    }
+
+    private static func arpText() -> String? {
+        for path in ["/usr/sbin/arp", "/usr/bin/arp"] {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: path)
+            process.arguments = ["-an"]
+            let pipe = Pipe()
+            process.standardOutput = pipe
+            process.standardError = FileHandle.nullDevice
+            guard (try? process.run()) != nil else { continue }
+            process.waitUntilExit()
+            return String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)
+        }
+        return nil
+    }
+
+    private static func normalizeMAC(_ text: String) -> String {
+        text.split(separator: ":").map { part in
+            String(format: "%02x", UInt8(part, radix: 16) ?? 0)
+        }.joined(separator: ":")
+    }
+
     private static func machine(disk: URL, extra: [URL], pointer: Bool) throws -> VZVirtualMachine {
         let config = VZVirtualMachineConfiguration()
         config.cpuCount = 2

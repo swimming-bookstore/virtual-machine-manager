@@ -130,14 +130,6 @@ struct Install: View {
             }
         }
         .toolbar {
-            if fill {
-                ToolbarItem(placement: .principal) {
-                    Text(guest.address ?? (guest.stopped ? "" : "Looking up IP"))
-                        .font(.body.monospaced())
-                        .foregroundStyle(guest.address == nil ? .secondary : .primary)
-                        .textSelection(.enabled)
-                }
-            }
             ToolbarItemGroup(placement: .primaryAction) {
                 Button("Start") { guest.bootDisk(disk, pointer: true) }
                     .disabled(!guest.stopped)
@@ -189,15 +181,6 @@ struct Install: View {
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
-            if !setup, let address = guest.address {
-                Text(address)
-                    .font(.body.monospaced())
-                    .textSelection(.enabled)
-            } else if !setup && !guest.stopped {
-                Text("Looking up IP")
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-            }
         }
     }
 
@@ -519,19 +502,31 @@ final class GuestSession: ObservableObject {
         addressWatch = nil
         guard fromSnapshotBoot, !stopped, !paused, let disk = diskURL else {
             address = nil
+            postAddress(nil)
             return
         }
         let path = disk
         DispatchQueue.global(qos: .utility).async {
-            let found = Worker.address(disk: path)
+            let found = Guest.natAddress(disk: path)
             DispatchQueue.main.async {
                 guard self.diskURL == path, !self.stopped, !self.paused else { return }
                 if let found {
                     self.address = found
+                    self.postAddress(found)
                 }
                 self.armAddressWatch()
             }
         }
+    }
+
+    /// The library list shows this. It does not own the guest session.
+    private func postAddress(_ address: String?) {
+        guard let disk = diskURL else { return }
+        NotificationCenter.default.post(
+            name: .guestAddress,
+            object: disk.path,
+            userInfo: address.map { ["address": $0] }
+        )
     }
 
     /// DHCP can answer after the window is already open. Keep looking until ARP has the MAC.

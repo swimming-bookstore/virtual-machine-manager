@@ -3,6 +3,7 @@ import AppKit
 
 extension Notification.Name {
     static let libraryDidChange = Notification.Name("LibraryDidChange")
+    static let guestAddress = Notification.Name("GuestAddress")
 }
 
 struct Machine: Identifiable, Hashable {
@@ -17,6 +18,8 @@ final class LibraryModel: ObservableObject {
     @Published var error: String?
     @Published var cloning = false
     @Published var snapshotReady = SupportDir.snapshotReady
+    /// Guest IP by disk, once ARP has the MAC. Empty while the machine is off.
+    @Published var addresses: [String: String] = [:]
     /// Running clones. The detail view is one machine; this keeps the others alive.
     private var sessions: [String: GuestSession] = [:]
 
@@ -45,6 +48,17 @@ final class LibraryModel: ObservableObject {
                 }
             }
         }
+    }
+
+    func setAddress(_ address: String?, disk: String) {
+        var next = addresses
+        if let address {
+            guard next[disk] != address else { return }
+            next[disk] = address
+        } else {
+            guard next.removeValue(forKey: disk) != nil else { return }
+        }
+        addresses = next
     }
 
     func refresh() {
@@ -131,6 +145,10 @@ struct Welcome: View {
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             library.appear()
         }
+        .onReceive(NotificationCenter.default.publisher(for: .guestAddress)) { note in
+            guard let disk = note.object as? String else { return }
+            library.setAddress(note.userInfo?["address"] as? String, disk: disk)
+        }
         .onReceive(NotificationCenter.default.publisher(for: .libraryDidChange)) { note in
             // Pause, stop, and start post this with no disk. Do not rebuild the left list for those.
             guard let disk = note.object as? String else { return }
@@ -176,8 +194,19 @@ struct Welcome: View {
     private var librarySplit: some View {
         NavigationSplitView {
             List(library.machines, selection: $library.selected) { machine in
-                Text(machine.name)
-                    .lineLimit(1)
+                HStack {
+                    Text(machine.name)
+                        .lineLimit(1)
+                    if let address = library.addresses[machine.disk] {
+                        Spacer(minLength: 8)
+                        Text(address)
+                            .font(.caption.monospaced())
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .textSelection(.enabled)
+                    }
+                }
+                .tag(machine.disk)
             }
             .listStyle(.sidebar)
             .navigationSplitViewColumnWidth(min: 200, ideal: 240, max: 300)
@@ -212,6 +241,7 @@ struct Welcome: View {
                 }
             }
             .navigationTitle("Virtual Machine Manager")
+            .modifier(GuestSubtitle(text: library.addresses[library.selected ?? ""] ?? ""))
         }
         .frame(minWidth: 900, idealWidth: 1100, maxWidth: .infinity, minHeight: 560, idealHeight: 720, maxHeight: .infinity)
     }
@@ -221,6 +251,19 @@ struct Welcome: View {
         DispatchQueue.main.async {
             dismissWindow(id: "main")
             AppWindow.closeMain()
+        }
+    }
+}
+
+/// Under the window title, and only once ARP has an address. Empty adds nothing.
+private struct GuestSubtitle: ViewModifier {
+    var text: String
+
+    @ViewBuilder func body(content: Content) -> some View {
+        if text.isEmpty {
+            content
+        } else {
+            content.navigationSubtitle(text)
         }
     }
 }
