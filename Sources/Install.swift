@@ -120,18 +120,16 @@ struct Install: View {
     }
 
     private var filled: some View {
-        VStack(spacing: 0) {
-            ZStack {
-                guestScreen
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .background(.black)
-                    .allowsHitTesting(!guest.stopped)
-                if let error = guest.error {
-                    Text(error).font(.callout).foregroundStyle(.red).padding()
-                }
+        ZStack {
+            guestScreen
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(.black)
+                .allowsHitTesting(!guest.stopped)
+            if let error = guest.error {
+                Text(error).font(.callout).foregroundStyle(.red).padding()
             }
-            guestIPRow
         }
+        .safeAreaInset(edge: .bottom, spacing: 0) { guestIPRow }
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
                 Button("Start") { guest.bootDisk(disk, pointer: true) }
@@ -147,22 +145,29 @@ struct Install: View {
         .onAppear { guest.refreshAddress() }
     }
 
-    /// Same row UTM puts under the screenshot. A toolbar label becomes the overflow menu, so the IP never shows.
+    /// Under the screen, not in the toolbar. A toolbar label collapses into the overflow menu.
+    /// The row stays even before the address is known, so it is not clipped away with the guest.
     private var guestIPRow: some View {
-        Group {
-            if let address = guest.address {
-                HStack(spacing: 8) {
-                    Label("Guest IP", systemImage: "network.badge.shield.half.filled")
-                        .foregroundStyle(.secondary)
-                    Spacer(minLength: 12)
-                    Text(address)
-                        .font(.body.monospaced())
-                        .textSelection(.enabled)
-                }
-                .padding(.horizontal, 16)
-                .padding(.vertical, 8)
-            }
+        HStack(spacing: 8) {
+            Text("Guest IP")
+                .foregroundStyle(.secondary)
+            Spacer(minLength: 12)
+            Text(addressText)
+                .font(.body.monospaced())
+                .textSelection(.enabled)
         }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 8)
+        .frame(maxWidth: .infinity, minHeight: 36, alignment: .leading)
+        .background(.quaternary.opacity(0.45))
+    }
+
+    /// The address, or why it is not here yet. Start the machine before this can fill in.
+    private var addressText: String {
+        if let address = guest.address { return address }
+        if guest.paused { return "Paused" }
+        if guest.stopped { return "Start the machine" }
+        return "Looking up…"
     }
 
     private var page: some View {
@@ -173,7 +178,7 @@ struct Install: View {
                     .frame(width: 800, height: 500)
             }
             if setup { stepList }
-            guestIPRow
+            if fromSnapshot { guestIPRow }
             WrappingPath(text: disk)
             if let error = guest.error {
                 Text(error).font(.callout).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true)
@@ -534,8 +539,16 @@ final class GuestSession: ObservableObject {
             return
         }
         let path = disk
+        if let saved = try? String(contentsOf: path.deletingLastPathComponent().appendingPathComponent("ip"), encoding: .utf8) {
+            let host = saved.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !host.isEmpty, address != host {
+                address = host
+                postAddress(host)
+            }
+        }
         DispatchQueue.global(qos: .utility).async {
-            let found = Worker.guestAddress(disk: path) ?? Guest.natAddress(disk: path)
+            // The lease file is in-process. The worker scans the subnet and would leave this row on "Looking up…".
+            let found = Guest.natAddress(disk: path) ?? Worker.guestAddress(disk: path)
             DispatchQueue.main.async {
                 guard token == self.addressGeneration, self.diskURL == path, !self.stopped, !self.paused else { return }
                 if let found {

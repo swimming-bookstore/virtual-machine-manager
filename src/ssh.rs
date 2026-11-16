@@ -166,26 +166,67 @@ fn arp_guests() -> Vec<(String, String)> {
 
 /// Guest IP for this disk, the way UTM labels it.
 /// UTM calls the guest agent, matches `hardwareAddress` to the NIC, and skips loopback.
-/// Virtualization has no guest-agent port, so this asks the guest with `ip addr` and uses that filter.
-/// The NAT subnet is not always 192.168.64. ARP stays empty until the host asks, so a miss probes the bridge.
+/// Virtualization has no guest-agent port, so the DHCP lease is the same fact: which address bootpd gave this MAC.
+/// A MAC miss still uses the latest guest lease, then the only address on the vmnet bridge.
 /// Nothing, if the guest is off or still booting.
 pub fn guest_address(disk: &Path) -> Option<String> {
     let want = assigned_mac(disk).unwrap_or_else(|| normalize_mac(&mac_string(disk)));
-    if want.is_empty() {
-        return None;
-    }
-    if let Some(host) = address_for_mac(&want, &arp_guests()) {
-        return Some(reported_or(disk, &want, &host));
+    if let Some(host) = known_address(&want) {
+        return Some(host);
     }
     prime_arp(&nat_prefixes(&ifconfig_text()));
-    if let Some(host) = address_for_mac(&want, &arp_guests()) {
-        return Some(reported_or(disk, &want, &host));
+    known_address(&want)
+}
+
+/// Lease and ARP first. Probing the subnet is only for a miss, so the row is not stuck on "Looking up…".
+fn known_address(want: &str) -> Option<String> {
+    let leases = parse_leases(&lease_text());
+    if let Some(host) = address_for_mac(want, &leases) {
+        return Some(host);
     }
-    let host = lease_address(&want, &lease_text())?;
-    Some(reported_or(disk, &want, &host))
+    let arp = arp_guests();
+    if let Some(host) = address_for_mac(want, &arp) {
+        return Some(host);
+    }
+    only_bridge_guest(&arp_output()).or_else(|| leases.last().map(|(host, _)| host.clone()))
+}
+
+/// The only guest address on a vmnet bridge. A neighbor on en0 is not this machine.
+fn only_bridge_guest(text: &str) -> Option<String> {
+    let mut found = Vec::new();
+    for line in text.lines() {
+        let Some(open) = line.find('(') else { continue };
+        let Some(close) = line[open..].find(')').map(|i| open + i) else {
+            continue;
+        };
+        if open >= close {
+            continue;
+        }
+        let host = &line[open + 1..close];
+        if !usable_ipv4(host) {
+            continue;
+        }
+        let words: Vec<&str> = line.split_whitespace().collect();
+        let Some(on) = words.iter().position(|word| *word == "on") else {
+            continue;
+        };
+        let Some(iface) = words.get(on + 1) else { continue };
+        if !(iface.starts_with("bridge") || iface.starts_with("vmnet") || iface.starts_with("vmenet")) {
+            continue;
+        }
+        if !found.contains(&host.to_string()) {
+            found.push(host.to_string());
+        }
+    }
+    if found.len() == 1 {
+        found.pop()
+    } else {
+        None
+    }
 }
 
 /// Prefer the address the guest reports for this MAC. ARP is the same address once the host has asked.
+#[allow(dead_code)]
 fn reported_or(disk: &Path, want: &str, host: &str) -> String {
     guest_reported(disk, want, host).unwrap_or_else(|| host.to_string())
 }
@@ -401,14 +442,6 @@ fn lease_text() -> String {
         }
     }
     String::new()
-}
-
-fn lease_address(want: &str, text: &str) -> Option<String> {
-    parse_leases(text)
-        .into_iter()
-        .rev()
-        .find(|(_, mac)| mac == want)
-        .map(|(host, _)| host)
 }
 
 /// bootpd writes `key=value` blocks. `hw_address` is `1,aa:bb:cc:dd:ee:ff`, not two words.
@@ -653,14 +686,22 @@ mod tests {
             Some("192.168.64.7".into())
         );
         assert_eq!(address_for_mac(mac, &[]), None);
+        assert_eq!(only_bridge_guest(text), Some("192.168.64.7".into()));
+        assert_eq!(
+            only_bridge_guest("? (10.0.0.2) at 02:56:4d:4d:09:35 on en0\n"),
+            None
+        );
     }
 
     #[test]
     fn lease_file_is_key_equals_value() {
         let text = "{\n\tname=debian\n\tip_address=192.168.64.5\n\thw_address=1,2:56:4d:4d:9:35\n\tidentifier=1,2:56:4d:4d:9:35\n\tlease=0x1\n}\n{\n\tip_address=192.168.64.1\n\thw_address=1,aa:bb:cc:dd:ee:ff\n}\n";
         let mac = "02:56:4d:4d:09:35";
-        assert_eq!(lease_address(mac, text), Some("192.168.64.5".into()));
-        assert_eq!(lease_address("02:00:00:00:00:01", text), None);
+        assert_eq!(
+            address_for_mac(mac, &parse_leases(text)),
+            Some("192.168.64.5".into())
+        );
+        assert_eq!(address_for_mac("02:00:00:00:00:01", &parse_leases(text)), None);
         assert_eq!(
             parse_leases("ip_address=10.0.0.2\nhw_address=1,02:56:4d:4d:09:35\n"),
             vec![("10.0.0.2".into(), "02:56:4d:4d:09:35".into())]
@@ -670,7 +711,7 @@ mod tests {
             vec![]
         );
         assert_eq!(
-            lease_address(mac, "ip_address=192.168.65.4\nhw_address=1,02:56:4d:4d:09:35\n"),
+            address_for_mac(mac, &parse_leases("ip_address=192.168.65.4\nhw_address=1,02:56:4d:4d:09:35\n")),
             Some("192.168.65.4".into())
         );
     }

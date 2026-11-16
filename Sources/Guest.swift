@@ -36,17 +36,20 @@ enum Guest {
         return lookup(mac: want)
     }
 
+    /// Lease file first. It is written when the guest gets an address, and it does not need an ARP probe.
+    /// A MAC miss still shows the latest guest lease, then the only address on the vmnet bridge.
     private static func lookup(mac want: String) -> String? {
-        if let text = arpText(), let host = address(in: text, mac: want) {
-            return host
-        }
-        if let host = leaseAddress(mac: want) {
-            return host
-        }
+        if let host = matched(mac: want) { return host }
+        if let host = onlyBridgeGuest() { return host }
+        if let host = latestLease() { return host }
         primeArp()
-        if let text = arpText(), let host = address(in: text, mac: want) {
-            return host
-        }
+        return matched(mac: want) ?? onlyBridgeGuest() ?? latestLease()
+    }
+
+    private static func matched(mac want: String) -> String? {
+        guard !want.isEmpty else { return nil }
+        if let host = leaseAddress(mac: want) { return host }
+        if let text = arpText(), let host = address(in: text, mac: want) { return host }
         return nil
     }
 
@@ -71,6 +74,97 @@ enum Guest {
             }
         }
         return nil
+    }
+
+    /// The only guest address on a vmnet bridge. A LAN neighbor on en0 is not this.
+    private static func onlyBridgeGuest() -> String? {
+        guard let text = arpText() else { return nil }
+        var found: [String] = []
+        for line in text.split(separator: "\n") {
+            guard let open = line.firstIndex(of: "("),
+                  let close = line[open...].firstIndex(of: ")"),
+                  open < close else { continue }
+            let host = String(line[line.index(after: open)..<close])
+            guard isGuestHost(host) else { continue }
+            let words = line.split(whereSeparator: \.isWhitespace).map(String.init)
+            guard let on = words.firstIndex(of: "on"), words.count > on + 1 else { continue }
+            let iface = words[on + 1]
+            guard iface.hasPrefix("bridge") || iface.hasPrefix("vmnet") || iface.hasPrefix("vmenet") else { continue }
+            if !found.contains(host) { found.append(host) }
+        }
+        return found.count == 1 ? found[0] : nil
+    }
+
+    /// Newest guest lease. bootpd appends, so the last block is the current grant.
+    private static func latestLease() -> String? {
+        for path in leasePaths {
+            if let host = latestLease(at: path) { return host }
+        }
+        return nil
+    }
+
+    private static func latestLease(at path: String) -> String? {
+        var isDir: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: path, isDirectory: &isDir) else { return nil }
+        if isDir.boolValue {
+            guard let names = try? FileManager.default.contentsOfDirectory(atPath: path) else { return nil }
+            var last: String?
+            for name in names.sorted() where name.hasSuffix(".lease") || name.hasSuffix(".plist") || name.contains("dhcp") {
+                if let host = latestLease(at: (path as NSString).appendingPathComponent(name)) {
+                    last = host
+                }
+            }
+            return last
+        }
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)), !data.isEmpty else { return nil }
+        let text = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .isoLatin1) ?? ""
+        return latestLeaseHost(text)
+    }
+
+    private static func latestLeaseHost(_ text: String) -> String? {
+        if text.contains("<key>") { return latestLeaseXML(text) }
+        var found: String?
+        var ip: String?
+        for raw in text.split(whereSeparator: \.isNewline) {
+            let line = raw.trimmingCharacters(in: .whitespaces)
+            if line.isEmpty || line == "{" { ip = nil; continue }
+            if line == "}" {
+                if let ip, isGuestHost(ip) { found = ip }
+                ip = nil
+                continue
+            }
+            guard let (key, value) = leaseField(line) else { continue }
+            if key == "ip_address" || key == "ip-address" { ip = value }
+        }
+        if let ip, isGuestHost(ip) { found = ip }
+        return found
+    }
+
+    private static func latestLeaseXML(_ text: String) -> String? {
+        var found: String?
+        var pending: String?
+        var ip: String?
+        for raw in text.split(whereSeparator: \.isNewline) {
+            let line = raw.trimmingCharacters(in: .whitespaces)
+            if line == "<dict>" { ip = nil; continue }
+            if line == "</dict>" {
+                if let ip, isGuestHost(ip) { found = ip }
+                ip = nil
+                continue
+            }
+            if line.hasPrefix("<key>"), line.hasSuffix("</key>") {
+                pending = String(line.dropFirst(5).dropLast(6))
+                continue
+            }
+            if line.hasPrefix("<string>"), line.hasSuffix("</string>"), let key = pending {
+                if key == "ip_address" || key == "ip-address" {
+                    ip = String(line.dropFirst(8).dropLast(9))
+                }
+                pending = nil
+            }
+        }
+        if let ip, isGuestHost(ip) { found = ip }
+        return found
     }
 
     /// vmnet writes one lease file, not a directory. Each guest is `key=value` inside `{ }`.

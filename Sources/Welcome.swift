@@ -315,8 +315,11 @@ private final class ChromeView: NSView {
                 window.setContentSize(size)
             }
         } else {
-            window.title = "Virtual Machine Manager"
-            // Keep the title up. Hiding it left the bar empty until a later layout, which is the jump.
+            // The title itself carries the address. The subtitle is easy to miss, and a toolbar label becomes the overflow menu.
+            let title = subtitle.isEmpty ? "Virtual Machine Manager" : "Virtual Machine Manager — \(subtitle)"
+            if window.title != title {
+                window.title = title
+            }
             window.titleVisibility = .visible
             window.styleMask.insert(.resizable)
             if window.subtitle != subtitle {
