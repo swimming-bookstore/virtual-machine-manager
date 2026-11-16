@@ -512,6 +512,12 @@ enum Command {
         #[arg(long, value_name = "PATH")]
         disk: PathBuf,
     },
+    /// The guest address ARP has for this disk. Empty when the VM is off.
+    Address {
+        /// Guest disk whose MAC should be looked up.
+        #[arg(long, value_name = "PATH")]
+        disk: PathBuf,
+    },
     /// Record a pause save already written beside the guest disk.
     Pause {
         /// Guest disk that was paused.
@@ -555,6 +561,12 @@ fn main() {
                 }
                 Err(err) => die(err),
             }
+        }
+        Command::Address { disk } => {
+            let mut event = ev("address", None, Some("done"));
+            event.disk = Some(disk.display().to_string());
+            event.detail = ssh::guest_address(&disk);
+            emit(event);
         }
         Command::Pause { disk } => match pause::mark(&disk) {
             Ok(()) => {

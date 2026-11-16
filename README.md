@@ -22,8 +22,8 @@ The private key is:
 ~/Library/Application Support/virtual-machine-manager/ssh/id_ed25519
 ```
 
-The app logs in by itself after install. To do it yourself, use the guest address on `192.168.64.0/24` (not `.1`, that is the host):
+Start the machine. The IP shows in the window title bar. `.1` is this Mac. If the bar is still empty, the guest is still booting.
 
 ```sh
-ssh -i ~/Library/Application\ Support/virtual-machine-manager/ssh/id_ed25519 debian@192.168.64.2
+ssh -i ~/Library/Application\ Support/virtual-machine-manager/ssh/id_ed25519 -o IdentitiesOnly=yes debian@192.168.64.N
 ```

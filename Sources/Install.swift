@@ -130,6 +130,14 @@ struct Install: View {
             }
         }
         .toolbar {
+            if fill {
+                ToolbarItem(placement: .principal) {
+                    Text(guest.address ?? (guest.stopped ? "" : "Looking up IP"))
+                        .font(.body.monospaced())
+                        .foregroundStyle(guest.address == nil ? .secondary : .primary)
+                        .textSelection(.enabled)
+                }
+            }
             ToolbarItemGroup(placement: .primaryAction) {
                 Button("Start") { guest.bootDisk(disk, pointer: true) }
                     .disabled(!guest.stopped)
@@ -139,6 +147,9 @@ struct Install: View {
                     .disabled(guest.stopped && !guest.paused)
             }
         }
+        .onChange(of: guest.stopped) { _, _ in guest.refreshAddress() }
+        .onChange(of: guest.paused) { _, _ in guest.refreshAddress() }
+        .onAppear { guest.refreshAddress() }
     }
 
     private var page: some View {
@@ -178,6 +189,15 @@ struct Install: View {
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
+            if !setup, let address = guest.address {
+                Text(address)
+                    .font(.body.monospaced())
+                    .textSelection(.enabled)
+            } else if !setup && !guest.stopped {
+                Text("Looking up IP")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+            }
         }
     }
 
@@ -434,6 +454,8 @@ final class GuestSession: ObservableObject {
     @Published var paused = false
     /// Last guest frame at pause. Shown while the machine is stopped.
     @Published var pausePreview: NSImage?
+    /// NAT address for this disk. Empty until ARP sees the guest MAC.
+    @Published var address: String?
     /// Quick start passes its own list. A clone keeps the rows on this session.
     var steps: Binding<[WizardStep]>?
     let view = InstallScreen()
@@ -449,6 +471,7 @@ final class GuestSession: ObservableObject {
     private var checking = false
     private var saved = false
     private var watch: Timer?
+    private var addressWatch: Timer?
     private var probing = false
     private var savingSnapshot = false
     /// Boots of the installed disk while Verify with host key has not logged in. A quit used to leave that row waiting.
@@ -490,6 +513,37 @@ final class GuestSession: ObservableObject {
         }
     }
 
+    /// ARP for this disk's MAC. The address is shown only while the guest is running.
+    func refreshAddress() {
+        addressWatch?.invalidate()
+        addressWatch = nil
+        guard fromSnapshotBoot, !stopped, !paused, let disk = diskURL else {
+            address = nil
+            return
+        }
+        let path = disk
+        DispatchQueue.global(qos: .utility).async {
+            let found = Worker.address(disk: path)
+            DispatchQueue.main.async {
+                guard self.diskURL == path, !self.stopped, !self.paused else { return }
+                if let found {
+                    self.address = found
+                }
+                self.armAddressWatch()
+            }
+        }
+    }
+
+    /// DHCP can answer after the window is already open. Keep looking until ARP has the MAC.
+    private func armAddressWatch() {
+        guard address == nil, !stopped, !paused else { return }
+        let timer = Timer(timeInterval: 2, repeats: false) { [weak self] _ in
+            self?.refreshAddress()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        addressWatch = timer
+    }
+
     /// A clone stays off until Start. A pause save is restored then, not on open.
     func holdClone(_ path: String) {
         if started && !stopped { return }
@@ -503,6 +557,7 @@ final class GuestSession: ObservableObject {
         paused = GuestPause.isPaused(beside: diskURL!)
         pausePreview = paused ? NSImage(contentsOf: GuestPause.preview(beside: diskURL!)) : nil
         headline = paused ? "Debian is paused." : "Debian is stopped. The guest disk is the installed system."
+        refreshAddress()
     }
 
     /// Quick start came back after the snapshot. Do not start the installer virtual machine.
@@ -676,6 +731,7 @@ final class GuestSession: ObservableObject {
                 self.stopped = false
                 self.headline = "Debian is running from the guest disk."
                 self.publishLibrary()
+                self.refreshAddress()
             }
         }
     }
@@ -748,6 +804,7 @@ final class GuestSession: ObservableObject {
         probing = false
         watch?.invalidate()
         watch = nil
+        refreshAddress()
         // The host-key login is still running. Kill it, or the next open stays on Verify with host key.
         GuestSSH.stop()
         stopped = true
@@ -764,6 +821,7 @@ final class GuestSession: ObservableObject {
         watch = nil
         stopped = true
         headline = "Debian stopped. The guest disk is the installed system."
+        refreshAddress()
         let running = machine
         dropMachine()
         running?.stop { _ in }
@@ -879,6 +937,7 @@ final class GuestSession: ObservableObject {
                     pane.show(self.pausePreview)
                 }
                 self.headline = "Debian is paused."
+                self.refreshAddress()
                 self.publishLibrary()
                 // A visible still can cover the guest. Without one, keep the paused machine so Metal still shows the last frame.
                 if self.pausePreview != nil {
@@ -1143,6 +1202,7 @@ final class GuestSession: ObservableObject {
                 markSetup("ssh", state: "now")
             } else {
                 headline = "Debian is running from the guest disk."
+                refreshAddress()
             }
             // start() can report success before state becomes .running. Probe from here.
             // A saved snapshot is the artifact. Do not probe it again.

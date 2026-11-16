@@ -396,6 +396,13 @@ enum Worker {
         return .success(disk)
     }
 
+    /// The address ARP has for this disk. Nil when the guest is off or still booting.
+    static func address(disk: URL) -> String? {
+        let (code, text) = run(["address", "--disk", disk.path])
+        guard code == 0 else { return nil }
+        return message(text).filter { $0.contains(".") }
+    }
+
     /// One SSH attempt in the worker. A closed port is not a finished install.
     /// `cancel` is set when the app closes so a scan cannot keep the next open on "Checking SSH".
     static func probe(disk: URL, cancel: @escaping () -> Bool) -> Bool {

@@ -160,6 +160,18 @@ fn arp_guests() -> Vec<(String, String)> {
     parse_arp(&arp_output())
 }
 
+/// The NAT address ARP has for this disk's MAC. Nothing, if the guest is off or still booting.
+pub fn guest_address(disk: &Path) -> Option<String> {
+    address_for(disk, &arp_guests())
+}
+
+fn address_for(disk: &Path, arp: &[(String, String)]) -> Option<String> {
+    let want = normalize_mac(&mac_string(disk));
+    arp.iter()
+        .find(|(_, seen)| seen == &want)
+        .map(|(host, _)| host.clone())
+}
+
 fn arp_output() -> String {
     for bin in ["/usr/sbin/arp", "/usr/bin/arp", "arp"] {
         if let Ok(out) = Command::new(bin)
@@ -285,6 +297,12 @@ mod tests {
             parse_arp(text),
             vec![("192.168.64.7".into(), "02:56:4d:4d:09:35".into())]
         );
+        let disk = Path::new("/tmp/vmm/snapshots/debian/disk.img");
+        assert_eq!(
+            address_for(disk, &parse_arp(text)),
+            Some("192.168.64.7".into())
+        );
+        assert_eq!(address_for(disk, &[]), None);
     }
 
     #[test]
