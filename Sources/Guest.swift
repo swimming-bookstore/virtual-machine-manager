@@ -27,8 +27,17 @@ enum Guest {
     }
 
     /// Address for this disk's MAC. ARP first, then the DHCP lease. Nil when the guest is off or still booting.
+    /// The MAC written at boot is the one vmnet recorded. A recomputed one misses the lease if Virtualization kept its own.
     static func natAddress(disk: URL) -> String? {
-        let want = macString(for: disk)
+        let want = normalizeMAC(assignedMAC(disk: disk) ?? macString(for: disk))
+        guard !want.isEmpty else { return nil }
+        if let host = lookup(mac: want) { return host }
+        // The host ARP table stays empty until this Mac talks to the guest. A short ping fills it.
+        nudgeARP()
+        return lookup(mac: want)
+    }
+
+    private static func lookup(mac want: String) -> String? {
         if let text = arpText(), let host = address(in: text, mac: want) {
             return host
         }
@@ -58,47 +67,121 @@ enum Guest {
         return nil
     }
 
-    /// vmnet writes the lease here. ARP stays empty until the host has talked to the guest.
+    /// vmnet writes one lease file, not a directory. Each guest is `key=value` inside `{ }`.
+    /// `hw_address` is `1,aa:bb:cc:dd:ee:ff`. ARP stays empty until this Mac talks to the guest.
+    private static let leasePaths = [
+        "/var/db/dhcpd_leases",
+        "/private/var/db/dhcpd_leases",
+        "/var/db/vmnet/dhcpd_leases",
+        "/private/var/db/vmnet/dhcpd_leases",
+    ]
+
     private static func leaseAddress(mac want: String) -> String? {
-        let root = URL(fileURLWithPath: "/var/db/dhcpd_leases", isDirectory: true)
-        guard let names = try? FileManager.default.contentsOfDirectory(atPath: root.path) else { return nil }
-        for name in names where name.hasSuffix(".lease") || name.hasSuffix(".plist") {
-            guard let text = try? String(contentsOf: root.appendingPathComponent(name), encoding: .utf8) else { continue }
-            if let host = leaseHost(text, mac: want) {
-                return host
-            }
+        for path in leasePaths {
+            if let host = leaseAddress(at: path, mac: want) { return host }
         }
         return nil
     }
 
+    private static func leaseAddress(at path: String, mac want: String) -> String? {
+        var isDir: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: path, isDirectory: &isDir) else { return nil }
+        if isDir.boolValue {
+            guard let names = try? FileManager.default.contentsOfDirectory(atPath: path) else { return nil }
+            for name in names.sorted() where name.hasSuffix(".lease") || name.hasSuffix(".plist") || name.contains("dhcp") {
+                if let host = leaseAddress(at: (path as NSString).appendingPathComponent(name), mac: want) {
+                    return host
+                }
+            }
+            return nil
+        }
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)), !data.isEmpty else { return nil }
+        let text = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .isoLatin1) ?? ""
+        return leaseHost(text, mac: want)
+    }
+
+    /// Last matching block wins. The file keeps the current lease last.
     private static func leaseHost(_ text: String, mac want: String) -> String? {
+        if text.contains("<key>") { return leaseHostXML(text, mac: want) }
+        var found: String?
         var ip: String?
         var mac: String?
-        for raw in text.split(separator: "\n") {
+        func consider() {
+            if let ip, let mac, normalizeMAC(mac) == want, isGuestHost(ip) {
+                found = ip
+            }
+        }
+        for raw in text.split(whereSeparator: \.isNewline) {
             let line = raw.trimmingCharacters(in: .whitespaces)
-            if line == "{" {
+            if line.isEmpty || line == "{" {
                 ip = nil
                 mac = nil
                 continue
             }
             if line == "}" {
-                if let ip, let mac, normalizeMAC(mac) == want, ip.hasPrefix("192.168.64."), ip != "192.168.64.1" {
-                    return ip
-                }
+                consider()
                 ip = nil
                 mac = nil
                 continue
             }
-            let parts = line.split(whereSeparator: \.isWhitespace).map(String.init)
-            guard parts.count >= 2 else { continue }
-            let key = parts[0].trimmingCharacters(in: CharacterSet(charactersIn: "\"="))
-            let value = parts[1].trimmingCharacters(in: CharacterSet(charactersIn: "\";"))
+            guard let (key, value) = leaseField(line) else { continue }
             if key == "ip_address" || key == "ip-address" { ip = value }
-            if key == "hw_address" || key == "hw-address" {
-                mac = parts.last.map { $0.trimmingCharacters(in: CharacterSet(charactersIn: "\";")) }
+            if key == "hw_address" || key == "hw-address" || key == "mac_address" || key == "hardware_address" {
+                mac = value
+            } else if key == "identifier", mac == nil {
+                mac = value
             }
         }
-        return nil
+        consider()
+        return found
+    }
+
+    private static func leaseHostXML(_ text: String, mac want: String) -> String? {
+        var found: String?
+        var pending: String?
+        var ip: String?
+        var mac: String?
+        func consider() {
+            if let ip, let mac, normalizeMAC(mac) == want, isGuestHost(ip) {
+                found = ip
+            }
+        }
+        for raw in text.split(whereSeparator: \.isNewline) {
+            let line = raw.trimmingCharacters(in: .whitespaces)
+            if line == "<dict>" { ip = nil; mac = nil; continue }
+            if line == "</dict>" { consider(); ip = nil; mac = nil; continue }
+            if line.hasPrefix("<key>"), line.hasSuffix("</key>") {
+                pending = String(line.dropFirst(5).dropLast(6))
+                continue
+            }
+            if line.hasPrefix("<string>"), line.hasSuffix("</string>"), let key = pending {
+                let value = String(line.dropFirst(8).dropLast(9))
+                if key == "ip_address" || key == "ip-address" { ip = value }
+                if key == "hw_address" || key == "hw-address" || key == "mac_address" { mac = value }
+                pending = nil
+            }
+        }
+        consider()
+        return found
+    }
+
+    private static func leaseField(_ line: String) -> (String, String)? {
+        let trimmed = line.trimmingCharacters(in: CharacterSet(charactersIn: "\";"))
+        if let eq = trimmed.firstIndex(of: "=") {
+            let key = String(trimmed[..<eq]).trimmingCharacters(in: .whitespaces).trimmingCharacters(in: CharacterSet(charactersIn: "\""))
+            let value = String(trimmed[trimmed.index(after: eq)...]).trimmingCharacters(in: .whitespaces).trimmingCharacters(in: CharacterSet(charactersIn: "\";"))
+            guard !key.isEmpty, !value.isEmpty else { return nil }
+            return (key, value)
+        }
+        let parts = trimmed.split(whereSeparator: \.isWhitespace).map(String.init)
+        guard parts.count >= 2 else { return nil }
+        let key = parts[0].trimmingCharacters(in: CharacterSet(charactersIn: "\""))
+        let value = parts.dropFirst().joined(separator: " ").trimmingCharacters(in: CharacterSet(charactersIn: "\";"))
+        return (key, value)
+    }
+
+    private static func isGuestHost(_ host: String) -> Bool {
+        host.hasPrefix("192.168.64.") && host != "192.168.64.1" && host.split(separator: ".").count == 4
     }
 
     private static func commandText(_ path: String, _ args: [String]) -> String? {
@@ -114,10 +197,76 @@ enum Guest {
     }
 
     private static func normalizeMAC(_ text: String) -> String {
-        text.split(separator: ":").map { part in
-            String(format: "%02x", UInt8(part, radix: 16) ?? 0)
-        }.joined(separator: ":")
+        let raw = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let body = raw.split(separator: ",").last.map { $0.trimmingCharacters(in: .whitespaces) } ?? raw
+        let token = body.split(whereSeparator: \.isWhitespace).first.map(String.init) ?? body
+        let parts = token.split { $0 == ":" || $0 == "-" }
+        guard parts.count == 6 else { return "" }
+        var bytes: [String] = []
+        for part in parts {
+            guard let value = UInt8(part, radix: 16) else { return "" }
+            bytes.append(String(format: "%02x", value))
+        }
+        return bytes.joined(separator: ":")
     }
+
+    private static var assigned: [String: String] = [:]
+    private static let macLock = NSLock()
+    private static var nudgeCursor = 2
+    private static var nudging = false
+
+    /// The MAC the attachment actually uses. Written beside the disk so the next lookup matches the lease.
+    static func noteMAC(_ mac: VZMACAddress, disk: URL) {
+        let text = mac.string.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return }
+        macLock.lock()
+        assigned[disk.path] = text
+        macLock.unlock()
+        let url = disk.deletingLastPathComponent().appendingPathComponent("mac")
+        try? (text + "\n").write(to: url, atomically: true, encoding: .utf8)
+    }
+
+    private static func assignedMAC(disk: URL) -> String? {
+        macLock.lock()
+        let cached = assigned[disk.path]
+        macLock.unlock()
+        if let cached, !cached.isEmpty { return cached }
+        let url = disk.deletingLastPathComponent().appendingPathComponent("mac")
+        guard let text = try? String(contentsOf: url, encoding: .utf8) else { return nil }
+        let mac = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return mac.contains(":") || mac.contains("-") ? mac : nil
+    }
+
+    /// Ask 192.168.64.2–254 who is home, a slice at a time, so ARP learns the guest MAC.
+    private static func nudgeARP() {
+        macLock.lock()
+        if nudging {
+            macLock.unlock()
+            return
+        }
+        nudging = true
+        let start = nudgeCursor
+        nudgeCursor = 2 + (start - 2 + 24) % 253
+        macLock.unlock()
+        for offset in 0..<24 {
+            let n = 2 + (start - 2 + offset) % 253
+            spawn("/sbin/ping", ["-c", "1", "-W", "200", "-q", "192.168.64.\(n)"])
+        }
+        Thread.sleep(forTimeInterval: 0.35)
+        macLock.lock()
+        nudging = false
+        macLock.unlock()
+    }
+
+    private static func spawn(_ path: String, _ args: [String]) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: path)
+        process.arguments = args
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        try? process.run()
+    }
+
 
     private static func machine(disk: URL, extra: [URL], pointer: Bool) throws -> VZVirtualMachine {
         let config = VZVirtualMachineConfiguration()
@@ -156,6 +305,7 @@ enum Guest {
         if let mac = VZMACAddress(string: macString(for: disk)) {
             network.macAddress = mac
         }
+        noteMAC(network.macAddress, disk: disk)
         return network
     }
 

@@ -51,14 +51,21 @@ final class LibraryModel: ObservableObject {
     }
 
     func setAddress(_ address: String?, disk: String) {
+        let key = canonical(disk)
         var next = addresses
         if let address {
-            guard next[disk] != address else { return }
-            next[disk] = address
+            guard next[key] != address else { return }
+            next[key] = address
         } else {
-            guard next.removeValue(forKey: disk) != nil else { return }
+            guard next.removeValue(forKey: key) != nil else { return }
         }
         addresses = next
+    }
+
+    /// The session path and the sidebar path are the same file. Standardize so the row finds the IP.
+    private func canonical(_ disk: String) -> String {
+        let want = URL(fileURLWithPath: disk).standardizedFileURL.path
+        return machines.first { URL(fileURLWithPath: $0.disk).standardizedFileURL.path == want }?.disk ?? disk
     }
 
     func refresh() {
@@ -134,7 +141,7 @@ struct Welcome: View {
                 splash
             }
         }
-        .background(MainWindowChrome(splash: !showsLibrary))
+        .background(MainWindowChrome(splash: !showsLibrary, subtitle: librarySubtitle))
         .onAppear {
             library.appear()
             AppWindow.closeQuickStart()
@@ -241,8 +248,15 @@ struct Welcome: View {
                 }
             }
             .navigationTitle("Virtual Machine Manager")
+            .navigationSubtitle(librarySubtitle)
         }
         .frame(minWidth: 900, idealWidth: 1100, maxWidth: .infinity, minHeight: 560, idealHeight: 720, maxHeight: .infinity)
+    }
+
+    /// IP of the selected machine. Empty while it is off or still booting.
+    private var librarySubtitle: String {
+        guard showsLibrary, let disk = library.selected else { return "" }
+        return library.addresses[disk] ?? ""
     }
 
     private func openQuickStart() {
@@ -258,15 +272,18 @@ struct Welcome: View {
 /// The title is applied before the window is shown, so it does not pop in after the first frame.
 private struct MainWindowChrome: NSViewRepresentable {
     var splash: Bool
+    var subtitle: String
 
     func makeNSView(context: Context) -> ChromeView {
         let view = ChromeView()
         view.splash = splash
+        view.subtitle = subtitle
         return view
     }
 
     func updateNSView(_ view: ChromeView, context: Context) {
         view.splash = splash
+        view.subtitle = subtitle
         view.apply()
     }
 }
@@ -274,6 +291,7 @@ private struct MainWindowChrome: NSViewRepresentable {
 /// viewDidMoveToWindow runs before the window is shown. The old async apply hid the title after launch.
 private final class ChromeView: NSView {
     var splash = false
+    var subtitle = ""
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
@@ -288,6 +306,7 @@ private final class ChromeView: NSView {
         }
         if splash {
             window.title = "Welcome"
+            window.subtitle = ""
             window.titleVisibility = .visible
             window.styleMask.remove(.resizable)
             let height = max(window.contentView?.fittingSize.height ?? 0, 248)
@@ -300,6 +319,9 @@ private final class ChromeView: NSView {
             // Keep the title up. Hiding it left the bar empty until a later layout, which is the jump.
             window.titleVisibility = .visible
             window.styleMask.insert(.resizable)
+            if window.subtitle != subtitle {
+                window.subtitle = subtitle
+            }
             guard window.frame.width < 900 || window.frame.height < 560 else { return }
             let screen = window.screen?.visibleFrame ?? NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1100, height: 720)
             var frame = window.frame

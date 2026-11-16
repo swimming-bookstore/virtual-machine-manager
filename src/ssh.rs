@@ -160,15 +160,127 @@ fn arp_guests() -> Vec<(String, String)> {
     parse_arp(&arp_output())
 }
 
-/// The NAT address ARP has for this disk's MAC. Nothing, if the guest is off or still booting.
+/// The NAT address for this disk's MAC. ARP first, then `/var/db/dhcpd_leases`.
+/// Nothing, if the guest is off or still booting.
 pub fn guest_address(disk: &Path) -> Option<String> {
-    address_for(disk, &arp_guests())
+    let want = assigned_mac(disk).unwrap_or_else(|| normalize_mac(&mac_string(disk)));
+    if want.is_empty() {
+        return None;
+    }
+    address_for_mac(&want, &arp_guests()).or_else(|| lease_address(&want, &lease_text()))
+}
+
+fn assigned_mac(disk: &Path) -> Option<String> {
+    let path = disk.parent()?.join("mac");
+    let text = fs::read_to_string(path).ok()?;
+    let mac = normalize_mac(text.trim());
+    if mac.is_empty() { None } else { Some(mac) }
+}
+
+fn lease_text() -> String {
+    for path in [
+        "/var/db/dhcpd_leases",
+        "/private/var/db/dhcpd_leases",
+        "/var/db/vmnet/dhcpd_leases",
+    ] {
+        if let Ok(text) = fs::read_to_string(path) {
+            if !text.is_empty() {
+                return text;
+            }
+        }
+    }
+    String::new()
+}
+
+fn lease_address(want: &str, text: &str) -> Option<String> {
+    parse_leases(text)
+        .into_iter()
+        .rev()
+        .find(|(_, mac)| mac == want)
+        .map(|(host, _)| host)
+}
+
+/// bootpd writes `key=value` blocks. `hw_address` is `1,aa:bb:cc:dd:ee:ff`, not two words.
+fn parse_leases(text: &str) -> Vec<(String, String)> {
+    let mut found = Vec::new();
+    let mut ip = None;
+    let mut mac = None;
+    let finish = |ip: &mut Option<String>, mac: &mut Option<String>, found: &mut Vec<(String, String)>| {
+        if let (Some(host), Some(raw)) = (ip.take(), mac.take()) {
+            let normalized = normalize_mac(&raw);
+            if !normalized.is_empty() && is_guest_host(&host) {
+                found.push((host, normalized));
+            }
+        } else {
+            ip.take();
+            mac.take();
+        }
+    };
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line == "{" {
+            ip = None;
+            mac = None;
+            continue;
+        }
+        if line == "}" {
+            finish(&mut ip, &mut mac, &mut found);
+            continue;
+        }
+        let Some((key, value)) = lease_field(line) else {
+            continue;
+        };
+        if key == "ip_address" || key == "ip-address" {
+            ip = Some(value);
+        } else if key == "hw_address"
+            || key == "hw-address"
+            || key == "mac_address"
+            || key == "hardware_address"
+        {
+            mac = Some(value);
+        } else if key == "identifier" && mac.is_none() {
+            mac = Some(value);
+        }
+    }
+    finish(&mut ip, &mut mac, &mut found);
+    found
+}
+
+fn lease_field(line: &str) -> Option<(String, String)> {
+    let trimmed = line.trim_matches(|c| c == '"' || c == ';');
+    if let Some((key, value)) = trimmed.split_once('=') {
+        let key = key.trim().trim_matches('"');
+        let value = value.trim().trim_matches(|c| c == '"' || c == ';');
+        if key.is_empty() || value.is_empty() {
+            return None;
+        }
+        return Some((key.to_string(), value.to_string()));
+    }
+    let mut parts = trimmed.split_whitespace();
+    let key = parts.next()?.trim_matches('"');
+    let value = parts.collect::<Vec<_>>().join(" ");
+    let value = value.trim_matches(|c| c == '"' || c == ';');
+    if key.is_empty() || value.is_empty() {
+        return None;
+    }
+    Some((key.to_string(), value.to_string()))
+}
+
+fn is_guest_host(host: &str) -> bool {
+    host.starts_with("192.168.64.") && host != "192.168.64.1" && host.split('.').count() == 4
 }
 
 fn address_for(disk: &Path, arp: &[(String, String)]) -> Option<String> {
-    let want = normalize_mac(&mac_string(disk));
+    let want = assigned_mac(disk).unwrap_or_else(|| normalize_mac(&mac_string(disk)));
+    address_for_mac(&want, arp)
+}
+
+fn address_for_mac(want: &str, arp: &[(String, String)]) -> Option<String> {
+    if want.is_empty() {
+        return None;
+    }
     arp.iter()
-        .find(|(_, seen)| seen == &want)
+        .find(|(_, seen)| seen == want)
         .map(|(host, _)| host.clone())
 }
 
@@ -212,10 +324,21 @@ fn parse_arp(text: &str) -> Vec<(String, String)> {
 }
 
 fn normalize_mac(text: &str) -> String {
-    text.split(':')
-        .map(|part| format!("{:02x}", u8::from_str_radix(part, 16).unwrap_or(0)))
-        .collect::<Vec<_>>()
-        .join(":")
+    let raw = text.trim();
+    let body = raw.rsplit(',').next().unwrap_or(raw).trim();
+    let token = body.split_whitespace().next().unwrap_or(body);
+    let parts: Vec<&str> = token.split(|c| c == ':' || c == '-').collect();
+    if parts.len() != 6 {
+        return String::new();
+    }
+    let mut bytes = Vec::with_capacity(6);
+    for part in parts {
+        let Ok(value) = u8::from_str_radix(part, 16) else {
+            return String::new();
+        };
+        bytes.push(format!("{value:02x}"));
+    }
+    bytes.join(":")
 }
 
 fn generate(private: &Path) -> Result<()> {
@@ -303,6 +426,18 @@ mod tests {
             Some("192.168.64.7".into())
         );
         assert_eq!(address_for(disk, &[]), None);
+    }
+
+    #[test]
+    fn lease_file_is_key_equals_value() {
+        let text = "{\n\tname=debian\n\tip_address=192.168.64.5\n\thw_address=1,2:56:4d:4d:9:35\n\tidentifier=1,2:56:4d:4d:9:35\n\tlease=0x1\n}\n{\n\tip_address=192.168.64.1\n\thw_address=1,aa:bb:cc:dd:ee:ff\n}\n";
+        let mac = "02:56:4d:4d:09:35";
+        assert_eq!(lease_address(mac, text), Some("192.168.64.5".into()));
+        assert_eq!(lease_address("02:00:00:00:00:01", text), None);
+        assert_eq!(
+            parse_leases("ip_address=10.0.0.2\nhw_address=1,02:56:4d:4d:09:35\n"),
+            vec![]
+        );
     }
 
     #[test]
