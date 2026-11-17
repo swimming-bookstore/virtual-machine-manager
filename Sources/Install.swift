@@ -540,8 +540,7 @@ final class GuestSession: ObservableObject {
         }
     }
 
-    /// Ask again while the guest is running. Each pass reads this disk's MAC from ARP.
-    /// UTM polls every 10 seconds and clears the row when the machine is not started.
+    /// The first pass is not enough. Apple writes the `bridge100` row after the guest answers DHCP.
     func refreshAddress() {
         addressWatch?.invalidate()
         addressWatch = nil

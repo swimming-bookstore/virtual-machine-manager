@@ -43,15 +43,50 @@ enum Guest {
 
     /// Address on this disk's NIC. Nil when ARP has no row for this MAC yet.
     /// Each machine has its own MAC. The IP is the ARP row for that MAC, not a guessed lease.
+    /// `bridge100` is the vmnet shared network. A row there is the guest.
     static func natAddress(disk: URL) -> String? {
         let want = lookupMAC(disk: disk)
-        guard !want.isEmpty else { return nil }
-        return arpMatch(mac: want, gateways: hostGateways())
+        guard !want.isEmpty, let text = arpText() else { return nil }
+        let gateways = hostGateways()
+        if let host = address(in: text, mac: want, gateways: gateways) {
+            return host
+        }
+        return bridgeAddress(in: text, mac: want, gateways: gateways)
     }
 
     private static func arpMatch(mac want: String, gateways: Set<String>) -> String? {
         guard !want.isEmpty, let text = arpText() else { return nil }
         return address(in: text, mac: want, gateways: gateways)
+    }
+
+    /// MAC on `bridge100` (or any `bridge*`). That row is the guest even when a stricter parse skipped it.
+    private static func bridgeAddress(in text: String, mac want: String, gateways: Set<String>) -> String? {
+        var found: String?
+        for line in text.split(whereSeparator: \.isNewline) {
+            guard let row = arpRow(String(line)) else { continue }
+            guard sharedBridge(row.iface), !gateways.contains(row.host), !hostSide(row.host) else { continue }
+            guard normalizeMAC(row.mac) == want else { continue }
+            found = row.host
+        }
+        return found
+    }
+
+    private static func sharedBridge(_ iface: String) -> Bool {
+        iface.hasPrefix("bridge") || iface.hasPrefix("vmnet") || iface.hasPrefix("vmenet")
+    }
+
+    private static func arpRow(_ line: String) -> (host: String, mac: String, iface: String)? {
+        guard let open = line.firstIndex(of: "("),
+              let close = line[open...].firstIndex(of: ")"),
+              open < close else { return nil }
+        let host = String(line[line.index(after: open)..<close])
+        let words = line.split(whereSeparator: \.isWhitespace).map(String.init)
+        guard let mac = words.first(where: { $0.split(separator: ":").count == 6 }) else { return nil }
+        let iface = words.firstIndex(of: "on").flatMap { index -> String? in
+            guard words.count > index + 1 else { return nil }
+            return String(words[index + 1].prefix { $0.isLetter || $0.isNumber })
+        } ?? ""
+        return (host, mac, iface)
     }
 
     private static func address(in text: String, mac want: String, gateways: Set<String>) -> String? {
@@ -174,7 +209,8 @@ enum Guest {
 
     /// `arp` may leave a comma or bracket on the last octet. Only the hex counts.
     private static func hexOctet(_ part: String) -> String {
-        String(part.prefix { $0.isHexDigit })
+        let body = part.drop { !$0.isHexDigit }
+        return String(body.prefix { $0.isHexDigit })
     }
 
     private static var assigned: [String: String] = [:]

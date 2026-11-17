@@ -179,14 +179,16 @@ fn arp_guests() -> Vec<(String, String)> {
 }
 
 /// Guest IP for this disk. The caller polls. Each machine has its own MAC, and ARP has the IP for that MAC.
+/// A row on `bridge100` is the guest. The interface name is not required to start with `bridge`.
 pub fn guest_address(disk: &Path, mac: Option<&str>) -> Option<String> {
     let wants = macs_for(disk, mac);
     if wants.is_empty() {
         return None;
     }
     let gateways = host_gateways(&net_text("VMM_IFCONFIG", ifconfig_text));
-    let arp = guest_rows(parse_arp(&net_text("VMM_ARP", arp_output)), &gateways);
-    live_match(&wants, &arp)
+    let text = net_text("VMM_ARP", arp_output);
+    let arp = guest_rows(parse_arp(&text), &gateways);
+    live_match(&wants, &arp).or_else(|| bridge_match(&wants, &text, &gateways))
 }
 
 fn macs_for(disk: &Path, mac: Option<&str>) -> Vec<String> {
@@ -436,27 +438,62 @@ fn arp_output() -> String {
 }
 
 fn parse_arp(text: &str) -> Vec<(String, String)> {
+    arp_rows(text)
+        .into_iter()
+        .filter(|(host, _, _)| is_guest_host(host))
+        .map(|(host, mac, _)| (host, mac))
+        .collect()
+}
+
+/// One ARP row: IP, normalized MAC, interface. `bridge100` is the vmnet shared network.
+fn arp_rows(text: &str) -> Vec<(String, String, String)> {
     let mut found = Vec::new();
     for line in text.lines() {
-        let Some(open) = line.find('(') else { continue };
-        let Some(close) = line[open..].find(')').map(|i| open + i) else {
+        let Some((host, mac, iface)) = arp_row(line) else {
             continue;
         };
-        if open >= close {
-            continue;
-        }
-        let host = &line[open + 1..close];
-        if !is_guest_host(host) {
-            continue;
-        }
-        let mac = line
-            .split_whitespace()
-            .find(|part| part.split(':').count() == 6)
-            .map(normalize_mac)
-            .unwrap_or_default();
-        found.push((host.to_string(), mac));
+        found.push((host, mac, iface));
     }
     found
+}
+
+fn arp_row(line: &str) -> Option<(String, String, String)> {
+    let open = line.find('(')?;
+    let close = open + line[open..].find(')')?;
+    if open >= close {
+        return None;
+    }
+    let host = line[open + 1..close].to_string();
+    let mac = line
+        .split_whitespace()
+        .find(|part| part.split(':').count() == 6)
+        .map(normalize_mac)
+        .unwrap_or_default();
+    let iface = line
+        .split_whitespace()
+        .skip_while(|part| *part != "on")
+        .nth(1)
+        .unwrap_or("")
+        .trim_end_matches(|c: char| !c.is_ascii_alphanumeric())
+        .to_string();
+    Some((host, mac, iface))
+}
+
+/// The MAC is on `bridge100` (or any `bridge*`). That row is the guest even when a stricter parse skipped it.
+fn bridge_match(wants: &[String], text: &str, gateways: &HashSet<String>) -> Option<String> {
+    let rows: Vec<(String, String)> = arp_rows(text)
+        .into_iter()
+        .filter(|(host, mac, iface)| {
+            shared_bridge(iface) && !mac.is_empty() && !gateways.contains(host) && !host_side(host)
+        })
+        .map(|(host, mac, _)| (host, mac))
+        .collect();
+    live_match(wants, &rows)
+}
+
+fn shared_bridge(iface: &str) -> bool {
+    let name = iface.trim_end_matches(|c: char| !c.is_ascii_alphanumeric());
+    name.starts_with("bridge") || name.starts_with("vmnet") || name.starts_with("vmenet")
 }
 
 fn normalize_mac(text: &str) -> String {
@@ -607,6 +644,17 @@ mod tests {
             ),
             Some("192.168.64.8".into())
         );
+        let bridge100 = "? (192.168.64.51) at 2:56:4d:4d:9:35 on bridge100 ifscope [bridge]\n";
+        assert_eq!(
+            address_for_mac("02:56:4d:4d:09:35", &parse_arp(bridge100)),
+            Some("192.168.64.51".into())
+        );
+        assert!(shared_bridge("bridge100"));
+        assert!(shared_bridge("bridge100,"));
+        let row = arp_row(bridge100.trim()).expect("bridge100 row");
+        assert_eq!(row.0, "192.168.64.51");
+        assert_eq!(row.1, "02:56:4d:4d:09:35");
+        assert_eq!(row.2, "bridge100");
     }
 
     #[test]

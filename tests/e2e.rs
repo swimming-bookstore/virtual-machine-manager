@@ -433,7 +433,7 @@ fn guest_ip_shows_51_not_a_stale_lease() {
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
         one_event(&out.stdout)
     };
-    let at_51 = "? (192.168.64.51) at 02:56:4d:4d:09:35 on bridge100\n";
+    let at_51 = "? (192.168.64.51) at 2:56:4d:4d:9:35 on bridge100 ifscope [bridge]\n";
     assert_eq!(ask(at_51)["detail"], "192.168.64.51");
     let other = "? (192.168.64.3) at aa:bb:cc:dd:ee:ff on bridge100\n? (192.168.64.51) at 02:56:4d:4d:00:02 on bridge100\n";
     let missing = ask(other);
