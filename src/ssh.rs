@@ -182,50 +182,89 @@ fn arp_guests() -> Vec<(String, String)> {
     parse_arp(&arp_output())
 }
 
-/// Guest IP for this disk: the address the host key can log into.
-/// A lease or ARP hit is only a candidate. `.1` and `.2` are this Mac, so SSH to them never reaches the guest.
-/// Nothing, if the guest is off or sshd is not up yet.
+/// Guest IP for this disk. The lease and ARP have it as soon as DHCP answers, before sshd is up.
+/// `.51` on the first shared network is that guest. `.1` and `.2` are this Mac, so they are never shown.
+/// An SSH walk from `.2` is only a miss, and it must not hide an address the bridge already has.
 pub fn guest_address(disk: &Path) -> Option<String> {
     let want = assigned_mac(disk).unwrap_or_else(|| normalize_mac(&mac_string(disk)));
-    if let Some(host) = reachable(disk, &want) {
+    if let Some(host) = known_address(&want) {
         return Some(host);
     }
-    prime_arp(&nat_prefixes(&ifconfig_text()));
-    reachable(disk, &want)
+    let prefixes = nat_prefixes(&ifconfig_text());
+    prime_arp(&prefixes);
+    if let Some(host) = known_address(&want) {
+        return Some(host);
+    }
+    listening(&prefixes)
 }
 
-/// Prefer a candidate SSH accepts. Otherwise try the next slice of the bridge, skipping the host side.
-fn reachable(disk: &Path, want: &str) -> Option<String> {
-    let guest = disk.parent()?;
-    let support = guest.parent()?.parent()?;
-    let private = support.join("ssh").join(PRIVATE);
-    if !private.is_file() {
-        return known_address(want);
+/// Port 22 on the bridge, when ARP stayed empty. The host side is open too, because this Mac runs sshd, so skip it.
+/// A guest at `.51` is asked before the walk from `.3`.
+fn listening(prefixes: &[[u8; 3]]) -> Option<String> {
+    let gateways = host_gateways(&ifconfig_text());
+    let open = hosts_with_ssh(prefixes, &gateways);
+    if open.len() == 1 {
+        open.into_iter().next()
+    } else {
+        None
     }
-    let text = ifconfig_text();
-    let prefixes = nat_prefixes(&text);
-    let gateways = host_gateways(&text);
-    if let Some(host) = known_address(want) {
-        if !gateways.contains(&host) && !host_side(&host) && login(&private, &host).unwrap_or(false) {
-            return Some(host);
+}
+
+fn hosts_with_ssh(prefixes: &[[u8; 3]], gateways: &HashSet<String>) -> Vec<String> {
+    let mut first = Vec::new();
+    let mut rest = Vec::new();
+    for prefix in prefixes {
+        for n in [51, 50, 52, 20, 100, 30, 40, 60, 70, 80, 90] {
+            first.push(format!("{}.{}.{}.{n}", prefix[0], prefix[1], prefix[2]));
+        }
+        for n in 3..=254 {
+            let host = format!("{}.{}.{}.{n}", prefix[0], prefix[1], prefix[2]);
+            if !first.contains(&host) {
+                rest.push(host);
+            }
         }
     }
-    for host in next_on_bridge(&prefixes, &gateways, &support.join("ssh"), want, &arp_guests()) {
-        if gateways.contains(&host) || host_side(&host) {
-            continue;
-        }
-        if tcp_open(&host) && login(&private, &host).unwrap_or(false) {
-            return Some(host);
-        }
+    let early = scan_ssh(first, gateways);
+    if !early.is_empty() {
+        return early;
     }
-    None
+    scan_ssh(rest, gateways)
+}
+
+fn scan_ssh(hosts: Vec<String>, gateways: &HashSet<String>) -> Vec<String> {
+    let jobs: Vec<String> = hosts
+        .into_iter()
+        .filter(|host| !gateways.contains(host) && !host_side(host))
+        .collect();
+    let jobs = Arc::new(Mutex::new(jobs.into_iter()));
+    let found = Arc::new(Mutex::new(Vec::new()));
+    let mut threads = Vec::new();
+    for _ in 0..32 {
+        let jobs = Arc::clone(&jobs);
+        let found = Arc::clone(&found);
+        threads.push(thread::spawn(move || loop {
+            let next = jobs.lock().ok().and_then(|mut queue| queue.next());
+            let Some(host) = next else {
+                break;
+            };
+            if tcp_open(&host) {
+                if let Ok(mut list) = found.lock() {
+                    list.push(host);
+                }
+            }
+        }));
+    }
+    for worker in threads {
+        let _ = worker.join();
+    }
+    found.lock().map(|list| list.clone()).unwrap_or_default()
 }
 
 fn tcp_open(host: &str) -> bool {
     let Ok(addr) = format!("{host}:{SSH_PORT}").parse::<SocketAddr>() else {
         return false;
     };
-    TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok()
+    TcpStream::connect_timeout(&addr, Duration::from_millis(80)).is_ok()
 }
 
 /// Lease and ARP first. Probing the subnet is only for a miss, so the row is not stuck on "Looking up…".
@@ -825,6 +864,16 @@ mod tests {
         );
         assert_eq!(address_for_mac(mac, &[]), None);
         assert_eq!(only_bridge_guest(text), Some("192.168.64.7".into()));
+        let guest = "\
+? (192.168.64.1) at aa:bb:cc:dd:ee:ff on bridge100
+? (192.168.64.2) at bb:bb:cc:dd:ee:ff on bridge100
+? (192.168.64.51) at 02:56:4d:4d:09:35 on bridge100
+";
+        assert_eq!(only_bridge_guest(guest), Some("192.168.64.51".into()));
+        assert_eq!(
+            address_for_mac("02:56:4d:4d:09:35", &parse_arp(guest)),
+            Some("192.168.64.51".into())
+        );
         assert_eq!(
             only_bridge_guest("? (10.0.0.2) at 02:56:4d:4d:09:35 on en0\n"),
             None
@@ -965,6 +1014,9 @@ bridge100: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
         assert!(host_gateways(second).contains("192.168.65.2"));
         assert!(!host_gateways(second).contains("192.168.65.3"));
         assert!(host_side("192.168.64.2"));
+        assert!(!host_side("192.168.64.51"));
+        assert!(is_guest_host("192.168.64.51"));
+        assert!(!is_guest_host("192.168.64.2"));
         assert!(!host_side("192.168.64.3"));
         assert!(!host_side("10.0.0.2"));
     }

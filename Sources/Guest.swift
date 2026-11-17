@@ -39,15 +39,103 @@ enum Guest {
     /// Lease file first. It is written when the guest gets an address, and it does not need an ARP probe.
     /// A MAC miss still shows the latest guest lease, then the only address on the vmnet bridge.
     /// The address on the bridge itself is this Mac: `.1`, or `.2` when `.1` was already taken.
-    /// On the first shared network that host address is `192.168.64.2`. SSH to it never reaches the guest.
+    /// On the first shared network that host address is `192.168.64.2`. The guest can already be `.51`.
     private static func lookup(mac want: String) -> String? {
         var gateways = hostGateways()
         if let host = matched(mac: want, gateways: gateways) { return host }
         if let host = onlyBridgeGuest(gateways: gateways) { return host }
         if let host = latestLease(gateways: gateways) { return host }
+        if let host = onlyListening(gateways: gateways) { return host }
         primeArp()
         gateways = hostGateways()
-        return matched(mac: want, gateways: gateways) ?? onlyBridgeGuest(gateways: gateways) ?? latestLease(gateways: gateways)
+        return matched(mac: want, gateways: gateways)
+            ?? onlyBridgeGuest(gateways: gateways)
+            ?? latestLease(gateways: gateways)
+            ?? onlyListening(gateways: gateways)
+    }
+
+    /// The guest already has an address when sshd answers. `.51` is that address. The host side answers too, so skip it.
+    private static func onlyListening(gateways: Set<String>) -> String? {
+        let open = listening(gateways: gateways)
+        return open.count == 1 ? open[0] : nil
+    }
+
+    /// Ask the middle of the subnet first. A guest at `.51` should not wait for `.3` through `.50`.
+    /// One open port is enough. Closed ports must not hold the row on "Looking up…".
+    private static func listening(gateways: Set<String>) -> [String] {
+        let prefixes = natPrefixes()
+        var first: [String] = []
+        var rest: [String] = []
+        for prefix in prefixes {
+            for n in [51, 50, 52, 20, 100, 30, 40, 60, 70, 80, 90] where (3...254).contains(n) {
+                first.append("\(prefix).\(n)")
+            }
+            for n in 3...254 {
+                let host = "\(prefix).\(n)"
+                if !first.contains(host) { rest.append(host) }
+            }
+        }
+        if let found = probe(first, gateways: gateways), !found.isEmpty { return found }
+        return probe(rest, gateways: gateways)
+    }
+
+    private static func probe(_ hosts: [String], gateways: Set<String>) -> [String] {
+        let found = OpenHosts()
+        let queue = OperationQueue()
+        queue.maxConcurrentOperationCount = 32
+        for host in hosts {
+            if gateways.contains(host) || hostSide(host) { continue }
+            queue.addOperation {
+                if found.count >= 1 { return }
+                if portOpen(host) { found.add(host) }
+            }
+        }
+        queue.waitUntilAllOperationsAreFinished()
+        return found.all
+    }
+
+    private final class OpenHosts: @unchecked Sendable {
+        private let lock = NSLock()
+        private var hosts: [String] = []
+        func add(_ host: String) {
+            lock.lock()
+            hosts.append(host)
+            lock.unlock()
+        }
+        var all: [String] {
+            lock.lock()
+            defer { lock.unlock() }
+            return hosts
+        }
+        var count: Int {
+            lock.lock()
+            defer { lock.unlock() }
+            return hosts.count
+        }
+    }
+
+    private static func portOpen(_ host: String) -> Bool {
+        let fd = socket(AF_INET, SOCK_STREAM, 0)
+        if fd < 0 { return false }
+        defer { close(fd) }
+        var addr = sockaddr_in()
+        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = in_port_t(22).bigEndian
+        let parsed: Int32 = host.withCString { cstr in
+            withUnsafeMutableBytes(of: &addr.sin_addr) { raw in
+                inet_pton(AF_INET, cstr, raw.baseAddress)
+            }
+        }
+        if parsed != 1 { return false }
+        var timeout = timeval(tv_sec: 0, tv_usec: 80_000)
+        _ = setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+        let started = withUnsafePointer(to: &addr) { ptr -> Int32 in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                Darwin.connect(fd, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        return started == 0
     }
 
     private static func matched(mac want: String, gateways: Set<String>) -> String? {
@@ -371,7 +459,7 @@ enum Guest {
         let group = DispatchGroup()
         let queue = DispatchQueue(label: "guest-arp", attributes: .concurrent)
         for prefix in prefixes {
-            for n in 2...254 {
+            for n in 3...254 {
                 group.enter()
                 queue.async {
                     poke("\(prefix).\(n)")
@@ -379,7 +467,7 @@ enum Guest {
                 }
             }
         }
-        _ = group.wait(timeout: .now() + 1.5)
+        _ = group.wait(timeout: .now() + 2.5)
     }
 
     private static func poke(_ host: String) {

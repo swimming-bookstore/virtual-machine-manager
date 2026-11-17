@@ -552,8 +552,8 @@ final class GuestSession: ObservableObject {
             }
         }
         DispatchQueue.global(qos: .utility).async {
-            // The worker logs in, so the row is the address ssh can use. A lease hit of .2 is this Mac.
-            let found = Worker.guestAddress(disk: path) ?? Guest.natAddress(disk: path)
+            // DHCP already gave the guest an address. Read that before the worker walks the subnet.
+            let found = Guest.natAddress(disk: path) ?? Worker.guestAddress(disk: path)
             DispatchQueue.main.async {
                 guard token == self.addressGeneration, self.diskURL == path, !self.stopped, !self.paused else { return }
                 if let found {
@@ -588,7 +588,7 @@ final class GuestSession: ObservableObject {
     private func armAddressWatch() {
         guard !stopped, !paused else { return }
         addressWatch?.invalidate()
-        let wait: TimeInterval = address == nil && addressMisses < 5 ? 2 : 10
+        let wait: TimeInterval = address == nil && addressMisses < 8 ? 1 : 10
         let timer = Timer(timeInterval: wait, repeats: false) { [weak self] _ in
             self?.refreshAddress()
         }
