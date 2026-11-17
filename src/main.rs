@@ -98,7 +98,11 @@ fn check_order(order: &mut [&'static str], id: &str, state: &str) -> Result<()> 
         "wait" if order[index] != "now" => bail!("{id} went back to waiting without running"),
         "wait" => {
             if let Some(later) = later {
-                bail!("cannot reset {id} while {} is {}", STEPS[later], order[later]);
+                bail!(
+                    "cannot reset {id} while {} is {}",
+                    STEPS[later],
+                    order[later]
+                );
             }
             order[index] = "wait";
             Ok(())
@@ -174,7 +178,9 @@ fn support_dir() -> PathBuf {
             (cfg!(target_os = "macos"))
                 .then(|| env::var_os("HOME"))
                 .flatten()
-                .map(|home| PathBuf::from(home).join("Library/Application Support/virtual-machine-manager"))
+                .map(|home| {
+                    PathBuf::from(home).join("Library/Application Support/virtual-machine-manager")
+                })
         })
         .or_else(|| {
             env::var_os("XDG_DATA_HOME")
@@ -241,7 +247,13 @@ fn total_size(resp: &ureq::Response, status: u16, already: u64) -> u64 {
         .unwrap_or_else(|| {
             resp.header("content-length")
                 .and_then(|s| s.parse().ok())
-                .map(|len: u64| if status == 206 { already.saturating_add(len) } else { len })
+                .map(|len: u64| {
+                    if status == 206 {
+                        already.saturating_add(len)
+                    } else {
+                        len
+                    }
+                })
                 .unwrap_or(0)
         })
 }
@@ -278,11 +290,14 @@ fn download(agent: &ureq::Agent, url: &str, partial: &Path) -> Result<u64> {
     let mut buf = vec![0u8; 256 * 1024];
     progress.tick(received, total, true);
     loop {
-        let n = reader.read(&mut buf).map_err(|err| anyhow!("download read: {err}"))?;
+        let n = reader
+            .read(&mut buf)
+            .map_err(|err| anyhow!("download read: {err}"))?;
         if n == 0 {
             break;
         }
-        file.write_all(&buf[..n]).map_err(|err| anyhow!("download write: {err}"))?;
+        file.write_all(&buf[..n])
+            .map_err(|err| anyhow!("download write: {err}"))?;
         received += n as u64;
         progress.tick(received, total, false);
     }
@@ -317,8 +332,12 @@ fn read_cached(path: &Path) -> Result<Vec<u8>> {
 fn cached_iso(cache: &Path, arch: &str) -> Result<PathBuf> {
     let suffix = format!("-{arch}-netinst.iso");
     let mut found = Vec::new();
-    for entry in fs::read_dir(cache).map_err(|err| anyhow!("cannot read {}: {err}", cache.display()))? {
-        let path = entry.map_err(|err| anyhow!("cannot read {}: {err}", cache.display()))?.path();
+    for entry in
+        fs::read_dir(cache).map_err(|err| anyhow!("cannot read {}: {err}", cache.display()))?
+    {
+        let path = entry
+            .map_err(|err| anyhow!("cannot read {}: {err}", cache.display()))?
+            .path();
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
@@ -334,7 +353,9 @@ fn cached_iso(cache: &Path, arch: &str) -> Result<PathBuf> {
 }
 
 fn write_manifest(url: &str, published: &verify::Published, dest: &Path) -> Result<()> {
-    let cache = dest.parent().ok_or_else(|| anyhow!("image path has no directory"))?;
+    let cache = dest
+        .parent()
+        .ok_or_else(|| anyhow!("image path has no directory"))?;
     let manifest = serde_json::json!({
         "url": url,
         "sha512": published.sha512,
@@ -352,9 +373,14 @@ fn write_manifest(url: &str, published: &verify::Published, dest: &Path) -> Resu
 
 /// Reset keeps the download cache and does every later step again, the way Packer rebuilds an image.
 fn clear_for_rebuild(dir: &Path) -> Result<()> {
-    for path in [dir.join(preseed::DIR), dir.join("ssh"), dir.join(preseed::SNAPSHOT)] {
+    for path in [
+        dir.join(preseed::DIR),
+        dir.join("ssh"),
+        dir.join(preseed::SNAPSHOT),
+    ] {
         if path.exists() {
-            fs::remove_dir_all(&path).map_err(|err| anyhow!("cannot remove {}: {err}", path.display()))?;
+            fs::remove_dir_all(&path)
+                .map_err(|err| anyhow!("cannot remove {}: {err}", path.display()))?;
         }
     }
     Ok(())
@@ -381,7 +407,8 @@ fn cache_step(
 fn run(dir: &Path, order: &mut Order) -> Result<()> {
     let arch = guest_arch()?;
     let cache = dir.join("cache");
-    fs::create_dir_all(&cache).map_err(|err| anyhow!("cannot create {}: {err}", cache.display()))?;
+    fs::create_dir_all(&cache)
+        .map_err(|err| anyhow!("cannot create {}: {err}", cache.display()))?;
     let _lock = hold_lock(&cache)?;
     // Every run starts at the first step. A file already in the cache is not fetched again.
     let agent = verify::agent();
@@ -397,7 +424,10 @@ fn run(dir: &Path, order: &mut Order) -> Result<()> {
     })?;
     let sums = cache_step(order, dir, &cache, "sums", || {
         if !wrote(dir, &cache, "sums") {
-            fs::write(cache.join("SHA512SUMS"), verify::fetch(&agent, &format!("{base}/SHA512SUMS"))?)?;
+            fs::write(
+                cache.join("SHA512SUMS"),
+                verify::fetch(&agent, &format!("{base}/SHA512SUMS"))?,
+            )?;
         }
         Ok(())
     })?;
@@ -436,10 +466,15 @@ fn run(dir: &Path, order: &mut Order) -> Result<()> {
     progress.tick(size, size, true);
     if got != published.sha512 {
         let _ = fs::remove_file(&dest);
-        bail!("the download did not match SHA512SUMS for {}", published.name);
+        bail!(
+            "the download did not match SHA512SUMS for {}",
+            published.name
+        );
     }
     if !wrote(dir, &cache, "verify") {
-        keep(dir, &cache, "verify", || write_manifest(&url, &published, &dest))?;
+        keep(dir, &cache, "verify", || {
+            write_manifest(&url, &published, &dest)
+        })?;
     }
     order.step("verify", "done")?;
 
@@ -517,6 +552,9 @@ enum Command {
         /// Guest disk whose MAC should be looked up.
         #[arg(long, value_name = "PATH")]
         disk: PathBuf,
+        /// MAC the attachment wrote for this disk. The lookup matches this, not a guessed octet.
+        #[arg(long, value_name = "MAC")]
+        mac: Option<String>,
     },
     /// Record a pause save already written beside the guest disk.
     Pause {
@@ -547,10 +585,13 @@ fn main() {
                 fail(err, order.current());
             }
         }
-        Command::Snapshot { dir } => finish("snapshot", snapshot::save(&dir.unwrap_or_else(support_dir))),
-        Command::Clone { dir, name } => {
-            finish("clone", snapshot::clone_machine(&dir.unwrap_or_else(support_dir), name.as_deref()))
+        Command::Snapshot { dir } => {
+            finish("snapshot", snapshot::save(&dir.unwrap_or_else(support_dir)))
         }
+        Command::Clone { dir, name } => finish(
+            "clone",
+            snapshot::clone_machine(&dir.unwrap_or_else(support_dir), name.as_deref()),
+        ),
         Command::Ssh { disk } => {
             ssh::own_group();
             match ssh::probe_disk(&disk) {
@@ -562,10 +603,10 @@ fn main() {
                 Err(err) => die(err),
             }
         }
-        Command::Address { disk } => {
+        Command::Address { disk, mac } => {
             let mut event = ev("address", None, Some("done"));
             event.disk = Some(disk.display().to_string());
-            event.detail = ssh::guest_address(&disk);
+            event.detail = ssh::guest_address(&disk, mac.as_deref());
             emit(event);
         }
         Command::Pause { disk } => match pause::mark(&disk) {
@@ -619,14 +660,23 @@ mod tests {
     }
 
     fn full() -> Vec<(&'static str, &'static str)> {
-        STEPS.into_iter().flat_map(|id| [(id, "now"), (id, "done")]).collect()
+        STEPS
+            .into_iter()
+            .flat_map(|id| [(id, "now"), (id, "done")])
+            .collect()
     }
 
     #[test]
     fn checks_run_only_after_the_previous_step() {
         run_seq(&full()).unwrap();
         assert!(run_seq(&[("key", "wait")]).is_err());
-        assert!(run_seq(&[("key", "now"), ("key", "done"), ("sums", "now"), ("sign", "now")]).is_err());
+        assert!(run_seq(&[
+            ("key", "now"),
+            ("key", "done"),
+            ("sums", "now"),
+            ("sign", "now")
+        ])
+        .is_err());
         assert!(run_seq(&[("key", "done")]).is_err());
         assert!(run_seq(&[("key", "now"), ("key", "done"), ("sums", "done")]).is_err());
     }

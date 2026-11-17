@@ -179,14 +179,19 @@ fn arp_guests() -> Vec<(String, String)> {
 }
 
 /// Guest IP for this disk. The lease and ARP have it as soon as DHCP answers, before sshd is up.
-/// `.51` on the first shared network is that guest. `.1` and `.2` are this Mac, so they are never shown.
-/// An SSH walk from `.2` is only a miss, and it must not hide an address the bridge already has.
-pub fn guest_address(disk: &Path) -> Option<String> {
-    let want = assigned_mac(disk).unwrap_or_else(|| normalize_mac(&mac_string(disk)));
+/// The caller polls, so each pass matches this disk's MAC. `.1` and `.2` are this Mac.
+/// A saved `.3` is not shown when the same MAC is already at `.51`. Do not scan the subnet.
+pub fn guest_address(disk: &Path, mac: Option<&str>) -> Option<String> {
+    let want = mac
+        .map(normalize_mac)
+        .filter(|text| !text.is_empty())
+        .or_else(|| assigned_mac(disk))
+        .unwrap_or_else(|| normalize_mac(&mac_string(disk)));
     known_address(&want)
 }
 
-/// Lease and ARP first. An address configured on the vmnet bridge is this Mac. So is `.2` on that subnet, including 192.168.64.2.
+/// Lease and ARP for this MAC. The caller polls, so a miss is not another guest's lease.
+/// `.1` and `.2` are this Mac. Do not scan the subnet.
 fn known_address(want: &str) -> Option<String> {
     let gateways = host_gateways(&ifconfig_text());
     let leases = parse_leases(&lease_text())
@@ -200,12 +205,7 @@ fn known_address(want: &str) -> Option<String> {
         .into_iter()
         .filter(|(host, _)| !gateways.contains(host) && !host_side(host))
         .collect::<Vec<_>>();
-    if let Some(host) = address_for_mac(want, &arp) {
-        return Some(host);
-    }
-    only_bridge_guest(&arp_output())
-        .filter(|host| !gateways.contains(host) && !host_side(host))
-        .or_else(|| leases.last().map(|(host, _)| host.clone()))
+    address_for_mac(want, &arp)
 }
 
 /// Addresses on vmnet bridges, plus the other host address on that subnet.

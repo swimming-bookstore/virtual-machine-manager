@@ -35,15 +35,10 @@ enum Guest {
         return lookup(mac: want)
     }
 
-    /// Lease file first. It is written when the guest gets an address, and it does not need an ARP probe.
-    /// A MAC miss still shows the latest guest lease, then the only address on the vmnet bridge.
-    /// The address on the bridge itself is this Mac: `.1`, or `.2` when `.1` was already taken.
-    /// On the first shared network that host address is `192.168.64.2`. The guest can already be `.51`.
+    /// Lease and ARP for this MAC only. The caller polls, so a miss is not another guest's lease.
+    /// `.1` and `.2` are this Mac. Do not scan the subnet.
     private static func lookup(mac want: String) -> String? {
-        let gateways = hostGateways()
-        if let host = matched(mac: want, gateways: gateways) { return host }
-        if let host = onlyBridgeGuest(gateways: gateways) { return host }
-        return latestLease(gateways: gateways)
+        matched(mac: want, gateways: hostGateways())
     }
 
     private static func matched(mac want: String, gateways: Set<String>) -> String? {

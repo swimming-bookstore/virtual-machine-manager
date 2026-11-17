@@ -525,7 +525,7 @@ final class GuestSession: ObservableObject {
         }
     }
 
-    /// Ask the guest for the address on this NIC. Shown only while the guest is running.
+    /// Ask again while the guest is running. Each pass matches this disk's MAC in the lease and ARP.
     /// UTM polls every 10 seconds and clears the row when the machine is not started.
     func refreshAddress() {
         addressWatch?.invalidate()
@@ -539,29 +539,24 @@ final class GuestSession: ObservableObject {
             return
         }
         let path = disk
-        if let saved = try? String(contentsOf: path.deletingLastPathComponent().appendingPathComponent("ip"), encoding: .utf8) {
-            let host = saved.trimmingCharacters(in: .whitespacesAndNewlines)
-            if Worker.isGuestIP(host) {
-                if address != host {
-                    address = host
-                    postAddress(host)
-                }
-            } else if !host.isEmpty {
-                address = nil
-                postAddress(nil)
-            }
-        }
+        let mac = Guest.macString(for: path)
         DispatchQueue.global(qos: .utility).async {
-            // DHCP already gave the guest an address. Read that before the worker walks the subnet.
-            let found = Guest.natAddress(disk: path) ?? Worker.guestAddress(disk: path)
+            let found = Guest.natAddress(disk: path) ?? Worker.guestAddress(disk: path, mac: mac)
             DispatchQueue.main.async {
                 guard token == self.addressGeneration, self.diskURL == path, !self.stopped, !self.paused else { return }
                 if let found {
                     self.addressMisses = 0
-                    self.address = found
-                    self.postAddress(found)
+                    if self.address != found {
+                        self.address = found
+                        self.postAddress(found)
+                    }
                 } else {
                     self.addressMisses += 1
+                    // A saved `.3` is not this MAC. Drop it so the next pass can show `.51`.
+                    if self.address != nil {
+                        self.address = nil
+                        self.postAddress(nil)
+                    }
                 }
                 self.armAddressWatch()
             }
@@ -584,11 +579,11 @@ final class GuestSession: ObservableObject {
         )
     }
 
-    /// UTM waits 10 seconds between guest-agent queries. Look sooner until the first address arrives.
+    /// UTM waits 10 seconds between guest-agent queries. Keep asking this disk's MAC until Stop.
     private func armAddressWatch() {
         guard !stopped, !paused else { return }
         addressWatch?.invalidate()
-        let wait: TimeInterval = address == nil && addressMisses < 8 ? 1 : 10
+        let wait: TimeInterval = address == nil ? 2 : 10
         let timer = Timer(timeInterval: wait, repeats: false) { [weak self] _ in
             self?.refreshAddress()
         }

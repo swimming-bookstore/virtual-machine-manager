@@ -399,8 +399,11 @@ enum Worker {
     /// One SSH attempt in the worker. A closed port is not a finished install.
     /// `cancel` is set when the app closes so a scan cannot keep the next open on "Checking SSH".
     /// The address the guest reports for this disk's NIC. Empty when the guest is still booting.
-    static func guestAddress(disk: URL) -> String? {
-        let (code, text) = run(["address", "--disk", disk.path])
+    /// `mac` is this disk's attachment address. The worker matches that, not a guessed octet.
+    static func guestAddress(disk: URL, mac: String) -> String? {
+        var args = ["address", "--disk", disk.path]
+        if !mac.isEmpty { args += ["--mac", mac] }
+        let (code, text) = run(args)
         guard code == 0, let host = message(text), isGuestIP(host) else { return nil }
         return host
     }
