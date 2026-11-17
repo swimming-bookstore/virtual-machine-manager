@@ -26,29 +26,41 @@ enum Guest {
         return String(format: "02:56:4d:4d:%02x:%02x", UInt8(sum >> 8), UInt8(truncatingIfNeeded: sum))
     }
 
+    /// The MAC the attachment wrote, or the stable address for this disk when that file is missing.
+    static func lookupMAC(disk: URL) -> String {
+        normalizeMAC(assignedMAC(disk: disk) ?? macString(for: disk))
+    }
+
     /// Address on this disk's NIC. Nil when the guest is off or still booting.
     /// UTM asks the guest agent and matches hardwareAddress. This matches the MAC the attachment wrote.
     /// ARP stays empty until the host asks, and the subnet is not always 192.168.64.
     static func natAddress(disk: URL) -> String? {
-        let want = normalizeMAC(assignedMAC(disk: disk) ?? macString(for: disk))
+        let want = lookupMAC(disk: disk)
         guard !want.isEmpty else { return nil }
         return lookup(mac: want)
     }
 
-    /// Lease and ARP for this MAC only. The caller polls, so a miss is not another guest's lease.
-    /// `.1` and `.2` are this Mac. Do not scan the subnet.
+    /// Lease and ARP for this MAC. The caller polls.
+    /// ARP stays empty until this Mac asks, so a miss pings `.51` before the newest lease.
+    /// `.1` and `.2` are this Mac. One address is not a subnet scan.
     private static func lookup(mac want: String) -> String? {
-        matched(mac: want, gateways: hostGateways())
+        let gateways = hostGateways()
+        if let host = arpMatch(mac: want, gateways: gateways) { return host }
+        for host in askList(gateways: gateways) {
+            nudge(host)
+            if let found = arpMatch(mac: want, gateways: gateways) { return found }
+        }
+        // Lease only after `.51` did not answer. The last grant for this MAC wins.
+        return leaseAddress(mac: want, gateways: gateways)
     }
 
-    private static func matched(mac want: String, gateways: Set<String>) -> String? {
-        guard !want.isEmpty else { return nil }
-        if let host = leaseAddress(mac: want, gateways: gateways) { return host }
-        if let text = arpText(), let host = address(in: text, mac: want, gateways: gateways) { return host }
-        return nil
+    private static func arpMatch(mac want: String, gateways: Set<String>) -> String? {
+        guard !want.isEmpty, let text = arpText() else { return nil }
+        return address(in: text, mac: want, gateways: gateways)
     }
 
     private static func address(in text: String, mac want: String, gateways: Set<String>) -> String? {
+        var found: String?
         for line in text.split(separator: "\n") {
             guard let open = line.firstIndex(of: "("),
                   let close = line[open...].firstIndex(of: ")"),
@@ -57,9 +69,9 @@ enum Guest {
             guard isGuestHost(host, gateways: gateways) else { continue }
             guard let mac = line.split(whereSeparator: \.isWhitespace).first(where: { $0.split(separator: ":").count == 6 }),
                   normalizeMAC(String(mac)) == want else { continue }
-            return host
+            found = host
         }
-        return nil
+        return found
     }
 
     private static func arpText() -> String? {
@@ -69,6 +81,39 @@ enum Guest {
             }
         }
         return nil
+    }
+
+    /// `.51` first. On the first shared network that is the guest, and `.2` is this Mac.
+    /// The newest lease is next, so a stale `.3` is not asked before `.51`.
+    private static func askList(gateways: Set<String>) -> [String] {
+        var asked: [String] = []
+        for prefix in natPrefixes() {
+            let host = "\(prefix).51"
+            if isGuestHost(host, gateways: gateways), !asked.contains(host) {
+                asked.append(host)
+            }
+        }
+        if let host = latestLease(gateways: gateways), !asked.contains(host) {
+            asked.append(host)
+        }
+        if let host = onlyBridgeGuest(gateways: gateways), !asked.contains(host) {
+            asked.append(host)
+        }
+        return asked
+    }
+
+    /// One ARP request. Not a subnet scan, so bridge100 does not fill with incomplete rows.
+    private static func nudge(_ host: String) {
+        for path in ["/sbin/ping", "/usr/sbin/ping"] {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: path)
+            process.arguments = ["-c", "1", "-W", "1000", host]
+            process.standardOutput = FileHandle.nullDevice
+            process.standardError = FileHandle.nullDevice
+            guard (try? process.run()) != nil else { continue }
+            process.waitUntilExit()
+            return
+        }
     }
 
     /// The only guest address on a vmnet bridge. A LAN neighbor on en0 is not this.
@@ -372,10 +417,14 @@ enum Guest {
         let raw = text.trimmingCharacters(in: .whitespacesAndNewlines)
         let body = raw.split(separator: ",").last.map { $0.trimmingCharacters(in: .whitespaces) } ?? raw
         let token = body.split(whereSeparator: \.isWhitespace).first.map(String.init) ?? body
-        let parts = token.split { $0 == ":" || $0 == "-" }
-        guard parts.count == 6 else { return "" }
+        let parts = token.split { $0 == ":" || $0 == "-" }.map(String.init)
+        var octets = parts
+        if octets.count == 7, let kind = UInt8(octets[0], radix: 16), kind <= 1 {
+            octets.removeFirst()
+        }
+        guard octets.count == 6 else { return "" }
         var bytes: [String] = []
-        for part in parts {
+        for part in octets {
             guard let value = UInt8(part, radix: 16) else { return "" }
             bytes.append(String(format: "%02x", value))
         }

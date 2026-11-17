@@ -178,34 +178,125 @@ fn arp_guests() -> Vec<(String, String)> {
     parse_arp(&arp_output())
 }
 
-/// Guest IP for this disk. The lease and ARP have it as soon as DHCP answers, before sshd is up.
-/// The caller polls, so each pass matches this disk's MAC. `.1` and `.2` are this Mac.
-/// A saved `.3` is not shown when the same MAC is already at `.51`. Do not scan the subnet.
+/// Guest IP for this disk. The caller polls, so each pass matches this disk's MAC.
+/// `.1` and `.2` are this Mac. A saved `.3` is not shown when this MAC is already at `.51`.
+/// ARP stays empty until this Mac asks, so a miss pings `.51` and the newest lease, then asks the guest.
+/// That is one address, not a subnet scan.
 pub fn guest_address(disk: &Path, mac: Option<&str>) -> Option<String> {
-    let want = mac
-        .map(normalize_mac)
-        .filter(|text| !text.is_empty())
-        .or_else(|| assigned_mac(disk))
-        .unwrap_or_else(|| normalize_mac(&mac_string(disk)));
-    known_address(&want)
-}
-
-/// Lease and ARP for this MAC. The caller polls, so a miss is not another guest's lease.
-/// `.1` and `.2` are this Mac. Do not scan the subnet.
-fn known_address(want: &str) -> Option<String> {
+    let wants = macs_for(disk, mac);
+    if wants.is_empty() {
+        return None;
+    }
     let gateways = host_gateways(&ifconfig_text());
-    let leases = parse_leases(&lease_text())
-        .into_iter()
-        .filter(|(host, _)| !gateways.contains(host) && !host_side(host))
-        .collect::<Vec<_>>();
-    if let Some(host) = address_for_mac(want, &leases) {
+    let leases = guest_rows(parse_leases(&lease_text()), &gateways);
+    let asks = ask_hosts(&nat_prefixes(&ifconfig_text()), &leases);
+    if let Some(host) = live_match(&wants, &guest_rows(arp_guests(), &gateways)) {
         return Some(host);
     }
-    let arp = arp_guests()
-        .into_iter()
+    for host in &asks {
+        nudge(host);
+        let arp = guest_rows(arp_guests(), &gateways);
+        if let Some(found) = live_match(&wants, &arp) {
+            return Some(found);
+        }
+    }
+    // The guest's own `ip addr` is the address for this MAC, even when the lease still says `.3`.
+    for host in asks.iter().chain(saved_ip(disk).iter()) {
+        for want in &wants {
+            if let Some(ip) = guest_reported(disk, want, host) {
+                return Some(ip);
+            }
+        }
+    }
+    // Lease only after `.51` did not answer. The last grant for this MAC wins.
+    lease_match(&wants, &leases)
+}
+
+fn macs_for(disk: &Path, mac: Option<&str>) -> Vec<String> {
+    let mut wants = Vec::new();
+    if let Some(mac) = mac.map(normalize_mac).filter(|text| !text.is_empty()) {
+        wants.push(mac);
+    }
+    if let Some(mac) = assigned_mac(disk) {
+        if !wants.contains(&mac) {
+            wants.push(mac);
+        }
+    }
+    let computed = normalize_mac(&mac_string(disk));
+    if !computed.is_empty() && !wants.contains(&computed) {
+        wants.push(computed);
+    }
+    wants
+}
+
+fn guest_rows(rows: Vec<(String, String)>, gateways: &HashSet<String>) -> Vec<(String, String)> {
+    rows.into_iter()
         .filter(|(host, _)| !gateways.contains(host) && !host_side(host))
-        .collect::<Vec<_>>();
-    address_for_mac(want, &arp)
+        .collect()
+}
+
+/// `.51` first. On the first shared network that is the guest, and `.2` is this Mac.
+/// The newest lease is next, so a stale `.3` is not asked before `.51`.
+fn ask_hosts(prefixes: &[[u8; 3]], leases: &[(String, String)]) -> Vec<String> {
+    let mut hosts = Vec::new();
+    for prefix in prefixes {
+        let host = format!("{}.{}.{}.51", prefix[0], prefix[1], prefix[2]);
+        if is_guest_host(&host) && !hosts.contains(&host) {
+            hosts.push(host);
+        }
+    }
+    if let Some((host, _)) = leases.last() {
+        if is_guest_host(host) && !hosts.contains(host) {
+            hosts.push(host.clone());
+        }
+    }
+    hosts
+}
+
+/// ARP is the live address. A lease for the same MAC is not used while ARP already has it.
+fn live_match(wants: &[String], arp: &[(String, String)]) -> Option<String> {
+    for want in wants {
+        if let Some(host) = address_for_mac(want, arp) {
+            return Some(host);
+        }
+    }
+    None
+}
+
+fn lease_match(wants: &[String], leases: &[(String, String)]) -> Option<String> {
+    for want in wants {
+        if let Some(host) = address_for_mac(want, leases) {
+            return Some(host);
+        }
+    }
+    None
+}
+
+/// One ARP request. Not a subnet scan, so bridge100 does not fill with incomplete rows.
+fn nudge(host: &str) {
+    let wait = if cfg!(target_os = "macos") { "1000" } else { "1" };
+    for bin in ["/sbin/ping", "/usr/sbin/ping", "ping"] {
+        if Command::new(bin)
+            .args(["-c", "1", "-W", wait, host])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok()
+        {
+            return;
+        }
+    }
+}
+
+fn saved_ip(disk: &Path) -> Option<String> {
+    let text = fs::read_to_string(disk.parent()?.join("ip")).ok()?;
+    let host = text.trim();
+    if is_guest_host(host) {
+        Some(host.to_string())
+    } else {
+        None
+    }
 }
 
 /// Addresses on vmnet bridges, plus the other host address on that subnet.
@@ -267,51 +358,7 @@ fn host_pair(host: &str) -> Vec<String> {
     vec![format!("{a}.{b}.{c}.1"), format!("{a}.{b}.{c}.2")]
 }
 
-/// The only guest address on a vmnet bridge. A neighbor on en0 is not this machine.
-fn only_bridge_guest(text: &str) -> Option<String> {
-    let mut found = Vec::new();
-    for line in text.lines() {
-        let Some(open) = line.find('(') else { continue };
-        let Some(close) = line[open..].find(')').map(|i| open + i) else {
-            continue;
-        };
-        if open >= close {
-            continue;
-        }
-        let host = &line[open + 1..close];
-        if !is_guest_host(host) {
-            continue;
-        }
-        let words: Vec<&str> = line.split_whitespace().collect();
-        let Some(on) = words.iter().position(|word| *word == "on") else {
-            continue;
-        };
-        let Some(iface) = words.get(on + 1) else {
-            continue;
-        };
-        if !(iface.starts_with("bridge")
-            || iface.starts_with("vmnet")
-            || iface.starts_with("vmenet"))
-        {
-            continue;
-        }
-        if !found.contains(&host.to_string()) {
-            found.push(host.to_string());
-        }
-    }
-    if found.len() == 1 {
-        found.pop()
-    } else {
-        None
-    }
-}
-
 /// Prefer the address the guest reports for this MAC. ARP is the same address once the host has asked.
-#[allow(dead_code)]
-fn reported_or(disk: &Path, want: &str, host: &str) -> String {
-    guest_reported(disk, want, host).unwrap_or_else(|| host.to_string())
-}
-
 fn guest_reported(disk: &Path, want: &str, host: &str) -> Option<String> {
     let guest = disk.parent()?;
     let support = guest.parent()?.parent()?;
@@ -604,9 +651,32 @@ fn address_for_mac(want: &str, arp: &[(String, String)]) -> Option<String> {
     if want.is_empty() {
         return None;
     }
-    arp.iter()
-        .find(|(_, seen)| seen == want)
-        .map(|(host, _)| host.clone())
+    let matched: Vec<&(String, String)> = arp.iter().filter(|(_, seen)| seen == want).collect();
+    // The current grant is last. A later en0 row is not this guest when a vmnet address is present.
+    matched
+        .iter()
+        .rev()
+        .find(|(host, _)| nat_guest(host))
+        .or_else(|| matched.last())
+        .map(|(host, _)| (*host).clone())
+}
+
+/// A vmnet shared-network address. `192.168.64.51` is one. `10.0.0.2` on en0 is not.
+fn nat_guest(host: &str) -> bool {
+    let mut parts = host.split('.');
+    let Some(a) = parts.next() else {
+        return false;
+    };
+    let Some(b) = parts.next() else {
+        return false;
+    };
+    let Some(c) = parts.next().and_then(|part| part.parse::<u8>().ok()) else {
+        return false;
+    };
+    let Some(d) = parts.next().and_then(|part| part.parse::<u8>().ok()) else {
+        return false;
+    };
+    parts.next().is_none() && a == "192" && b == "168" && c >= 64 && d != 1 && d != 2
 }
 
 fn arp_output() -> String {
@@ -652,7 +722,17 @@ fn normalize_mac(text: &str) -> String {
     let raw = text.trim();
     let body = raw.rsplit(',').next().unwrap_or(raw).trim();
     let token = body.split_whitespace().next().unwrap_or(body);
-    let parts: Vec<&str> = token.split(|c| c == ':' || c == '-').collect();
+    let mut parts: Vec<&str> = token.split(|c| c == ':' || c == '-').collect();
+    // bootpd sometimes writes the hardware type in front of the six MAC bytes.
+    if parts.len() == 7 {
+        let Ok(kind) = u8::from_str_radix(parts[0], 16) else {
+            return String::new();
+        };
+        if kind > 1 {
+            return String::new();
+        }
+        parts.remove(0);
+    }
     if parts.len() != 6 {
         return String::new();
     }
@@ -754,21 +834,35 @@ mod tests {
             Some("192.168.64.7".into())
         );
         assert_eq!(address_for_mac(mac, &[]), None);
-        assert_eq!(only_bridge_guest(text), Some("192.168.64.7".into()));
         let guest = "\
 ? (192.168.64.1) at aa:bb:cc:dd:ee:ff on bridge100
 ? (192.168.64.2) at bb:bb:cc:dd:ee:ff on bridge100
 ? (192.168.64.51) at 02:56:4d:4d:09:35 on bridge100
 ";
-        assert_eq!(only_bridge_guest(guest), Some("192.168.64.51".into()));
         assert_eq!(
             address_for_mac("02:56:4d:4d:09:35", &parse_arp(guest)),
             Some("192.168.64.51".into())
         );
+        let moved = vec![
+            ("192.168.64.3".into(), "02:56:4d:4d:09:35".into()),
+            ("192.168.64.51".into(), "02:56:4d:4d:09:35".into()),
+        ];
         assert_eq!(
-            only_bridge_guest("? (10.0.0.2) at 02:56:4d:4d:09:35 on en0\n"),
-            None
+            address_for_mac("02:56:4d:4d:09:35", &moved),
+            Some("192.168.64.51".into())
         );
+        assert_eq!(
+            ask_hosts(&[[192, 168, 64]], &moved),
+            vec![String::from("192.168.64.51")]
+        );
+        assert_eq!(
+            ask_hosts(
+                &[[192, 168, 64]],
+                &[("192.168.64.3".into(), "aa:bb:cc:dd:ee:ff".into())]
+            ),
+            vec![String::from("192.168.64.51"), String::from("192.168.64.3")]
+        );
+        assert_eq!(normalize_mac("1,01:02:56:4d:4d:09:35"), "02:56:4d:4d:09:35");
     }
 
     #[test]

@@ -539,7 +539,7 @@ final class GuestSession: ObservableObject {
             return
         }
         let path = disk
-        let mac = Guest.macString(for: path)
+        let mac = Guest.lookupMAC(disk: path)
         DispatchQueue.global(qos: .utility).async {
             let found = Guest.natAddress(disk: path) ?? Worker.guestAddress(disk: path, mac: mac)
             DispatchQueue.main.async {
