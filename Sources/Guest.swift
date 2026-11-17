@@ -40,12 +40,12 @@ enum Guest {
     /// A MAC miss still shows the latest guest lease, then the only address on the vmnet bridge.
     /// The address on the bridge itself (192.168.64.1, or 192.168.65.2 when .1 is taken) is this Mac.
     private static func lookup(mac want: String) -> String? {
-        let gateways = hostGateways()
+        var gateways = hostGateways()
         if let host = matched(mac: want, gateways: gateways) { return host }
         if let host = onlyBridgeGuest(gateways: gateways) { return host }
         if let host = latestLease(gateways: gateways) { return host }
         primeArp()
-        let gateways = hostGateways()
+        gateways = hostGateways()
         return matched(mac: want, gateways: gateways) ?? onlyBridgeGuest(gateways: gateways) ?? latestLease(gateways: gateways)
     }
 
