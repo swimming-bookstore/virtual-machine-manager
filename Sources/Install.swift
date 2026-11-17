@@ -120,16 +120,19 @@ struct Install: View {
     }
 
     private var filled: some View {
-        ZStack {
-            guestScreen
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .background(.black)
-                .allowsHitTesting(!guest.stopped)
-            if let error = guest.error {
-                Text(error).font(.callout).foregroundStyle(.red).padding()
+        VStack(spacing: 0) {
+            ZStack {
+                guestScreen
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .background(.black)
+                    .clipped()
+                    .allowsHitTesting(!guest.stopped)
+                if let error = guest.error {
+                    Text(error).font(.callout).foregroundStyle(.red).padding()
+                }
             }
+            guestIPRow
         }
-        .safeAreaInset(edge: .bottom, spacing: 0) { guestIPRow }
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
                 Button("Start") { guest.bootDisk(disk, pointer: true) }
@@ -156,7 +159,7 @@ struct Install: View {
                 .font(.body.monospaced())
                 .textSelection(.enabled)
             Spacer(minLength: 12)
-            Text(macText)
+            Text(macText.isEmpty ? "" : "MAC \(macText)")
                 .font(.caption.monospaced())
                 .foregroundStyle(.secondary)
                 .textSelection(.enabled)
@@ -1446,6 +1449,8 @@ final class GuestPane: NSView {
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
+        // The Metal guest draws outside its frame and used to cover the IP row under it.
+        clipsToBounds = true
         layer?.backgroundColor = NSColor.black.cgColor
         still.imageScaling = .scaleProportionallyUpOrDown
         still.wantsLayer = true

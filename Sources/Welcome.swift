@@ -201,17 +201,24 @@ struct Welcome: View {
     private var librarySplit: some View {
         NavigationSplitView {
             List(library.machines, selection: $library.selected) { machine in
-                HStack {
-                    Text(machine.name)
-                        .lineLimit(1)
-                    if let address = library.addresses[machine.disk] {
-                        Spacer(minLength: 8)
-                        Text(address)
-                            .font(.caption.monospaced())
-                            .foregroundStyle(.secondary)
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack {
+                        Text(machine.name)
                             .lineLimit(1)
-                            .textSelection(.enabled)
+                        if let address = library.addresses[machine.disk] {
+                            Spacer(minLength: 8)
+                            Text(address)
+                                .font(.caption.monospaced())
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                                .textSelection(.enabled)
+                        }
                     }
+                    Text(Guest.lookupMAC(disk: URL(fileURLWithPath: machine.disk)))
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                        .lineLimit(1)
                 }
                 .tag(machine.disk)
             }
@@ -253,10 +260,15 @@ struct Welcome: View {
         .frame(minWidth: 900, idealWidth: 1100, maxWidth: .infinity, minHeight: 560, idealHeight: 720, maxHeight: .infinity)
     }
 
-    /// IP of the selected machine. Empty while it is off or still booting.
+    /// IP and MAC of the selected machine. The title is the row that stays visible.
+    /// The guest view draws over a bar under the screen, so the MAC cannot live only there.
     private var librarySubtitle: String {
         guard showsLibrary, let disk = library.selected else { return "" }
-        return library.addresses[disk] ?? ""
+        let mac = Guest.lookupMAC(disk: URL(fileURLWithPath: disk))
+        let ip = library.addresses[disk] ?? ""
+        if ip.isEmpty { return mac.isEmpty ? "" : "MAC \(mac)" }
+        if mac.isEmpty { return ip }
+        return "\(ip)  MAC \(mac)"
     }
 
     private func openQuickStart() {
