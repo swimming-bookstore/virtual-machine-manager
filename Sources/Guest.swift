@@ -41,16 +41,16 @@ enum Guest {
     }
 
     /// Lease and ARP for this MAC. The caller polls.
-    /// ARP stays empty until this Mac asks, so a miss pings `.51` before the newest lease.
-    /// `.1` and `.2` are this Mac. One address is not a subnet scan.
+    /// ARP stays empty until this Mac asks, so a miss pings each granted lease, then matches this MAC.
+    /// `.51` is only the first guest. A later VM is a later lease. This is not a subnet scan.
     private static func lookup(mac want: String) -> String? {
         let gateways = hostGateways()
         if let host = arpMatch(mac: want, gateways: gateways) { return host }
-        for host in askList(gateways: gateways) {
+        for host in leaseHosts(gateways: gateways) {
             nudge(host)
             if let found = arpMatch(mac: want, gateways: gateways) { return found }
         }
-        // Lease only after `.51` did not answer. The last grant for this MAC wins.
+        // This MAC's grant only. Another VM's `.51` is not this disk.
         return leaseAddress(mac: want, gateways: gateways)
     }
 
@@ -83,25 +83,6 @@ enum Guest {
         return nil
     }
 
-    /// `.51` first. On the first shared network that is the guest, and `.2` is this Mac.
-    /// The newest lease is next, so a stale `.3` is not asked before `.51`.
-    private static func askList(gateways: Set<String>) -> [String] {
-        var asked: [String] = []
-        for prefix in natPrefixes() {
-            let host = "\(prefix).51"
-            if isGuestHost(host, gateways: gateways), !asked.contains(host) {
-                asked.append(host)
-            }
-        }
-        if let host = latestLease(gateways: gateways), !asked.contains(host) {
-            asked.append(host)
-        }
-        if let host = onlyBridgeGuest(gateways: gateways), !asked.contains(host) {
-            asked.append(host)
-        }
-        return asked
-    }
-
     /// One ARP request. Not a subnet scan, so bridge100 does not fill with incomplete rows.
     private static func nudge(_ host: String) {
         for path in ["/sbin/ping", "/usr/sbin/ping"] {
@@ -116,79 +97,63 @@ enum Guest {
         }
     }
 
-    /// The only guest address on a vmnet bridge. A LAN neighbor on en0 is not this.
-    private static func onlyBridgeGuest(gateways: Set<String>) -> String? {
-        guard let text = arpText() else { return nil }
+    /// Every guest grant. The second and third VMs are not `.51` and not the newest block alone.
+    private static func leaseHosts(gateways: Set<String>) -> [String] {
         var found: [String] = []
-        for line in text.split(separator: "\n") {
-            guard let open = line.firstIndex(of: "("),
-                  let close = line[open...].firstIndex(of: ")"),
-                  open < close else { continue }
-            let host = String(line[line.index(after: open)..<close])
-            guard isGuestHost(host, gateways: gateways) else { continue }
-            let words = line.split(whereSeparator: \.isWhitespace).map(String.init)
-            guard let on = words.firstIndex(of: "on"), words.count > on + 1 else { continue }
-            let iface = words[on + 1]
-            guard iface.hasPrefix("bridge") || iface.hasPrefix("vmnet") || iface.hasPrefix("vmenet") else { continue }
-            if !found.contains(host) { found.append(host) }
-        }
-        return found.count == 1 ? found[0] : nil
-    }
-
-    /// Newest guest lease. bootpd appends, so the last block is the current grant.
-    private static func latestLease(gateways: Set<String>) -> String? {
         for path in leasePaths {
-            if let host = latestLease(at: path, gateways: gateways) { return host }
+            for host in leaseHosts(at: path, gateways: gateways) where !found.contains(host) {
+                found.append(host)
+            }
         }
-        return nil
+        return found
     }
 
-    private static func latestLease(at path: String, gateways: Set<String>) -> String? {
+    private static func leaseHosts(at path: String, gateways: Set<String>) -> [String] {
         var isDir: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: path, isDirectory: &isDir) else { return nil }
+        guard FileManager.default.fileExists(atPath: path, isDirectory: &isDir) else { return [] }
         if isDir.boolValue {
-            guard let names = try? FileManager.default.contentsOfDirectory(atPath: path) else { return nil }
-            var last: String?
+            guard let names = try? FileManager.default.contentsOfDirectory(atPath: path) else { return [] }
+            var found: [String] = []
             for name in names.sorted() where name.hasSuffix(".lease") || name.hasSuffix(".plist") || name.contains("dhcp") {
-                if let host = latestLease(at: (path as NSString).appendingPathComponent(name), gateways: gateways) {
-                    last = host
+                for host in leaseHosts(at: (path as NSString).appendingPathComponent(name), gateways: gateways) where !found.contains(host) {
+                    found.append(host)
                 }
             }
-            return last
+            return found
         }
-        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)), !data.isEmpty else { return nil }
-        let text = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .isoLatin1) ?? ""
-        return latestLeaseHost(text, gateways: gateways)
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)), !data.isEmpty else { return [] }
+        let body = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .isoLatin1) ?? ""
+        return leaseHostList(body, gateways: gateways)
     }
 
-    private static func latestLeaseHost(_ text: String, gateways: Set<String>) -> String? {
-        if text.contains("<key>") { return latestLeaseXML(text, gateways: gateways) }
-        var found: String?
+    private static func leaseHostList(_ text: String, gateways: Set<String>) -> [String] {
+        if text.contains("<key>") { return leaseHostListXML(text, gateways: gateways) }
+        var found: [String] = []
         var ip: String?
         for raw in text.split(whereSeparator: \.isNewline) {
             let line = raw.trimmingCharacters(in: .whitespaces)
             if line.isEmpty || line == "{" { ip = nil; continue }
             if line == "}" {
-                if let ip, isGuestHost(ip, gateways: gateways) { found = ip }
+                if let ip, isGuestHost(ip, gateways: gateways), !found.contains(ip) { found.append(ip) }
                 ip = nil
                 continue
             }
             guard let (key, value) = leaseField(line) else { continue }
             if key == "ip_address" || key == "ip-address" { ip = value }
         }
-        if let ip, isGuestHost(ip, gateways: gateways) { found = ip }
+        if let ip, isGuestHost(ip, gateways: gateways), !found.contains(ip) { found.append(ip) }
         return found
     }
 
-    private static func latestLeaseXML(_ text: String, gateways: Set<String>) -> String? {
-        var found: String?
+    private static func leaseHostListXML(_ text: String, gateways: Set<String>) -> [String] {
+        var found: [String] = []
         var pending: String?
         var ip: String?
         for raw in text.split(whereSeparator: \.isNewline) {
             let line = raw.trimmingCharacters(in: .whitespaces)
             if line == "<dict>" { ip = nil; continue }
             if line == "</dict>" {
-                if let ip, isGuestHost(ip, gateways: gateways) { found = ip }
+                if let ip, isGuestHost(ip, gateways: gateways), !found.contains(ip) { found.append(ip) }
                 ip = nil
                 continue
             }
@@ -203,7 +168,7 @@ enum Guest {
                 pending = nil
             }
         }
-        if let ip, isGuestHost(ip, gateways: gateways) { found = ip }
+        if let ip, isGuestHost(ip, gateways: gateways), !found.contains(ip) { found.append(ip) }
         return found
     }
 
@@ -384,23 +349,6 @@ enum Guest {
         return found
     }
 
-    /// Ask the subnet this Mac actually has a bridge on, including when that address is `.2`.
-    /// 192.168.64 is Apple's first subnet.
-    private static func natPrefixes() -> [String] {
-        var found: [String] = []
-        for host in bridgeAddresses() {
-            let parts = host.split(separator: ".")
-            guard parts.count == 4,
-                  let third = Int(parts[2]), third >= 64,
-                  parts[0] == "192", parts[1] == "168",
-                  parts[3] == "1" || parts[3] == "2" else { continue }
-            let prefix = parts.prefix(3).joined(separator: ".")
-            if !found.contains(prefix) { found.append(prefix) }
-        }
-        if found.isEmpty { found.append("192.168.64") }
-        return found
-    }
-
     private static func commandText(_ path: String, _ args: [String]) -> String? {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: path)
@@ -505,14 +453,34 @@ enum Guest {
     }
 
     /// The identifier the pause save was written with. A new one is stored beside the disk.
+    /// A clone used to copy the snapshot id. A second VM with that id does not get its own DHCP lease.
     private static func machineIdentifier(beside disk: URL) throws -> VZGenericMachineIdentifier {
         let url = disk.deletingLastPathComponent().appendingPathComponent("machine-id")
-        if let data = try? Data(contentsOf: url), let id = VZGenericMachineIdentifier(dataRepresentation: data) {
+        if let data = try? Data(contentsOf: url),
+           let id = VZGenericMachineIdentifier(dataRepresentation: data),
+           GuestPause.isPaused(beside: disk) || !sharedIdentity(data, disk: disk, file: url) {
             return id
         }
         let id = VZGenericMachineIdentifier()
         try id.dataRepresentation.write(to: url, options: .atomic)
         return id
+    }
+
+    /// True when this file is the snapshot id, or another machine already has these bytes.
+    private static func sharedIdentity(_ data: Data, disk: URL, file: URL) -> Bool {
+        let support = disk.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let snapshot = support.appendingPathComponent("snapshots").appendingPathComponent("debian").appendingPathComponent("machine-id")
+        if file.path != snapshot.path, let other = try? Data(contentsOf: snapshot), other == data {
+            return true
+        }
+        let machines = support.appendingPathComponent("machines")
+        guard let names = try? FileManager.default.contentsOfDirectory(atPath: machines.path) else { return false }
+        for name in names {
+            let other = machines.appendingPathComponent(name).appendingPathComponent("machine-id")
+            if other.path == file.path { continue }
+            if let bytes = try? Data(contentsOf: other), bytes == data { return true }
+        }
+        return false
     }
 
     private static func usb(_ url: URL, readOnly: Bool) throws -> VZUSBMassStorageDeviceConfiguration {

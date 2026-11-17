@@ -74,7 +74,8 @@ pub fn clone_machine(support: &Path, name: Option<&str>) -> Result<Saved> {
     let _ = fs::remove_dir_all(&stage);
     fs::create_dir_all(&stage)
         .map_err(|err| anyhow!("cannot create {}: {err}", stage.display()))?;
-    copy_beside(&src, &stage, &[DISK, NVRAM, MACHINE_ID])?;
+    // A shared machine identifier makes later VMs look like the first guest to DHCP.
+    copy_beside(&src, &stage, &[DISK, NVRAM])?;
     fs::rename(&stage, &dest)?;
     Ok(saved(&dest))
 }
@@ -412,7 +413,7 @@ mod tests {
         assert_eq!(cloned.disk.metadata().unwrap().len(), GUEST);
         assert!(cloned.disk.metadata().unwrap().blocks() < 256);
         assert_eq!(fs::read(cloned.dir.join(NVRAM)).unwrap(), b"efi-vars");
-        assert_eq!(fs::read(cloned.dir.join(MACHINE_ID)).unwrap(), b"machine");
+        assert!(!cloned.dir.join(MACHINE_ID).exists());
         let mut cloned_buf = [0u8; 6];
         let mut cloned_disk = File::open(&cloned.disk).unwrap();
         cloned_disk.seek(SeekFrom::Start(600)).unwrap();

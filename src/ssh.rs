@@ -179,25 +179,29 @@ fn arp_guests() -> Vec<(String, String)> {
 }
 
 /// Guest IP for this disk. The caller polls, so each pass matches this disk's MAC.
-/// `.1` and `.2` are this Mac. A saved `.3` is not shown when this MAC is already at `.51`.
-/// ARP stays empty until this Mac asks, so a miss pings `.51` and the newest lease, then asks the guest.
-/// That is one address, not a subnet scan.
+/// `.1` and `.2` are this Mac. `.51` is only the first guest, so a miss pings every grant, then matches this MAC.
+/// ARP stays empty until this Mac asks. That is not a subnet scan.
 pub fn guest_address(disk: &Path, mac: Option<&str>) -> Option<String> {
     let wants = macs_for(disk, mac);
     if wants.is_empty() {
         return None;
     }
-    let gateways = host_gateways(&ifconfig_text());
-    let leases = guest_rows(parse_leases(&lease_text()), &gateways);
-    let asks = ask_hosts(&nat_prefixes(&ifconfig_text()), &leases);
-    if let Some(host) = live_match(&wants, &guest_rows(arp_guests(), &gateways)) {
+    let ifconfig = net_text("VMM_IFCONFIG", ifconfig_text);
+    let gateways = host_gateways(&ifconfig);
+    let leases = guest_rows(parse_leases(&net_text("VMM_LEASE", lease_text)), &gateways);
+    let arp = || guest_rows(parse_arp(&net_text("VMM_ARP", arp_output)), &gateways);
+    if let Some(host) = live_match(&wants, &arp()) {
         return Some(host);
     }
-    for host in &asks {
-        nudge(host);
-        let arp = guest_rows(arp_guests(), &gateways);
-        if let Some(found) = live_match(&wants, &arp) {
-            return Some(found);
+    // A test supplies VMM_ARP. The app leaves it unset and asks each granted lease, then matches this MAC.
+    // `.51` is the first guest. The second and third are later grants, not that address.
+    let asks = ask_hosts(disk, &wants, &leases);
+    if std::env::var_os("VMM_ARP").is_none() {
+        for host in ping_hosts(&leases) {
+            nudge(&host);
+            if let Some(found) = live_match(&wants, &arp()) {
+                return Some(found);
+            }
         }
     }
     // The guest's own `ip addr` is the address for this MAC, even when the lease still says `.3`.
@@ -208,7 +212,7 @@ pub fn guest_address(disk: &Path, mac: Option<&str>) -> Option<String> {
             }
         }
     }
-    // Lease only after `.51` did not answer. The last grant for this MAC wins.
+    // Lease only after this MAC did not answer ARP. The last grant for this MAC wins.
     lease_match(&wants, &leases)
 }
 
@@ -235,19 +239,26 @@ fn guest_rows(rows: Vec<(String, String)>, gateways: &HashSet<String>) -> Vec<(S
         .collect()
 }
 
-/// `.51` first. On the first shared network that is the guest, and `.2` is this Mac.
-/// The newest lease is next, so a stale `.3` is not asked before `.51`.
-fn ask_hosts(prefixes: &[[u8; 3]], leases: &[(String, String)]) -> Vec<String> {
+/// Every guest grant. Ping these so ARP learns each MAC. Not a subnet scan.
+fn ping_hosts(leases: &[(String, String)]) -> Vec<String> {
     let mut hosts = Vec::new();
-    for prefix in prefixes {
-        let host = format!("{}.{}.{}.51", prefix[0], prefix[1], prefix[2]);
-        if is_guest_host(&host) && !hosts.contains(&host) {
-            hosts.push(host);
-        }
-    }
-    if let Some((host, _)) = leases.last() {
+    for (host, _) in leases {
         if is_guest_host(host) && !hosts.contains(host) {
             hosts.push(host.clone());
+        }
+    }
+    hosts
+}
+
+/// This disk's lease, then the address saved beside it. Not another VM's grant.
+fn ask_hosts(disk: &Path, wants: &[String], leases: &[(String, String)]) -> Vec<String> {
+    let mut hosts = Vec::new();
+    if let Some(host) = lease_match(wants, leases) {
+        hosts.push(host);
+    }
+    if let Some(host) = saved_ip(disk) {
+        if !hosts.contains(&host) {
+            hosts.push(host);
         }
     }
     hosts
@@ -679,6 +690,11 @@ fn nat_guest(host: &str) -> bool {
     parts.next().is_none() && a == "192" && b == "168" && c >= 64 && d != 1 && d != 2
 }
 
+/// Tests pass `VMM_ARP`, `VMM_LEASE`, and `VMM_IFCONFIG`. The app leaves them unset.
+fn net_text(key: &str, live: fn() -> String) -> String {
+    std::env::var(key).unwrap_or_else(|_| live())
+}
+
 fn arp_output() -> String {
     for bin in ["/usr/sbin/arp", "/usr/bin/arp", "arp"] {
         if let Ok(out) = Command::new(bin)
@@ -851,16 +867,43 @@ mod tests {
             address_for_mac("02:56:4d:4d:09:35", &moved),
             Some("192.168.64.51".into())
         );
+        let disk = Path::new("/tmp/vmm/machines/debian-2/disk.img");
         assert_eq!(
-            ask_hosts(&[[192, 168, 64]], &moved),
+            ask_hosts(disk, &["02:56:4d:4d:09:35".into()], &moved),
             vec![String::from("192.168.64.51")]
         );
         assert_eq!(
             ask_hosts(
-                &[[192, 168, 64]],
+                disk,
+                &["02:00:00:00:00:02".into()],
                 &[("192.168.64.3".into(), "aa:bb:cc:dd:ee:ff".into())]
             ),
-            vec![String::from("192.168.64.51"), String::from("192.168.64.3")]
+            Vec::<String>::new()
+        );
+        let later = vec![
+            ("192.168.64.51".into(), "02:56:4d:4d:00:01".into()),
+            ("192.168.64.4".into(), "02:56:4d:4d:00:02".into()),
+            ("192.168.64.5".into(), "02:56:4d:4d:00:03".into()),
+        ];
+        assert_eq!(
+            ping_hosts(&later),
+            vec![
+                String::from("192.168.64.51"),
+                String::from("192.168.64.4"),
+                String::from("192.168.64.5"),
+            ]
+        );
+        assert_eq!(
+            lease_match(&["02:56:4d:4d:00:02".into()], &later),
+            Some("192.168.64.4".into())
+        );
+        assert_eq!(
+            lease_match(&["02:56:4d:4d:00:03".into()], &later),
+            Some("192.168.64.5".into())
+        );
+        assert_eq!(
+            ask_hosts(disk, &["02:56:4d:4d:00:03".into()], &later),
+            vec![String::from("192.168.64.5")]
         );
         assert_eq!(normalize_mac("1,01:02:56:4d:4d:09:35"), "02:56:4d:4d:09:35");
     }
