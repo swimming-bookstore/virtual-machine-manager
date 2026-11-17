@@ -414,7 +414,7 @@ fn ssh_probe_is_true_only_after_login() {
     assert_eq!(event["state"], "done");
 }
 
-/// ARP at `.51` wins over a stale `.3` lease for this MAC. `.51` with another MAC does not.
+/// Each machine's MAC has its own ARP row. A stale `.3` is not this guest when ARP already has `.51`.
 #[test]
 fn guest_ip_shows_51_not_a_stale_lease() {
     let dir = dir();
@@ -422,12 +422,10 @@ fn guest_ip_shows_51_not_a_stale_lease() {
     std::fs::create_dir_all(disk.parent().unwrap()).unwrap();
     std::fs::write(&disk, b"disk").unwrap();
     let mac = "02:56:4d:4d:09:35";
-    let lease = "{\n\tip_address=192.168.64.3\n\thw_address=1,02:56:4d:4d:09:35\n}\n";
     let bridge = "bridge100: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500\n\tinet 192.168.64.1 netmask 0xffffff00 broadcast 192.168.64.255\n";
-    let ask = |arp: &str, lease: &str| {
+    let ask = |arp: &str| {
         let out = Command::new(env!("CARGO_BIN_EXE_virtual-machine-worker"))
             .args(["address", "--disk", disk.to_str().unwrap(), "--mac", mac])
-            .env("VMM_LEASE", lease)
             .env("VMM_ARP", arp)
             .env("VMM_IFCONFIG", bridge)
             .output()
@@ -436,21 +434,20 @@ fn guest_ip_shows_51_not_a_stale_lease() {
         one_event(&out.stdout)
     };
     let at_51 = "? (192.168.64.51) at 02:56:4d:4d:09:35 on bridge100\n";
-    assert_eq!(ask(at_51, lease)["detail"], "192.168.64.51");
-    let stale = "? (192.168.64.3) at 02:56:4d:4d:09:35 on bridge100\n? (192.168.64.51) at aa:bb:cc:dd:ee:ff on bridge100\n";
-    assert_eq!(ask(stale, lease)["detail"], "192.168.64.3");
-    assert_eq!(ask("", lease)["detail"], "192.168.64.3");
-    let missing = ask("", "");
+    assert_eq!(ask(at_51)["detail"], "192.168.64.51");
+    let other = "? (192.168.64.3) at aa:bb:cc:dd:ee:ff on bridge100\n? (192.168.64.51) at 02:56:4d:4d:00:02 on bridge100\n";
+    let missing = ask(other);
     assert!(missing.get("detail").is_none() || missing["detail"].is_null());
+    let none = ask("");
+    assert!(none.get("detail").is_none() || none["detail"].is_null());
 }
 
-/// The second and third guests are not the first lease. Each MAC keeps its own address.
+/// The second and third guests are not the first ARP row. Each MAC keeps its own address.
 #[test]
 fn later_guests_keep_their_own_ip() {
     let dir = dir();
     let bridge = "bridge100: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500\n\tinet 192.168.64.1 netmask 0xffffff00 broadcast 192.168.64.255\n";
-    let lease = "{\n\tip_address=192.168.64.51\n\thw_address=1,02:56:4d:4d:00:01\n}\n{\n\tip_address=192.168.64.4\n\thw_address=1,02:56:4d:4d:00:02\n}\n{\n\tip_address=192.168.64.5\n\thw_address=1,02:56:4d:4d:00:03\n}\n";
-    let arp = "? (192.168.64.51) at 02:56:4d:4d:00:01 on bridge100\n";
+    let arp = "? (192.168.64.51) at 02:56:4d:4d:00:01 on bridge100\n? (192.168.64.4) at 02:56:4d:4d:00:02 on bridge100\n? (192.168.64.5) at 02:56:4d:4d:00:03 on bridge100\n";
     let cases = [
         ("debian-2", "02:56:4d:4d:00:01", "192.168.64.51"),
         ("debian-3", "02:56:4d:4d:00:02", "192.168.64.4"),
@@ -462,7 +459,6 @@ fn later_guests_keep_their_own_ip() {
         std::fs::write(&disk, b"disk").unwrap();
         let out = Command::new(env!("CARGO_BIN_EXE_virtual-machine-worker"))
             .args(["address", "--disk", disk.to_str().unwrap(), "--mac", mac])
-            .env("VMM_LEASE", lease)
             .env("VMM_ARP", arp)
             .env("VMM_IFCONFIG", bridge)
             .output()

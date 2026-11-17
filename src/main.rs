@@ -552,7 +552,7 @@ enum Command {
         /// Guest disk whose MAC should be looked up.
         #[arg(long, value_name = "PATH")]
         disk: PathBuf,
-        /// MAC the attachment wrote for this disk. The lookup matches this, not a guessed octet.
+        /// MAC the attachment wrote for this disk. The lookup reads that row from ARP.
         #[arg(long, value_name = "MAC")]
         mac: Option<String>,
     },

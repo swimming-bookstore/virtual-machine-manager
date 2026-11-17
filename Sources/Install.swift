@@ -525,7 +525,7 @@ final class GuestSession: ObservableObject {
         }
     }
 
-    /// Ask again while the guest is running. Each pass matches this disk's MAC in the lease and ARP.
+    /// Ask again while the guest is running. Each pass reads this disk's MAC from ARP.
     /// UTM polls every 10 seconds and clears the row when the machine is not started.
     func refreshAddress() {
         addressWatch?.invalidate()
@@ -552,7 +552,7 @@ final class GuestSession: ObservableObject {
                     }
                 } else {
                     self.addressMisses += 1
-                    // A saved `.3` is not this MAC. Drop it so the next pass can show `.51`.
+                    // ARP has no row for this MAC yet. Keep polling until it does.
                     if self.address != nil {
                         self.address = nil
                         self.postAddress(nil)

@@ -398,8 +398,8 @@ enum Worker {
 
     /// One SSH attempt in the worker. A closed port is not a finished install.
     /// `cancel` is set when the app closes so a scan cannot keep the next open on "Checking SSH".
-    /// The address the guest reports for this disk's NIC. Empty when the guest is still booting.
-    /// `mac` is this disk's attachment address. The worker matches that, not a guessed octet.
+    /// The address the guest has in ARP for this disk's MAC. Empty until that row appears.
+    /// `mac` is this disk's attachment address.
     static func guestAddress(disk: URL, mac: String) -> String? {
         var args = ["address", "--disk", disk.path]
         if !mac.isEmpty { args += ["--mac", mac] }
