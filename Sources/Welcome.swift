@@ -214,7 +214,7 @@ struct Welcome: View {
                                 .textSelection(.enabled)
                         }
                     }
-                    Text(Guest.lookupMAC(disk: URL(fileURLWithPath: machine.disk)))
+                    Text(Guest.arpMAC(disk: URL(fileURLWithPath: machine.disk)))
                         .font(.caption.monospaced())
                         .foregroundStyle(.secondary)
                         .textSelection(.enabled)
@@ -264,7 +264,7 @@ struct Welcome: View {
     /// The guest view draws over a bar under the screen, so the MAC cannot live only there.
     private var librarySubtitle: String {
         guard showsLibrary, let disk = library.selected else { return "" }
-        let mac = Guest.lookupMAC(disk: URL(fileURLWithPath: disk))
+        let mac = Guest.arpMAC(disk: URL(fileURLWithPath: disk))
         let ip = library.addresses[disk] ?? ""
         if ip.isEmpty { return mac.isEmpty ? "" : "MAC \(mac)" }
         if mac.isEmpty { return ip }

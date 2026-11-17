@@ -181,7 +181,7 @@ struct Install: View {
     /// Attachment MAC for this disk. Empty until the window has a disk path.
     private var macText: String {
         guard !disk.isEmpty else { return "" }
-        let mac = Guest.lookupMAC(disk: URL(fileURLWithPath: disk))
+        let mac = Guest.arpMAC(disk: URL(fileURLWithPath: disk))
         return mac.isEmpty ? "" : mac
     }
 

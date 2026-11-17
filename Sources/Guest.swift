@@ -31,6 +31,16 @@ enum Guest {
         normalizeMAC(assignedMAC(disk: disk) ?? macString(for: disk))
     }
 
+    /// How `arp -an` prints it. `02:56:4d:4d:09:00` is `2:56:4d:4d:9:0` in that table.
+    static func arpMAC(disk: URL) -> String {
+        let padded = lookupMAC(disk: disk)
+        guard !padded.isEmpty else { return "" }
+        return padded.split(separator: ":").map { octet in
+            let trimmed = octet.drop { $0 == "0" }
+            return trimmed.isEmpty ? "0" : String(trimmed)
+        }.joined(separator: ":")
+    }
+
     /// Address on this disk's NIC. Nil when ARP has no row for this MAC yet.
     /// Each machine has its own MAC. The IP is the ARP row for that MAC, not a guessed lease.
     static func natAddress(disk: URL) -> String? {
@@ -156,10 +166,15 @@ enum Guest {
         guard octets.count == 6 else { return "" }
         var bytes: [String] = []
         for part in octets {
-            guard let value = UInt8(part, radix: 16) else { return "" }
+            guard let value = UInt8(hexOctet(part), radix: 16) else { return "" }
             bytes.append(String(format: "%02x", value))
         }
         return bytes.joined(separator: ":")
+    }
+
+    /// `arp` may leave a comma or bracket on the last octet. Only the hex counts.
+    private static func hexOctet(_ part: String) -> String {
+        String(part.prefix { $0.isHexDigit })
     }
 
     private static var assigned: [String: String] = [:]

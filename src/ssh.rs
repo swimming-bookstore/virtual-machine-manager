@@ -479,12 +479,18 @@ fn normalize_mac(text: &str) -> String {
     }
     let mut bytes = Vec::with_capacity(6);
     for part in parts {
-        let Ok(value) = u8::from_str_radix(part, 16) else {
+        let Ok(value) = u8::from_str_radix(hex_octet(part), 16) else {
             return String::new();
         };
         bytes.push(format!("{value:02x}"));
     }
     bytes.join(":")
+}
+
+/// `arp -an` prints `2:56:4d:4d:9:0` for `02:56:4d:4d:09:00`, sometimes with a comma on the last octet.
+fn hex_octet(part: &str) -> &str {
+    part.trim_end_matches(|c: char| !c.is_ascii_hexdigit())
+        .trim_start_matches(|c: char| !c.is_ascii_hexdigit())
 }
 
 fn generate(private: &Path) -> Result<()> {
@@ -593,6 +599,14 @@ mod tests {
             Some("192.168.64.51".into())
         );
         assert_eq!(normalize_mac("1,01:02:56:4d:4d:09:35"), "02:56:4d:4d:09:35");
+        assert_eq!(normalize_mac("2:56:4d:4d:9:0"), "02:56:4d:4d:09:00");
+        assert_eq!(
+            address_for_mac(
+                "02:56:4d:4d:09:00",
+                &parse_arp("? (192.168.64.8) at 2:56:4d:4d:9:0 on bridge100\n")
+            ),
+            Some("192.168.64.8".into())
+        );
     }
 
     #[test]
