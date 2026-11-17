@@ -42,37 +42,22 @@ enum Guest {
     }
 
     /// Address on this disk's NIC. Nil when ARP has no row for this MAC yet.
-    /// Each machine has its own MAC. The IP is the ARP row for that MAC, not a guessed lease.
-    /// `bridge100` is the vmnet shared network. A row there is the guest.
+    /// Each machine has its own MAC. The IP is that ARP row, on whichever interface `arp -an` printed.
     static func natAddress(disk: URL) -> String? {
         let want = lookupMAC(disk: disk)
         guard !want.isEmpty, let text = arpText() else { return nil }
-        let gateways = hostGateways()
-        if let host = address(in: text, mac: want, gateways: gateways) {
-            return host
-        }
-        return bridgeAddress(in: text, mac: want, gateways: gateways)
+        return macInARP(text, mac: want, gateways: hostGateways())
     }
 
-    private static func arpMatch(mac want: String, gateways: Set<String>) -> String? {
-        guard !want.isEmpty, let text = arpText() else { return nil }
-        return address(in: text, mac: want, gateways: gateways)
-    }
-
-    /// MAC on `bridge100` (or any `bridge*`). That row is the guest even when a stricter parse skipped it.
-    private static func bridgeAddress(in text: String, mac want: String, gateways: Set<String>) -> String? {
+    /// Any ARP row for this MAC, except the host gateway. `bridge100` is common; the name is not required.
+    private static func macInARP(_ text: String, mac want: String, gateways: Set<String>) -> String? {
         var found: String?
         for line in text.split(whereSeparator: \.isNewline) {
-            guard let row = arpRow(String(line)) else { continue }
-            guard sharedBridge(row.iface), !gateways.contains(row.host), !hostSide(row.host) else { continue }
-            guard normalizeMAC(row.mac) == want else { continue }
+            guard let row = arpRow(String(line)), normalizeMAC(row.mac) == want else { continue }
+            guard !gateways.contains(row.host), !hostSide(row.host), usableIPv4(row.host) else { continue }
             found = row.host
         }
         return found
-    }
-
-    private static func sharedBridge(_ iface: String) -> Bool {
-        iface.hasPrefix("bridge") || iface.hasPrefix("vmnet") || iface.hasPrefix("vmenet")
     }
 
     private static func arpRow(_ line: String) -> (host: String, mac: String, iface: String)? {
@@ -81,27 +66,15 @@ enum Guest {
               open < close else { return nil }
         let host = String(line[line.index(after: open)..<close])
         let words = line.split(whereSeparator: \.isWhitespace).map(String.init)
-        guard let mac = words.first(where: { $0.split(separator: ":").count == 6 }) else { return nil }
+        let mac = words.first { token in
+            let parts = token.split { $0 == ":" || $0 == "-" }
+            return parts.count == 6 || parts.count == 7
+        } ?? ""
         let iface = words.firstIndex(of: "on").flatMap { index -> String? in
             guard words.count > index + 1 else { return nil }
             return String(words[index + 1].prefix { $0.isLetter || $0.isNumber })
         } ?? ""
         return (host, mac, iface)
-    }
-
-    private static func address(in text: String, mac want: String, gateways: Set<String>) -> String? {
-        var found: String?
-        for line in text.split(separator: "\n") {
-            guard let open = line.firstIndex(of: "("),
-                  let close = line[open...].firstIndex(of: ")"),
-                  open < close else { continue }
-            let host = String(line[line.index(after: open)..<close])
-            guard isGuestHost(host, gateways: gateways) else { continue }
-            guard let mac = line.split(whereSeparator: \.isWhitespace).first(where: { $0.split(separator: ":").count == 6 }),
-                  normalizeMAC(String(mac)) == want else { continue }
-            found = host
-        }
-        return found
     }
 
     private static func arpText() -> String? {
@@ -114,14 +87,7 @@ enum Guest {
     }
 
     /// Not this Mac, loopback, or a broadcast. `.1` is always the gateway.
-    /// `.2` on a vmnet shared network is this Mac too: `192.168.64.2` on the first bridge,
-    /// `192.168.65.2` when `.1` was already taken. Neither answers SSH for the guest.
-    private static func isGuestHost(_ host: String, gateways: Set<String>) -> Bool {
-        guard !gateways.contains(host), !hostSide(host) else { return false }
-        return usableIPv4(host)
-    }
-
-    /// The host side of every vmnet shared network. ifconfig often lists only `.1`, so `.2` is excluded here.
+    /// `.2` on a vmnet shared network is this Mac too.
     private static func hostSide(_ host: String) -> Bool {
         let parts = host.split(separator: ".")
         guard parts.count == 4,
@@ -181,12 +147,15 @@ enum Guest {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: path)
         process.arguments = args
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = FileHandle.nullDevice
+        let out = Pipe()
+        let err = Pipe()
+        process.standardOutput = out
+        process.standardError = err
         guard (try? process.run()) != nil else { return nil }
         process.waitUntilExit()
-        return String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)
+        let data = out.fileHandleForReading.readDataToEndOfFile()
+        guard !data.isEmpty else { return nil }
+        return String(data: data, encoding: .utf8) ?? String(data: data, encoding: .isoLatin1)
     }
 
     private static func normalizeMAC(_ text: String) -> String {

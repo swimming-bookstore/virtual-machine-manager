@@ -179,16 +179,25 @@ fn arp_guests() -> Vec<(String, String)> {
 }
 
 /// Guest IP for this disk. The caller polls. Each machine has its own MAC, and ARP has the IP for that MAC.
-/// A row on `bridge100` is the guest. The interface name is not required to start with `bridge`.
+/// The row may be on `bridge100` or another interface. Match the MAC, not the interface name.
 pub fn guest_address(disk: &Path, mac: Option<&str>) -> Option<String> {
     let wants = macs_for(disk, mac);
     if wants.is_empty() {
         return None;
     }
-    let gateways = host_gateways(&net_text("VMM_IFCONFIG", ifconfig_text));
     let text = net_text("VMM_ARP", arp_output);
-    let arp = guest_rows(parse_arp(&text), &gateways);
-    live_match(&wants, &arp).or_else(|| bridge_match(&wants, &text, &gateways))
+    let gateways = host_gateways(&net_text("VMM_IFCONFIG", ifconfig_text));
+    mac_in_arp(&wants, &text, &gateways)
+}
+
+/// Any ARP row for this disk's MAC, except the host gateway. Interface name is not part of the match.
+fn mac_in_arp(wants: &[String], text: &str, gateways: &HashSet<String>) -> Option<String> {
+    let rows: Vec<(String, String)> = arp_rows(text)
+        .into_iter()
+        .filter(|(host, mac, _)| !mac.is_empty() && !gateways.contains(host) && !host_side(host))
+        .map(|(host, mac, _)| (host, mac))
+        .collect();
+    live_match(wants, &rows)
 }
 
 fn macs_for(disk: &Path, mac: Option<&str>) -> Vec<String> {
@@ -206,12 +215,6 @@ fn macs_for(disk: &Path, mac: Option<&str>) -> Vec<String> {
         wants.push(computed);
     }
     wants
-}
-
-fn guest_rows(rows: Vec<(String, String)>, gateways: &HashSet<String>) -> Vec<(String, String)> {
-    rows.into_iter()
-        .filter(|(host, _)| !gateways.contains(host) && !host_side(host))
-        .collect()
 }
 
 /// ARP is the live address. A lease for the same MAC is not used while ARP already has it.
@@ -466,7 +469,10 @@ fn arp_row(line: &str) -> Option<(String, String, String)> {
     let host = line[open + 1..close].to_string();
     let mac = line
         .split_whitespace()
-        .find(|part| part.split(':').count() == 6)
+        .find(|part| {
+            let n = part.split(|c| c == ':' || c == '-').count();
+            n == 6 || n == 7
+        })
         .map(normalize_mac)
         .unwrap_or_default();
     let iface = line
@@ -477,23 +483,6 @@ fn arp_row(line: &str) -> Option<(String, String, String)> {
         .trim_end_matches(|c: char| !c.is_ascii_alphanumeric())
         .to_string();
     Some((host, mac, iface))
-}
-
-/// The MAC is on `bridge100` (or any `bridge*`). That row is the guest even when a stricter parse skipped it.
-fn bridge_match(wants: &[String], text: &str, gateways: &HashSet<String>) -> Option<String> {
-    let rows: Vec<(String, String)> = arp_rows(text)
-        .into_iter()
-        .filter(|(host, mac, iface)| {
-            shared_bridge(iface) && !mac.is_empty() && !gateways.contains(host) && !host_side(host)
-        })
-        .map(|(host, mac, _)| (host, mac))
-        .collect();
-    live_match(wants, &rows)
-}
-
-fn shared_bridge(iface: &str) -> bool {
-    let name = iface.trim_end_matches(|c: char| !c.is_ascii_alphanumeric());
-    name.starts_with("bridge") || name.starts_with("vmnet") || name.starts_with("vmenet")
 }
 
 fn normalize_mac(text: &str) -> String {
@@ -649,8 +638,15 @@ mod tests {
             address_for_mac("02:56:4d:4d:09:35", &parse_arp(bridge100)),
             Some("192.168.64.51".into())
         );
-        assert!(shared_bridge("bridge100"));
-        assert!(shared_bridge("bridge100,"));
+        let en0 = "? (192.168.64.51) at 2:56:4d:4d:9:35 on en0 ifscope [ethernet]\n";
+        assert_eq!(
+            mac_in_arp(
+                &["02:56:4d:4d:09:35".into()],
+                en0,
+                &HashSet::new()
+            ),
+            Some("192.168.64.51".into())
+        );
         let row = arp_row(bridge100.trim()).expect("bridge100 row");
         assert_eq!(row.0, "192.168.64.51");
         assert_eq!(row.1, "02:56:4d:4d:09:35");
