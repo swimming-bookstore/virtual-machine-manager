@@ -541,7 +541,7 @@ final class GuestSession: ObservableObject {
         let path = disk
         if let saved = try? String(contentsOf: path.deletingLastPathComponent().appendingPathComponent("ip"), encoding: .utf8) {
             let host = saved.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !host.isEmpty, address != host {
+            if Worker.isGuestIP(host), address != host {
                 address = host
                 postAddress(host)
             }

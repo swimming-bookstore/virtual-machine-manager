@@ -91,7 +91,7 @@ pub fn own_group() {
 }
 
 /// One attempt. A closed port or a refused key is not a finished install.
-/// ARP first, then the next slice of 192.168.64.2–254. 192.168.64.1 is the host gateway, not the guest.
+/// ARP first, then the next slice of the vmnet subnet. `.1` is the host gateway, not the guest.
 /// DHCP is not limited to .2–.8, so one probe must not stop there, and it must not walk the whole subnet.
 pub fn probe_disk(disk: &Path) -> Result<bool> {
     if logged_in_beside(disk)? {
@@ -109,7 +109,9 @@ pub fn probe_disk(disk: &Path) -> Result<bool> {
         return Ok(false);
     }
     let mac = mac_string(disk);
-    for host in next_hosts(&dir, &mac, &arp_guests()) {
+    let text = ifconfig_text();
+    let prefixes = nat_prefixes(&text);
+    for host in next_on_bridge(&prefixes, &host_gateways(&text), &dir, &mac, &arp_guests()) {
         if login(&private, &host)? {
             write_new(&guest.join(PROOF), format!("{USER} ok\n").as_bytes())?;
             write_new(&dir.join(PROOF), format!("{USER} ok\n").as_bytes())?;
@@ -129,11 +131,22 @@ pub fn mac_string(disk: &Path) -> String {
     format!("02:56:4d:4d:{:02x}:{:02x}", (sum >> 8) as u8, sum as u8)
 }
 
+#[cfg(test)]
 fn next_hosts(dir: &Path, mac: &str, arp: &[(String, String)]) -> Vec<String> {
+    next_on_bridge(&[[192, 168, 64]], &HashSet::new(), dir, mac, arp)
+}
+
+fn next_on_bridge(
+    prefixes: &[[u8; 3]],
+    gateways: &HashSet<String>,
+    dir: &Path,
+    mac: &str,
+    arp: &[(String, String)],
+) -> Vec<String> {
     let want = normalize_mac(mac);
     let mut batch = Vec::new();
     for (host, seen) in arp {
-        if seen == &want {
+        if seen == &want && !gateways.contains(host) {
             batch.push(host.clone());
         }
     }
@@ -141,9 +154,14 @@ fn next_hosts(dir: &Path, mac: &str, arp: &[(String, String)]) -> Vec<String> {
     let next = 2 + (start - 2 + 12) % 253;
     let _ = fs::create_dir_all(dir);
     let _ = fs::write(dir.join(SCAN), format!("{next}\n"));
+    let prefix = prefixes.first().copied().unwrap_or([192, 168, 64]);
     for offset in 0..12 {
         let n = 2 + (start - 2 + offset) % 253;
-        batch.push(format!("192.168.64.{n}"));
+        let host = format!("{}.{}.{}.{n}", prefix[0], prefix[1], prefix[2]);
+        if gateways.contains(&host) {
+            continue;
+        }
+        batch.push(host);
     }
     let mut seen = HashSet::new();
     batch
@@ -179,16 +197,53 @@ pub fn guest_address(disk: &Path) -> Option<String> {
 }
 
 /// Lease and ARP first. Probing the subnet is only for a miss, so the row is not stuck on "Looking up…".
+/// An address configured on the vmnet bridge is this Mac, including 192.168.65.2.
 fn known_address(want: &str) -> Option<String> {
-    let leases = parse_leases(&lease_text());
+    let gateways = host_gateways(&ifconfig_text());
+    let leases = parse_leases(&lease_text())
+        .into_iter()
+        .filter(|(host, _)| !gateways.contains(host))
+        .collect::<Vec<_>>();
     if let Some(host) = address_for_mac(want, &leases) {
         return Some(host);
     }
-    let arp = arp_guests();
+    let arp = arp_guests()
+        .into_iter()
+        .filter(|(host, _)| !gateways.contains(host))
+        .collect::<Vec<_>>();
     if let Some(host) = address_for_mac(want, &arp) {
         return Some(host);
     }
-    only_bridge_guest(&arp_output()).or_else(|| leases.last().map(|(host, _)| host.clone()))
+    only_bridge_guest(&arp_output())
+        .filter(|host| !gateways.contains(host))
+        .or_else(|| leases.last().map(|(host, _)| host.clone()))
+}
+
+/// Addresses on vmnet bridges. The host side is `.1`, or `.2` when `.1` is already taken.
+fn host_gateways(text: &str) -> HashSet<String> {
+    let mut found = HashSet::new();
+    let mut name = "";
+    for line in text.lines() {
+        if !line.starts_with('\t') && !line.starts_with(' ') {
+            name = line.split(':').next().unwrap_or("");
+        }
+        let bridge =
+            name.starts_with("bridge") || name.starts_with("vmnet") || name.starts_with("vmenet");
+        if !bridge {
+            continue;
+        }
+        let Some(inet) = line
+            .split_whitespace()
+            .skip_while(|word| *word != "inet")
+            .nth(1)
+        else {
+            continue;
+        };
+        if usable_ipv4(inet) || inet.split('.').count() == 4 {
+            found.insert(inet.to_string());
+        }
+    }
+    found
 }
 
 /// The only guest address on a vmnet bridge. A neighbor on en0 is not this machine.
@@ -210,8 +265,13 @@ fn only_bridge_guest(text: &str) -> Option<String> {
         let Some(on) = words.iter().position(|word| *word == "on") else {
             continue;
         };
-        let Some(iface) = words.get(on + 1) else { continue };
-        if !(iface.starts_with("bridge") || iface.starts_with("vmnet") || iface.starts_with("vmenet")) {
+        let Some(iface) = words.get(on + 1) else {
+            continue;
+        };
+        if !(iface.starts_with("bridge")
+            || iface.starts_with("vmnet")
+            || iface.starts_with("vmenet"))
+        {
             continue;
         }
         if !found.contains(&host.to_string()) {
@@ -271,7 +331,10 @@ fn guest_ip(want: &str, text: &str) -> Option<String> {
                 }
             }
         }
-        if let Some(i) = tokens.iter().position(|token| *token == "inet" || *token == "inet6") {
+        if let Some(i) = tokens
+            .iter()
+            .position(|token| *token == "inet" || *token == "inet6")
+        {
             let v6 = tokens[i] == "inet6";
             if let Some(raw_ip) = tokens.get(i + 1) {
                 let ip = raw_ip.split('/').next().unwrap_or(raw_ip);
@@ -305,11 +368,16 @@ fn nat_prefixes(text: &str) -> Vec<[u8; 3]> {
         if !line.starts_with('\t') && !line.starts_with(' ') {
             name = line.split(':').next().unwrap_or("");
         }
-        let bridge = name.starts_with("bridge") || name.starts_with("vmnet") || name.starts_with("vmenet");
+        let bridge =
+            name.starts_with("bridge") || name.starts_with("vmnet") || name.starts_with("vmenet");
         if !bridge {
             continue;
         }
-        let Some(inet) = line.split_whitespace().skip_while(|word| *word != "inet").nth(1) else {
+        let Some(inet) = line
+            .split_whitespace()
+            .skip_while(|word| *word != "inet")
+            .nth(1)
+        else {
             continue;
         };
         let mut parts = inet.split('.');
@@ -371,14 +439,12 @@ fn prime_arp(prefixes: &[[u8; 3]]) {
     let mut threads = Vec::new();
     for _ in 0..64 {
         let jobs = Arc::clone(&jobs);
-        threads.push(thread::spawn(move || {
-            loop {
-                let next = jobs.lock().ok().and_then(|mut queue| queue.next());
-                let Some(addr) = next else {
-                    break;
-                };
-                let _ = TcpStream::connect_timeout(&addr, Duration::from_millis(150));
-            }
+        threads.push(thread::spawn(move || loop {
+            let next = jobs.lock().ok().and_then(|mut queue| queue.next());
+            let Some(addr) = next else {
+                break;
+            };
+            let _ = TcpStream::connect_timeout(&addr, Duration::from_millis(150));
         }));
     }
     for worker in threads {
@@ -426,7 +492,11 @@ fn assigned_mac(disk: &Path) -> Option<String> {
     let path = disk.parent()?.join("mac");
     let text = fs::read_to_string(path).ok()?;
     let mac = normalize_mac(text.trim());
-    if mac.is_empty() { None } else { Some(mac) }
+    if mac.is_empty() {
+        None
+    } else {
+        Some(mac)
+    }
 }
 
 fn lease_text() -> String {
@@ -449,17 +519,18 @@ fn parse_leases(text: &str) -> Vec<(String, String)> {
     let mut found = Vec::new();
     let mut ip = None;
     let mut mac = None;
-    let finish = |ip: &mut Option<String>, mac: &mut Option<String>, found: &mut Vec<(String, String)>| {
-        if let (Some(host), Some(raw)) = (ip.take(), mac.take()) {
-            let normalized = normalize_mac(&raw);
-            if !normalized.is_empty() && is_guest_host(&host) {
-                found.push((host, normalized));
+    let finish =
+        |ip: &mut Option<String>, mac: &mut Option<String>, found: &mut Vec<(String, String)>| {
+            if let (Some(host), Some(raw)) = (ip.take(), mac.take()) {
+                let normalized = normalize_mac(&raw);
+                if !normalized.is_empty() && is_guest_host(&host) {
+                    found.push((host, normalized));
+                }
+            } else {
+                ip.take();
+                mac.take();
             }
-        } else {
-            ip.take();
-            mac.take();
-        }
-    };
+        };
     for raw in text.lines() {
         let line = raw.trim();
         if line.is_empty() || line == "{" {
@@ -510,7 +581,8 @@ fn lease_field(line: &str) -> Option<(String, String)> {
     Some((key.to_string(), value.to_string()))
 }
 
-/// Not the host gateway (`.1`), loopback, or a broadcast. The subnet is whichever bridge vmnet chose.
+/// Not this Mac, loopback, or a broadcast. The subnet is whichever bridge vmnet chose.
+/// The host side of the bridge is `.1`, or `.2` when that subnet's `.1` is already taken.
 fn is_guest_host(host: &str) -> bool {
     usable_ipv4(host)
 }
@@ -701,7 +773,10 @@ mod tests {
             address_for_mac(mac, &parse_leases(text)),
             Some("192.168.64.5".into())
         );
-        assert_eq!(address_for_mac("02:00:00:00:00:01", &parse_leases(text)), None);
+        assert_eq!(
+            address_for_mac("02:00:00:00:00:01", &parse_leases(text)),
+            None
+        );
         assert_eq!(
             parse_leases("ip_address=10.0.0.2\nhw_address=1,02:56:4d:4d:09:35\n"),
             vec![("10.0.0.2".into(), "02:56:4d:4d:09:35".into())]
@@ -711,9 +786,21 @@ mod tests {
             vec![]
         );
         assert_eq!(
-            address_for_mac(mac, &parse_leases("ip_address=192.168.65.4\nhw_address=1,02:56:4d:4d:09:35\n")),
+            address_for_mac(
+                mac,
+                &parse_leases("ip_address=192.168.65.4\nhw_address=1,02:56:4d:4d:09:35\n")
+            ),
             Some("192.168.65.4".into())
         );
+        assert!(parse_leases("ip_address=192.168.64.1\nhw_address=1,aa:bb:cc:dd:ee:ff\n").is_empty());
+        let second = "bridge100: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500\n\tinet 192.168.65.2 netmask 0xffffff00 broadcast 192.168.65.255\n";
+        let gateways = host_gateways(second);
+        let leased = parse_leases("ip_address=192.168.65.2\nhw_address=1,aa:bb:cc:dd:ee:ff\nip_address=192.168.65.3\nhw_address=1,02:56:4d:4d:09:35\n");
+        let guests: Vec<_> = leased
+            .into_iter()
+            .filter(|(host, _)| !gateways.contains(host))
+            .collect();
+        assert_eq!(guests, vec![("192.168.65.3".into(), "02:56:4d:4d:09:35".into())]);
     }
 
     #[test]
@@ -735,6 +822,12 @@ mod tests {
         let second = next_hosts(&dir, mac, &[]);
         assert_eq!(second[0], "192.168.64.14");
         assert_eq!(second.len(), 12);
+        let gateways = HashSet::from(["192.168.65.2".to_string()]);
+        let other = dir.join("second-subnet");
+        fs::create_dir_all(&other).unwrap();
+        let skipped = next_on_bridge(&[[192, 168, 65]], &gateways, &other, mac, &[]);
+        assert!(!skipped.contains(&"192.168.65.2".to_string()));
+        assert_eq!(skipped[0], "192.168.65.3");
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -764,9 +857,15 @@ mod tests {
     inet6 fe80::1/64 scope link
     inet6 ::1/128 scope host
 ";
-        assert_eq!(guest_ip("02:56:4d:4d:09:35", text), Some("192.168.65.4".into()));
+        assert_eq!(
+            guest_ip("02:56:4d:4d:09:35", text),
+            Some("192.168.65.4".into())
+        );
         assert_eq!(guest_ip("02:00:00:00:00:01", text), None);
-        assert_eq!(guest_ip("02:56:4d:4d:09:35", "2: enp0s1\n    inet 127.0.0.1/8\n"), None);
+        assert_eq!(
+            guest_ip("02:56:4d:4d:09:35", "2: enp0s1\n    inet 127.0.0.1/8\n"),
+            None
+        );
     }
 
     #[test]
@@ -783,5 +882,13 @@ vmnet1: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
 ";
         assert_eq!(nat_prefixes(text), vec![[192, 168, 65], [192, 168, 66]]);
         assert_eq!(nat_prefixes(""), vec![[192, 168, 64]]);
+        assert!(host_gateways(text).contains("192.168.65.1"));
+        assert!(!host_gateways(text).contains("192.168.1.23"));
+        let second = "\
+bridge100: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+	inet 192.168.65.2 netmask 0xffffff00 broadcast 192.168.65.255
+";
+        assert!(host_gateways(second).contains("192.168.65.2"));
+        assert!(!host_gateways(second).contains("192.168.65.3"));
     }
 }

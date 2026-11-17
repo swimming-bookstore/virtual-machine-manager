@@ -405,12 +405,14 @@ enum Worker {
         return host
     }
 
-    private static func isGuestIP(_ host: String) -> Bool {
+    /// Not this Mac. The host side of the bridge is `.1`, or `.2` when `.1` is already taken.
+    static func isGuestIP(_ host: String) -> Bool {
         let parts = host.split(separator: ".")
         guard parts.count == 4,
-              let a = Int(parts[0]), let d = Int(parts[3]),
-              parts[1].allSatisfy(\.isNumber), parts[2].allSatisfy(\.isNumber) else { return false }
-        return a != 0 && a != 127 && a < 224 && d != 0 && d != 1 && d != 255
+              let a = Int(parts[0]), let b = Int(parts[1]),
+              let c = Int(parts[2]), let d = Int(parts[3]) else { return false }
+        if a == 0 || a == 127 || a >= 224 || d == 0 || d == 1 || d == 255 { return false }
+        return !(a == 192 && b == 168 && c >= 64 && d == 2)
     }
 
     static func probe(disk: URL, cancel: @escaping () -> Bool) -> Bool {
