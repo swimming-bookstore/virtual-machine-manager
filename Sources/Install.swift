@@ -541,14 +541,19 @@ final class GuestSession: ObservableObject {
         let path = disk
         if let saved = try? String(contentsOf: path.deletingLastPathComponent().appendingPathComponent("ip"), encoding: .utf8) {
             let host = saved.trimmingCharacters(in: .whitespacesAndNewlines)
-            if Worker.isGuestIP(host), address != host {
-                address = host
-                postAddress(host)
+            if Worker.isGuestIP(host) {
+                if address != host {
+                    address = host
+                    postAddress(host)
+                }
+            } else if !host.isEmpty {
+                address = nil
+                postAddress(nil)
             }
         }
         DispatchQueue.global(qos: .utility).async {
-            // The lease file is in-process. The worker scans the subnet and would leave this row on "Looking up…".
-            let found = Guest.natAddress(disk: path) ?? Worker.guestAddress(disk: path)
+            // The worker logs in, so the row is the address ssh can use. A lease hit of .2 is this Mac.
+            let found = Worker.guestAddress(disk: path) ?? Guest.natAddress(disk: path)
             DispatchQueue.main.async {
                 guard token == self.addressGeneration, self.diskURL == path, !self.stopped, !self.paused else { return }
                 if let found {

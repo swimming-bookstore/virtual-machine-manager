@@ -146,7 +146,7 @@ fn next_on_bridge(
     let want = normalize_mac(mac);
     let mut batch = Vec::new();
     for (host, seen) in arp {
-        if seen == &want && !gateways.contains(host) {
+        if seen == &want && !gateways.contains(host) && !host_side(host) {
             batch.push(host.clone());
         }
     }
@@ -158,7 +158,7 @@ fn next_on_bridge(
     for offset in 0..12 {
         let n = 2 + (start - 2 + offset) % 253;
         let host = format!("{}.{}.{}.{n}", prefix[0], prefix[1], prefix[2]);
-        if gateways.contains(&host) {
+        if gateways.contains(&host) || host_side(&host) {
             continue;
         }
         batch.push(host);
@@ -182,46 +182,88 @@ fn arp_guests() -> Vec<(String, String)> {
     parse_arp(&arp_output())
 }
 
-/// Guest IP for this disk, the way UTM labels it.
-/// UTM calls the guest agent, matches `hardwareAddress` to the NIC, and skips loopback.
-/// Virtualization has no guest-agent port, so the DHCP lease is the same fact: which address bootpd gave this MAC.
-/// A MAC miss still uses the latest guest lease, then the only address on the vmnet bridge.
-/// Nothing, if the guest is off or still booting.
+/// Guest IP for this disk: the address the host key can log into.
+/// A lease or ARP hit is only a candidate. `.1` and `.2` are this Mac, so SSH to them never reaches the guest.
+/// Nothing, if the guest is off or sshd is not up yet.
 pub fn guest_address(disk: &Path) -> Option<String> {
     let want = assigned_mac(disk).unwrap_or_else(|| normalize_mac(&mac_string(disk)));
-    if let Some(host) = known_address(&want) {
+    if let Some(host) = reachable(disk, &want) {
         return Some(host);
     }
     prime_arp(&nat_prefixes(&ifconfig_text()));
-    known_address(&want)
+    reachable(disk, &want)
+}
+
+/// Prefer a candidate SSH accepts. Otherwise try the next slice of the bridge, skipping the host side.
+fn reachable(disk: &Path, want: &str) -> Option<String> {
+    let guest = disk.parent()?;
+    let support = guest.parent()?.parent()?;
+    let private = support.join("ssh").join(PRIVATE);
+    if !private.is_file() {
+        return known_address(want);
+    }
+    let text = ifconfig_text();
+    let prefixes = nat_prefixes(&text);
+    let gateways = host_gateways(&text);
+    if let Some(host) = known_address(want) {
+        if !gateways.contains(&host) && !host_side(&host) && login(&private, &host).unwrap_or(false) {
+            return Some(host);
+        }
+    }
+    for host in next_on_bridge(&prefixes, &gateways, &support.join("ssh"), want, &arp_guests()) {
+        if gateways.contains(&host) || host_side(&host) {
+            continue;
+        }
+        if tcp_open(&host) && login(&private, &host).unwrap_or(false) {
+            return Some(host);
+        }
+    }
+    None
+}
+
+fn tcp_open(host: &str) -> bool {
+    let Ok(addr) = format!("{host}:{SSH_PORT}").parse::<SocketAddr>() else {
+        return false;
+    };
+    TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok()
 }
 
 /// Lease and ARP first. Probing the subnet is only for a miss, so the row is not stuck on "Looking up…".
-/// An address configured on the vmnet bridge is this Mac, including 192.168.65.2.
+/// An address configured on the vmnet bridge is this Mac. So is `.2` on that subnet, including 192.168.64.2.
 fn known_address(want: &str) -> Option<String> {
     let gateways = host_gateways(&ifconfig_text());
     let leases = parse_leases(&lease_text())
         .into_iter()
-        .filter(|(host, _)| !gateways.contains(host))
+        .filter(|(host, _)| !gateways.contains(host) && !host_side(host))
         .collect::<Vec<_>>();
     if let Some(host) = address_for_mac(want, &leases) {
         return Some(host);
     }
     let arp = arp_guests()
         .into_iter()
-        .filter(|(host, _)| !gateways.contains(host))
+        .filter(|(host, _)| !gateways.contains(host) && !host_side(host))
         .collect::<Vec<_>>();
     if let Some(host) = address_for_mac(want, &arp) {
         return Some(host);
     }
     only_bridge_guest(&arp_output())
-        .filter(|host| !gateways.contains(host))
+        .filter(|host| !gateways.contains(host) && !host_side(host))
         .or_else(|| leases.last().map(|(host, _)| host.clone()))
 }
 
-/// Addresses on vmnet bridges. The host side is `.1`, or `.2` when `.1` is already taken.
+/// Addresses on vmnet bridges, plus the other host address on that subnet.
+/// A bridge at 192.168.64.1 also owns .2. A bridge at 192.168.65.2 also owns .1.
 fn host_gateways(text: &str) -> HashSet<String> {
     let mut found = HashSet::new();
+    for host in bridge_addresses(text) {
+        found.insert(host.clone());
+        found.extend(host_pair(&host));
+    }
+    found
+}
+
+fn bridge_addresses(text: &str) -> Vec<String> {
+    let mut found = Vec::new();
     let mut name = "";
     for line in text.lines() {
         if !line.starts_with('\t') && !line.starts_with(' ') {
@@ -239,11 +281,33 @@ fn host_gateways(text: &str) -> HashSet<String> {
         else {
             continue;
         };
-        if usable_ipv4(inet) || inet.split('.').count() == 4 {
-            found.insert(inet.to_string());
+        if (usable_ipv4(inet) || inet.split('.').count() == 4) && !found.contains(&inet.to_string())
+        {
+            found.push(inet.to_string());
         }
     }
     found
+}
+
+/// 192.168.64.1 and 192.168.64.2 are the same Mac. Whichever ifconfig shows, skip both.
+fn host_pair(host: &str) -> Vec<String> {
+    let mut parts = host.split('.');
+    let Some(a) = parts.next() else {
+        return Vec::new();
+    };
+    let Some(b) = parts.next() else {
+        return Vec::new();
+    };
+    let Some(c) = parts.next().and_then(|part| part.parse::<u8>().ok()) else {
+        return Vec::new();
+    };
+    let Some(d) = parts.next() else {
+        return Vec::new();
+    };
+    if a != "192" || b != "168" || c < 64 || parts.next().is_some() || (d != "1" && d != "2") {
+        return Vec::new();
+    }
+    vec![format!("{a}.{b}.{c}.1"), format!("{a}.{b}.{c}.2")]
 }
 
 /// The only guest address on a vmnet bridge. A neighbor on en0 is not this machine.
@@ -258,7 +322,7 @@ fn only_bridge_guest(text: &str) -> Option<String> {
             continue;
         }
         let host = &line[open + 1..close];
-        if !usable_ipv4(host) {
+        if !is_guest_host(host) {
             continue;
         }
         let words: Vec<&str> = line.split_whitespace().collect();
@@ -359,27 +423,11 @@ fn usable_guest_ip(ip: &str, v6: bool) -> bool {
     usable_ipv4(ip)
 }
 
-/// vmnet shared networks are bridge interfaces. The host address on that bridge is `.1`.
+/// vmnet shared networks are bridge interfaces. The host address on that bridge is `.1` or `.2`.
 /// A miss falls back to 192.168.64, the first subnet Apple hands out.
 fn nat_prefixes(text: &str) -> Vec<[u8; 3]> {
     let mut found = Vec::new();
-    let mut name = "";
-    for line in text.lines() {
-        if !line.starts_with('\t') && !line.starts_with(' ') {
-            name = line.split(':').next().unwrap_or("");
-        }
-        let bridge =
-            name.starts_with("bridge") || name.starts_with("vmnet") || name.starts_with("vmenet");
-        if !bridge {
-            continue;
-        }
-        let Some(inet) = line
-            .split_whitespace()
-            .skip_while(|word| *word != "inet")
-            .nth(1)
-        else {
-            continue;
-        };
+    for inet in bridge_addresses(text) {
         let mut parts = inet.split('.');
         let Some(a) = parts.next().and_then(|part| part.parse::<u8>().ok()) else {
             continue;
@@ -393,7 +441,7 @@ fn nat_prefixes(text: &str) -> Vec<[u8; 3]> {
         let Some(d) = parts.next().and_then(|part| part.parse::<u8>().ok()) else {
             continue;
         };
-        if a != 192 || b != 168 || c < 64 || d != 1 || parts.next().is_some() {
+        if a != 192 || b != 168 || c < 64 || (d != 1 && d != 2) || parts.next().is_some() {
             continue;
         }
         let prefix = [a, b, c];
@@ -582,9 +630,27 @@ fn lease_field(line: &str) -> Option<(String, String)> {
 }
 
 /// Not this Mac, loopback, or a broadcast. The subnet is whichever bridge vmnet chose.
-/// The host side of the bridge is `.1`, or `.2` when that subnet's `.1` is already taken.
+/// `.1` is the gateway. `.2` on a vmnet shared network is this Mac too, including 192.168.64.2.
 fn is_guest_host(host: &str) -> bool {
-    usable_ipv4(host)
+    usable_ipv4(host) && !host_side(host)
+}
+
+/// The host side of a vmnet shared network. ifconfig may show only `.1`, so `.2` is excluded here.
+fn host_side(host: &str) -> bool {
+    let mut parts = host.split('.');
+    let Some(a) = parts.next() else {
+        return false;
+    };
+    let Some(b) = parts.next() else {
+        return false;
+    };
+    let Some(c) = parts.next().and_then(|part| part.parse::<u8>().ok()) else {
+        return false;
+    };
+    let Some(d) = parts.next().and_then(|part| part.parse::<u8>().ok()) else {
+        return false;
+    };
+    parts.next().is_none() && a == "192" && b == "168" && c >= 64 && (d == 1 || d == 2)
 }
 
 fn usable_ipv4(host: &str) -> bool {
@@ -639,7 +705,7 @@ fn parse_arp(text: &str) -> Vec<(String, String)> {
             continue;
         }
         let host = &line[open + 1..close];
-        if !usable_ipv4(host) {
+        if !is_guest_host(host) {
             continue;
         }
         let mac = line
@@ -793,12 +859,19 @@ mod tests {
             Some("192.168.65.4".into())
         );
         assert!(parse_leases("ip_address=192.168.64.1\nhw_address=1,aa:bb:cc:dd:ee:ff\n").is_empty());
+        assert!(parse_leases("ip_address=192.168.64.2\nhw_address=1,aa:bb:cc:dd:ee:ff\n").is_empty());
         let second = "bridge100: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500\n\tinet 192.168.65.2 netmask 0xffffff00 broadcast 192.168.65.255\n";
         let gateways = host_gateways(second);
+        assert!(gateways.contains("192.168.65.1"));
+        assert!(gateways.contains("192.168.65.2"));
+        let first = "bridge100: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500\n\tinet 192.168.64.1 netmask 0xffffff00 broadcast 192.168.64.255\n";
+        let paired = host_gateways(first);
+        assert!(paired.contains("192.168.64.1"));
+        assert!(paired.contains("192.168.64.2"));
         let leased = parse_leases("ip_address=192.168.65.2\nhw_address=1,aa:bb:cc:dd:ee:ff\nip_address=192.168.65.3\nhw_address=1,02:56:4d:4d:09:35\n");
         let guests: Vec<_> = leased
             .into_iter()
-            .filter(|(host, _)| !gateways.contains(host))
+            .filter(|(host, _)| !gateways.contains(host) && !host_side(host))
             .collect();
         assert_eq!(guests, vec![("192.168.65.3".into(), "02:56:4d:4d:09:35".into())]);
     }
@@ -813,12 +886,9 @@ mod tests {
         let first = next_hosts(&dir, mac, &arp);
         assert_eq!(first[0], "192.168.64.7");
         let mut want = vec!["192.168.64.7".into()];
-        want.extend(
-            (2..14)
-                .filter(|n| *n != 7)
-                .map(|n| format!("192.168.64.{n}")),
-        );
+        want.extend((2..14).filter(|n| *n != 2 && *n != 7).map(|n| format!("192.168.64.{n}")));
         assert_eq!(first, want);
+        assert!(!first.iter().any(|host| host.ends_with(".2")));
         let second = next_hosts(&dir, mac, &[]);
         assert_eq!(second[0], "192.168.64.14");
         assert_eq!(second.len(), 12);
@@ -883,12 +953,19 @@ vmnet1: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
         assert_eq!(nat_prefixes(text), vec![[192, 168, 65], [192, 168, 66]]);
         assert_eq!(nat_prefixes(""), vec![[192, 168, 64]]);
         assert!(host_gateways(text).contains("192.168.65.1"));
+        assert!(host_gateways(text).contains("192.168.65.2"));
         assert!(!host_gateways(text).contains("192.168.1.23"));
+        assert!(!host_gateways(text).contains("192.168.1.2"));
         let second = "\
 bridge100: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
 	inet 192.168.65.2 netmask 0xffffff00 broadcast 192.168.65.255
 ";
+        assert_eq!(nat_prefixes(second), vec![[192, 168, 65]]);
+        assert!(host_gateways(second).contains("192.168.65.1"));
         assert!(host_gateways(second).contains("192.168.65.2"));
         assert!(!host_gateways(second).contains("192.168.65.3"));
+        assert!(host_side("192.168.64.2"));
+        assert!(!host_side("192.168.64.3"));
+        assert!(!host_side("10.0.0.2"));
     }
 }

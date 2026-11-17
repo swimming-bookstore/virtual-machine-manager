@@ -38,7 +38,8 @@ enum Guest {
 
     /// Lease file first. It is written when the guest gets an address, and it does not need an ARP probe.
     /// A MAC miss still shows the latest guest lease, then the only address on the vmnet bridge.
-    /// The address on the bridge itself (192.168.64.1, or 192.168.65.2 when .1 is taken) is this Mac.
+    /// The address on the bridge itself is this Mac: `.1`, or `.2` when `.1` was already taken.
+    /// On the first shared network that host address is `192.168.64.2`. SSH to it never reaches the guest.
     private static func lookup(mac want: String) -> String? {
         var gateways = hostGateways()
         if let host = matched(mac: want, gateways: gateways) { return host }
@@ -284,41 +285,50 @@ enum Guest {
     }
 
     /// Not this Mac, loopback, or a broadcast. `.1` is always the gateway.
-    /// `.2` is this Mac only when ifconfig shows it on the bridge (192.168.65.2).
+    /// `.2` on a vmnet shared network is this Mac too: `192.168.64.2` on the first bridge,
+    /// `192.168.65.2` when `.1` was already taken. Neither answers SSH for the guest.
     private static func isGuestHost(_ host: String, gateways: Set<String>) -> Bool {
+        guard !gateways.contains(host), !hostSide(host) else { return false }
+        return usableIPv4(host)
+    }
+
+    /// The host side of every vmnet shared network. ifconfig often lists only `.1`, so `.2` is excluded here.
+    private static func hostSide(_ host: String) -> Bool {
+        let parts = host.split(separator: ".")
+        guard parts.count == 4,
+              let c = Int(parts[2]), let d = Int(parts[3]) else { return false }
+        return parts[0] == "192" && parts[1] == "168" && c >= 64 && (d == 1 || d == 2)
+    }
+
+    private static func usableIPv4(_ host: String) -> Bool {
         let parts = host.split(separator: ".")
         guard parts.count == 4,
               let a = Int(parts[0]), let d = Int(parts[3]),
               parts[1].allSatisfy(\.isNumber), parts[2].allSatisfy(\.isNumber) else { return false }
-        if a == 0 || a == 127 || a >= 224 || d == 0 || d == 1 || d == 255 { return false }
-        return !gateways.contains(host)
+        return a != 0 && a != 127 && a < 224 && d != 0 && d != 255
     }
 
-    /// Addresses configured on vmnet bridges. 192.168.65.2 is the gateway when .1 was already used.
+    /// Addresses configured on vmnet bridges, plus the other host address on that subnet.
+    /// A bridge at `192.168.64.1` also owns `.2`. A bridge at `192.168.65.2` also owns `.1`.
     private static func hostGateways() -> Set<String> {
         var found: Set<String> = []
-        let text = commandText("/sbin/ifconfig", ["-a"]) ?? commandText("/usr/sbin/ifconfig", ["-a"]) ?? ""
-        var name = ""
-        for raw in text.split(whereSeparator: \.isNewline) {
-            let line = String(raw)
-            if !line.hasPrefix("\t") && !line.hasPrefix(" ") {
-                name = String(line.split(separator: ":").first ?? "")
-            }
-            let bridge = name.hasPrefix("bridge") || name.hasPrefix("vmnet") || name.hasPrefix("vmenet")
-            guard bridge else { continue }
-            let words = line.split(whereSeparator: \.isWhitespace).map(String.init)
-            guard let inet = words.firstIndex(of: "inet"), words.count > inet + 1 else { continue }
-            let host = words[inet + 1]
-            let parts = host.split(separator: ".")
-            guard parts.count == 4, parts.allSatisfy({ Int($0) != nil }) else { continue }
+        for host in bridgeAddresses() {
             found.insert(host)
+            found.formUnion(pair(of: host))
         }
         return found
     }
 
-    /// vmnet's bridge is `.1` on the first shared network and `.2` on the next. Ask that subnet
-    /// so the guest answers ARP. 192.168.64 is Apple's first subnet.
-    private static func natPrefixes() -> [String] {
+    /// `192.168.64.1` and `192.168.64.2` are the same Mac. Whichever ifconfig shows, skip both.
+    private static func pair(of host: String) -> Set<String> {
+        let parts = host.split(separator: ".")
+        guard parts.count == 4, parts[0] == "192", parts[1] == "168",
+              let c = Int(parts[2]), c >= 64, parts[3] == "1" || parts[3] == "2" else { return [] }
+        let prefix = parts.prefix(3).joined(separator: ".")
+        return ["\(prefix).1", "\(prefix).2"]
+    }
+
+    private static func bridgeAddresses() -> [String] {
         var found: [String] = []
         let text = commandText("/sbin/ifconfig", ["-a"]) ?? commandText("/usr/sbin/ifconfig", ["-a"]) ?? ""
         var name = ""
@@ -331,10 +341,23 @@ enum Guest {
             guard bridge else { continue }
             let words = line.split(whereSeparator: \.isWhitespace).map(String.init)
             guard let inet = words.firstIndex(of: "inet"), words.count > inet + 1 else { continue }
-            let parts = words[inet + 1].split(separator: ".")
-            guard parts.count == 4, parts[3] == "1",
+            let host = words[inet + 1]
+            guard usableIPv4(host) || host.split(separator: ".").count == 4 else { continue }
+            if !found.contains(host) { found.append(host) }
+        }
+        return found
+    }
+
+    /// Ask the subnet this Mac actually has a bridge on, including when that address is `.2`.
+    /// 192.168.64 is Apple's first subnet.
+    private static func natPrefixes() -> [String] {
+        var found: [String] = []
+        for host in bridgeAddresses() {
+            let parts = host.split(separator: ".")
+            guard parts.count == 4,
                   let third = Int(parts[2]), third >= 64,
-                  parts[0] == "192", parts[1] == "168" else { continue }
+                  parts[0] == "192", parts[1] == "168",
+                  parts[3] == "1" || parts[3] == "2" else { continue }
             let prefix = parts.prefix(3).joined(separator: ".")
             if !found.contains(prefix) { found.append(prefix) }
         }
@@ -465,7 +488,7 @@ enum Guest {
     }
 
     /// `VZNATNetworkDeviceAttachment()` takes no arguments. There is no forwarding-rules type.
-    /// The host is `.1` on the vmnet bridge. sshd is on the guest address, port 22. The subnet is not always 192.168.64.
+    /// The host is `.1` or `.2` on the vmnet bridge. sshd is on the guest address, port 22. The subnet is not always 192.168.64.
     private static func network(disk: URL) -> VZVirtioNetworkDeviceConfiguration {
         let network = VZVirtioNetworkDeviceConfiguration()
         network.attachment = VZNATNetworkDeviceAttachment()

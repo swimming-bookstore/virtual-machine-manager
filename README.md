@@ -22,7 +22,7 @@ The private key is:
 ~/Library/Application Support/virtual-machine-manager/ssh/id_ed25519
 ```
 
-Start the machine. Guest IP is the bar under the screen, and in the window title. `.1` is this Mac. "Looking up…" means the guest is still booting.
+Start the machine. Guest IP is the bar under the screen, and in the window title. `.1` and `.2` are this Mac. "Looking up…" means the guest is still booting.
 
 ```sh
 ssh -i ~/Library/Application\ Support/virtual-machine-manager/ssh/id_ed25519 -o IdentitiesOnly=yes debian@<Guest IP>

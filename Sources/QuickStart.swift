@@ -405,14 +405,16 @@ enum Worker {
         return host
     }
 
-    /// Not this Mac. The host side of the bridge is `.1`, or `.2` when `.1` is already taken.
+    /// Not this Mac. `.1` is the gateway. `.2` on a vmnet shared network is this Mac as well
+    /// (`192.168.64.2` on the first bridge, `192.168.65.2` when `.1` was already taken).
     static func isGuestIP(_ host: String) -> Bool {
         let parts = host.split(separator: ".")
         guard parts.count == 4,
               let a = Int(parts[0]), let b = Int(parts[1]),
               let c = Int(parts[2]), let d = Int(parts[3]) else { return false }
         if a == 0 || a == 127 || a >= 224 || d == 0 || d == 1 || d == 255 { return false }
-        return !(a == 192 && b == 168 && c >= 64 && d == 2)
+        if a == 192 && b == 168 && c >= 64 && (d == 1 || d == 2) { return false }
+        return true
     }
 
     static func probe(disk: URL, cancel: @escaping () -> Bool) -> Bool {
