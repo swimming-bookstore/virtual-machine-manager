@@ -2,13 +2,9 @@
 
 use std::collections::HashSet;
 use std::fs::{self, File};
-use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::Duration;
 
 use anyhow::{anyhow, bail, Result};
 
@@ -187,88 +183,10 @@ fn arp_guests() -> Vec<(String, String)> {
 /// An SSH walk from `.2` is only a miss, and it must not hide an address the bridge already has.
 pub fn guest_address(disk: &Path) -> Option<String> {
     let want = assigned_mac(disk).unwrap_or_else(|| normalize_mac(&mac_string(disk)));
-    if let Some(host) = known_address(&want) {
-        return Some(host);
-    }
-    let prefixes = nat_prefixes(&ifconfig_text());
-    prime_arp(&prefixes);
-    if let Some(host) = known_address(&want) {
-        return Some(host);
-    }
-    listening(&prefixes)
+    known_address(&want)
 }
 
-/// Port 22 on the bridge, when ARP stayed empty. The host side is open too, because this Mac runs sshd, so skip it.
-/// A guest at `.51` is asked before the walk from `.3`.
-fn listening(prefixes: &[[u8; 3]]) -> Option<String> {
-    let gateways = host_gateways(&ifconfig_text());
-    let open = hosts_with_ssh(prefixes, &gateways);
-    if open.len() == 1 {
-        open.into_iter().next()
-    } else {
-        None
-    }
-}
-
-fn hosts_with_ssh(prefixes: &[[u8; 3]], gateways: &HashSet<String>) -> Vec<String> {
-    let mut first = Vec::new();
-    let mut rest = Vec::new();
-    for prefix in prefixes {
-        for n in [51, 50, 52, 20, 100, 30, 40, 60, 70, 80, 90] {
-            first.push(format!("{}.{}.{}.{n}", prefix[0], prefix[1], prefix[2]));
-        }
-        for n in 3..=254 {
-            let host = format!("{}.{}.{}.{n}", prefix[0], prefix[1], prefix[2]);
-            if !first.contains(&host) {
-                rest.push(host);
-            }
-        }
-    }
-    let early = scan_ssh(first, gateways);
-    if !early.is_empty() {
-        return early;
-    }
-    scan_ssh(rest, gateways)
-}
-
-fn scan_ssh(hosts: Vec<String>, gateways: &HashSet<String>) -> Vec<String> {
-    let jobs: Vec<String> = hosts
-        .into_iter()
-        .filter(|host| !gateways.contains(host) && !host_side(host))
-        .collect();
-    let jobs = Arc::new(Mutex::new(jobs.into_iter()));
-    let found = Arc::new(Mutex::new(Vec::new()));
-    let mut threads = Vec::new();
-    for _ in 0..32 {
-        let jobs = Arc::clone(&jobs);
-        let found = Arc::clone(&found);
-        threads.push(thread::spawn(move || loop {
-            let next = jobs.lock().ok().and_then(|mut queue| queue.next());
-            let Some(host) = next else {
-                break;
-            };
-            if tcp_open(&host) {
-                if let Ok(mut list) = found.lock() {
-                    list.push(host);
-                }
-            }
-        }));
-    }
-    for worker in threads {
-        let _ = worker.join();
-    }
-    found.lock().map(|list| list.clone()).unwrap_or_default()
-}
-
-fn tcp_open(host: &str) -> bool {
-    let Ok(addr) = format!("{host}:{SSH_PORT}").parse::<SocketAddr>() else {
-        return false;
-    };
-    TcpStream::connect_timeout(&addr, Duration::from_millis(80)).is_ok()
-}
-
-/// Lease and ARP first. Probing the subnet is only for a miss, so the row is not stuck on "Looking up…".
-/// An address configured on the vmnet bridge is this Mac. So is `.2` on that subnet, including 192.168.64.2.
+/// Lease and ARP first. An address configured on the vmnet bridge is this Mac. So is `.2` on that subnet, including 192.168.64.2.
 fn known_address(want: &str) -> Option<String> {
     let gateways = host_gateways(&ifconfig_text());
     let leases = parse_leases(&lease_text())
@@ -510,33 +428,6 @@ fn ifconfig_text() -> String {
         }
     }
     String::new()
-}
-
-/// Ask the bridge for every address so the guest answers ARP. The cache stays empty until then.
-fn prime_arp(prefixes: &[[u8; 3]]) {
-    let jobs: Vec<SocketAddr> = prefixes
-        .iter()
-        .flat_map(|prefix| {
-            (2..=254).map(|n| {
-                SocketAddr::from((Ipv4Addr::new(prefix[0], prefix[1], prefix[2], n), SSH_PORT))
-            })
-        })
-        .collect();
-    let jobs = Arc::new(Mutex::new(jobs.into_iter()));
-    let mut threads = Vec::new();
-    for _ in 0..64 {
-        let jobs = Arc::clone(&jobs);
-        threads.push(thread::spawn(move || loop {
-            let next = jobs.lock().ok().and_then(|mut queue| queue.next());
-            let Some(addr) = next else {
-                break;
-            };
-            let _ = TcpStream::connect_timeout(&addr, Duration::from_millis(150));
-        }));
-    }
-    for worker in threads {
-        let _ = worker.join();
-    }
 }
 
 fn ssh_capture(private: &Path, host: &str, command: &str) -> Option<String> {
