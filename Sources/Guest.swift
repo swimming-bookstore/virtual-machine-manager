@@ -40,7 +40,7 @@ enum Guest {
     /// The address on the bridge itself is this Mac: `.1`, or `.2` when `.1` was already taken.
     /// On the first shared network that host address is `192.168.64.2`. The guest can already be `.51`.
     private static func lookup(mac want: String) -> String? {
-        var gateways = hostGateways()
+        let gateways = hostGateways()
         if let host = matched(mac: want, gateways: gateways) { return host }
         if let host = onlyBridgeGuest(gateways: gateways) { return host }
         return latestLease(gateways: gateways)
