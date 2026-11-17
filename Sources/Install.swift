@@ -147,13 +147,18 @@ struct Install: View {
 
     /// Under the screen, not in the toolbar. A toolbar label collapses into the overflow menu.
     /// The row stays even before the address is known, so it is not clipped away with the guest.
+    /// The MAC is the one we match in ARP. Compare it with `arp -an` when the IP stays empty.
     private var guestIPRow: some View {
         HStack(spacing: 8) {
             Text("Guest IP")
                 .foregroundStyle(.secondary)
-            Spacer(minLength: 12)
             Text(addressText)
                 .font(.body.monospaced())
+                .textSelection(.enabled)
+            Spacer(minLength: 12)
+            Text(macText)
+                .font(.caption.monospaced())
+                .foregroundStyle(.secondary)
                 .textSelection(.enabled)
         }
         .padding(.horizontal, 16)
@@ -168,6 +173,13 @@ struct Install: View {
         if guest.paused { return "Paused" }
         if guest.stopped { return "Start the machine" }
         return "Looking up…"
+    }
+
+    /// Attachment MAC for this disk. Empty until the window has a disk path.
+    private var macText: String {
+        guard !disk.isEmpty else { return "" }
+        let mac = Guest.lookupMAC(disk: URL(fileURLWithPath: disk))
+        return mac.isEmpty ? "" : mac
     }
 
     private var page: some View {
