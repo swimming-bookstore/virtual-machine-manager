@@ -267,7 +267,10 @@ mod tests {
     #[test]
     fn key_file_matches_the_published_key_id() {
         assert_eq!(key_file(), "key-DA87E80D6294BE9B.txt");
-        assert_eq!(KEY_URL, "https://www.debian.org/CD/key-DA87E80D6294BE9B.txt");
+        assert_eq!(
+            KEY_URL,
+            "https://www.debian.org/CD/key-DA87E80D6294BE9B.txt"
+        );
         assert_eq!(
             &fingerprint()[fingerprint().len() - 16..],
             "da87e80d6294be9b"
