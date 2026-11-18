@@ -175,6 +175,9 @@ struct Install: View {
         if let address = guest.address { return address }
         if guest.paused { return "Paused" }
         if guest.stopped { return "Start the machine" }
+        if guest.addressMisses > 0 {
+            return "No ARP row for this MAC"
+        }
         return "Looking up…"
     }
 
@@ -497,7 +500,8 @@ final class GuestSession: ObservableObject {
     private var saved = false
     private var watch: Timer?
     private var addressWatch: Timer?
-    private var addressMisses = 0
+    /// Polls that found no ARP row for this MAC. The bar uses this instead of staying on "Looking up…".
+    @Published var addressMisses = 0
     private var addressGeneration = 0
     private var probing = false
     private var savingSnapshot = false
@@ -540,7 +544,7 @@ final class GuestSession: ObservableObject {
         }
     }
 
-    /// The first pass is not enough. Apple writes the `bridge100` row after the guest answers DHCP.
+    /// The first pass is not enough. Apple writes the ARP row after the guest answers DHCP.
     func refreshAddress() {
         addressWatch?.invalidate()
         addressWatch = nil
@@ -555,7 +559,8 @@ final class GuestSession: ObservableObject {
         let path = disk
         let mac = Guest.lookupMAC(disk: path)
         DispatchQueue.global(qos: .utility).async {
-            let found = Guest.natAddress(disk: path) ?? Worker.guestAddress(disk: path, mac: mac)
+            // The IP beside this MAC in `arp -an`. The worker is the same lookup if the app binary cannot run arp.
+            let found = Guest.addressForMAC(disk: path) ?? Worker.guestAddress(disk: path, mac: mac)
             DispatchQueue.main.async {
                 guard token == self.addressGeneration, self.diskURL == path, !self.stopped, !self.paused else { return }
                 if let found {

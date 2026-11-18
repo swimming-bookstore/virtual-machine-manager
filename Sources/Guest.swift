@@ -41,106 +41,50 @@ enum Guest {
         }.joined(separator: ":")
     }
 
-    /// Address on this disk's NIC. Nil when ARP has no row for this MAC yet.
-    /// Each machine has its own MAC. The IP is that ARP row, on whichever interface `arp -an` printed.
-    static func natAddress(disk: URL) -> String? {
+    /// IP beside this disk's MAC in `arp -an`. Nil until that row exists.
+    /// Tests pass the table in `VMM_ARP` so this does not need a Mac.
+    static func addressForMAC(disk: URL) -> String? {
         let want = lookupMAC(disk: disk)
-        guard !want.isEmpty, let text = arpText() else { return nil }
-        return macInARP(text, mac: want, gateways: hostGateways())
-    }
-
-    /// Any ARP row for this MAC, except the host gateway. `bridge100` is common; the name is not required.
-    private static func macInARP(_ text: String, mac want: String, gateways: Set<String>) -> String? {
-        var found: String?
-        for line in text.split(whereSeparator: \.isNewline) {
-            guard let row = arpRow(String(line)), normalizeMAC(row.mac) == want else { continue }
-            guard !gateways.contains(row.host), !hostSide(row.host), usableIPv4(row.host) else { continue }
-            found = row.host
+        guard !want.isEmpty else { return nil }
+        if let injected = ProcessInfo.processInfo.environment["VMM_ARP"] {
+            return ip(for: want, in: injected)
         }
-        return found
-    }
-
-    private static func arpRow(_ line: String) -> (host: String, mac: String, iface: String)? {
-        guard let open = line.firstIndex(of: "("),
-              let close = line[open...].firstIndex(of: ")"),
-              open < close else { return nil }
-        let host = String(line[line.index(after: open)..<close])
-        let words = line.split(whereSeparator: \.isWhitespace).map(String.init)
-        let mac = words.first { token in
-            let parts = token.split { $0 == ":" || $0 == "-" }
-            return parts.count == 6 || parts.count == 7
-        } ?? ""
-        let iface = words.firstIndex(of: "on").flatMap { index -> String? in
-            guard words.count > index + 1 else { return nil }
-            return String(words[index + 1].prefix { $0.isLetter || $0.isNumber })
-        } ?? ""
-        return (host, mac, iface)
-    }
-
-    private static func arpText() -> String? {
-        for path in ["/usr/sbin/arp", "/usr/bin/arp"] {
-            if let text = commandText(path, ["-an"]) {
-                return text
-            }
+        for path in ["/usr/sbin/arp", "/usr/bin/arp", "/sbin/arp"] {
+            guard let text = commandText(path, ["-an"]) else { continue }
+            if let host = ip(for: want, in: text) { return host }
         }
         return nil
     }
 
-    /// Not this Mac, loopback, or a broadcast. `.1` is always the gateway.
-    /// `.2` on a vmnet shared network is this Mac too.
-    private static func hostSide(_ host: String) -> Bool {
-        let parts = host.split(separator: ".")
-        guard parts.count == 4,
-              let c = Int(parts[2]), let d = Int(parts[3]) else { return false }
-        return parts[0] == "192" && parts[1] == "168" && c >= 64 && (d == 1 || d == 2)
-    }
-
-    private static func usableIPv4(_ host: String) -> Bool {
-        let parts = host.split(separator: ".")
-        guard parts.count == 4,
-              let a = Int(parts[0]), let d = Int(parts[3]),
-              parts[1].allSatisfy(\.isNumber), parts[2].allSatisfy(\.isNumber) else { return false }
-        return a != 0 && a != 127 && a < 224 && d != 0 && d != 255
-    }
-
-    /// Addresses configured on vmnet bridges, plus the other host address on that subnet.
-    /// A bridge at `192.168.64.1` also owns `.2`. A bridge at `192.168.65.2` also owns `.1`.
-    private static func hostGateways() -> Set<String> {
-        var found: Set<String> = []
-        for host in bridgeAddresses() {
-            found.insert(host)
-            found.formUnion(pair(of: host))
-        }
-        return found
-    }
-
-    /// `192.168.64.1` and `192.168.64.2` are the same Mac. Whichever ifconfig shows, skip both.
-    private static func pair(of host: String) -> Set<String> {
-        let parts = host.split(separator: ".")
-        guard parts.count == 4, parts[0] == "192", parts[1] == "168",
-              let c = Int(parts[2]), c >= 64, parts[3] == "1" || parts[3] == "2" else { return [] }
-        let prefix = parts.prefix(3).joined(separator: ".")
-        return ["\(prefix).1", "\(prefix).2"]
-    }
-
-    private static func bridgeAddresses() -> [String] {
-        var found: [String] = []
-        let text = commandText("/sbin/ifconfig", ["-a"]) ?? commandText("/usr/sbin/ifconfig", ["-a"]) ?? ""
-        var name = ""
+    /// `? (192.168.64.51) at 2:56:4d:4d:9:35 on bridge100` — the MAC is enough. The interface name is not.
+    private static func ip(for want: String, in text: String) -> String? {
+        var found: String?
         for raw in text.split(whereSeparator: \.isNewline) {
             let line = String(raw)
-            if !line.hasPrefix("\t") && !line.hasPrefix(" ") {
-                name = String(line.split(separator: ":").first ?? "")
-            }
-            let bridge = name.hasPrefix("bridge") || name.hasPrefix("vmnet") || name.hasPrefix("vmenet")
-            guard bridge else { continue }
-            let words = line.split(whereSeparator: \.isWhitespace).map(String.init)
-            guard let inet = words.firstIndex(of: "inet"), words.count > inet + 1 else { continue }
-            let host = words[inet + 1]
-            guard usableIPv4(host) || host.split(separator: ".").count == 4 else { continue }
-            if !found.contains(host) { found.append(host) }
+            guard let open = line.firstIndex(of: "("),
+                  let close = line[line.index(after: open)...].firstIndex(of: ")"),
+                  open < close else { continue }
+            let host = String(line[line.index(after: open)..<close])
+            guard isGuestIP(host) else { continue }
+            let mac = line.split(whereSeparator: \.isWhitespace).compactMap { token -> String? in
+                let normalized = normalizeMAC(String(token))
+                return normalized.isEmpty ? nil : normalized
+            }.first
+            guard mac == want else { continue }
+            found = host
         }
         return found
+    }
+
+    /// Not this Mac. `.1` and `.2` on a vmnet shared network are the host.
+    private static func isGuestIP(_ host: String) -> Bool {
+        let parts = host.split(separator: ".")
+        guard parts.count == 4,
+              let a = Int(parts[0]), let b = Int(parts[1]),
+              let c = Int(parts[2]), let d = Int(parts[3]) else { return false }
+        if a == 0 || a == 127 || a >= 224 || d == 0 || d == 1 || d == 255 { return false }
+        if a == 192 && b == 168 && c >= 64 && (d == 1 || d == 2) { return false }
+        return true
     }
 
     private static func commandText(_ path: String, _ args: [String]) -> String? {
@@ -148,9 +92,8 @@ enum Guest {
         process.executableURL = URL(fileURLWithPath: path)
         process.arguments = args
         let out = Pipe()
-        let err = Pipe()
         process.standardOutput = out
-        process.standardError = err
+        process.standardError = Pipe()
         guard (try? process.run()) != nil else { return nil }
         process.waitUntilExit()
         let data = out.fileHandleForReading.readDataToEndOfFile()
