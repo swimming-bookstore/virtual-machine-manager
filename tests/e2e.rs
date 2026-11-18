@@ -435,6 +435,17 @@ fn guest_ip_shows_51_not_a_stale_lease() {
     };
     let at_51 = "? (192.168.64.51) at 2:56:4d:4d:9:35 on bridge100 ifscope [bridge]\n";
     assert_eq!(ask(at_51)["detail"], "192.168.64.51");
+    // `arp -an` prints `2:56:4d:4d:a0:0`. The stored MAC is `02:56:4d:4d:a0:00`. Same NIC.
+    let unpadded = "? (192.168.64.51) at 2:56:4d:4d:a0:0 on bridge100 ifscope [bridge]\n";
+    let padded = "02:56:4d:4d:a0:00";
+    let out = Command::new(env!("CARGO_BIN_EXE_virtual-machine-worker"))
+        .args(["address", "--disk", disk.to_str().unwrap(), "--mac", padded])
+        .env("VMM_ARP", unpadded)
+        .env("VMM_IFCONFIG", bridge)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(one_event(&out.stdout)["detail"], "192.168.64.51");
     // The MAC is enough. The interface does not have to be named bridge100.
     let other_iface = "? (192.168.64.51) at 2:56:4d:4d:9:35 on en0 ifscope [ethernet]\n";
     assert_eq!(ask(other_iface)["detail"], "192.168.64.51");

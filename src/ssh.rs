@@ -389,10 +389,15 @@ fn usable_ipv4(host: &str) -> bool {
 }
 
 fn address_for_mac(want: &str, arp: &[(String, String)]) -> Option<String> {
+    let want = normalize_mac(want);
     if want.is_empty() {
         return None;
     }
-    let matched: Vec<&(String, String)> = arp.iter().filter(|(_, seen)| seen == want).collect();
+    // `2:56:4d:4d:a0:0` and `02:56:4d:4d:a0:00` are the same NIC.
+    let matched: Vec<&(String, String)> = arp
+        .iter()
+        .filter(|(_, seen)| normalize_mac(seen) == want)
+        .collect();
     // The current grant is last. A later en0 row is not this guest when a vmnet address is present.
     matched
         .iter()
@@ -625,7 +630,14 @@ mod tests {
             Some("192.168.64.51".into())
         );
         assert_eq!(normalize_mac("1,01:02:56:4d:4d:09:35"), "02:56:4d:4d:09:35");
-        assert_eq!(normalize_mac("2:56:4d:4d:9:0"), "02:56:4d:4d:09:00");
+        assert_eq!(normalize_mac("2:56:4d:4d:a0:0"), "02:56:4d:4d:a0:00");
+        assert_eq!(
+            address_for_mac(
+                "02:56:4d:4d:a0:00",
+                &parse_arp("? (192.168.64.51) at 2:56:4d:4d:a0:0 on bridge100 ifscope [bridge]\n")
+            ),
+            Some("192.168.64.51".into())
+        );
         assert_eq!(
             address_for_mac(
                 "02:56:4d:4d:09:00",

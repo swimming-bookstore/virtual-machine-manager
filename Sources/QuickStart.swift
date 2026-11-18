@@ -458,6 +458,11 @@ enum Worker {
         let process = Process()
         process.executableURL = url
         process.arguments = args
+        // A shell that exported VMM_ARP for tests must not hide the live table.
+        var env = ProcessInfo.processInfo.environment
+        env.removeValue(forKey: "VMM_ARP")
+        env.removeValue(forKey: "VMM_IFCONFIG")
+        process.environment = env
         let pipe = Pipe()
         process.standardOutput = pipe
         process.standardError = pipe

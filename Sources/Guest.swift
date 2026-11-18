@@ -31,24 +31,16 @@ enum Guest {
         normalizeMAC(assignedMAC(disk: disk) ?? macString(for: disk))
     }
 
-    /// How `arp -an` prints it. `02:56:4d:4d:09:00` is `2:56:4d:4d:9:0` in that table.
+    /// How `arp -an` prints it. `02:56:4d:4d:a0:00` is `2:56:4d:4d:a0:0` in that table.
     static func arpMAC(disk: URL) -> String {
-        let padded = lookupMAC(disk: disk)
-        guard !padded.isEmpty else { return "" }
-        return padded.split(separator: ":").map { octet in
-            let trimmed = octet.drop { $0 == "0" }
-            return trimmed.isEmpty ? "0" : String(trimmed)
-        }.joined(separator: ":")
+        arpForm(lookupMAC(disk: disk))
     }
 
-    /// IP beside this disk's MAC in `arp -an`. Nil until that row exists.
-    /// Tests pass the table in `VMM_ARP` so this does not need a Mac.
+    /// IP beside this disk's MAC in live `arp -an`. Nil until that row exists.
+    /// `? (192.168.64.51) at 2:56:4d:4d:a0:0 on bridge100 ifscope [bridge]` is `.51`.
     static func addressForMAC(disk: URL) -> String? {
         let want = lookupMAC(disk: disk)
         guard !want.isEmpty else { return nil }
-        if let injected = ProcessInfo.processInfo.environment["VMM_ARP"] {
-            return ip(for: want, in: injected)
-        }
         for path in ["/usr/sbin/arp", "/usr/bin/arp", "/sbin/arp"] {
             guard let text = commandText(path, ["-an"]) else { continue }
             if let host = ip(for: want, in: text) { return host }
@@ -56,8 +48,11 @@ enum Guest {
         return nil
     }
 
-    /// `? (192.168.64.51) at 2:56:4d:4d:9:35 on bridge100` — the MAC is enough. The interface name is not.
+    /// `? (192.168.64.51) at 2:56:4d:4d:a0:0 on bridge100 ifscope [bridge]`
+    /// Compare the unpadded form. `02:...:00` and `2:...:0` are the same address.
     private static func ip(for want: String, in text: String) -> String? {
+        let needle = arpForm(want)
+        guard !needle.isEmpty else { return nil }
         var found: String?
         for raw in text.split(whereSeparator: \.isNewline) {
             let line = String(raw)
@@ -66,14 +61,20 @@ enum Guest {
                   open < close else { continue }
             let host = String(line[line.index(after: open)..<close])
             guard isGuestIP(host) else { continue }
-            let mac = line.split(whereSeparator: \.isWhitespace).compactMap { token -> String? in
-                let normalized = normalizeMAC(String(token))
-                return normalized.isEmpty ? nil : normalized
-            }.first
-            guard mac == want else { continue }
+            guard line.split(whereSeparator: \.isWhitespace).contains(where: { arpForm(String($0)) == needle }) else { continue }
             found = host
         }
         return found
+    }
+
+    /// Drop leading zeros so the MAC on screen is the token in `arp -an`.
+    private static func arpForm(_ text: String) -> String {
+        let padded = normalizeMAC(text)
+        guard !padded.isEmpty else { return "" }
+        return padded.split(separator: ":").map { octet in
+            let trimmed = octet.drop { $0 == "0" }
+            return trimmed.isEmpty ? "0" : String(trimmed)
+        }.joined(separator: ":")
     }
 
     /// Not this Mac. `.1` and `.2` on a vmnet shared network are the host.

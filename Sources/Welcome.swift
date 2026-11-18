@@ -18,13 +18,15 @@ final class LibraryModel: ObservableObject {
     @Published var error: String?
     @Published var cloning = false
     @Published var snapshotReady = SupportDir.snapshotReady
-    /// Guest IP by disk. Empty while the machine is off.
+    /// Guest IP by disk. Empty until ARP has this machine's MAC.
     @Published var addresses: [String: String] = [:]
     /// Running clones. The detail view is one machine; this keeps the others alive.
     private var sessions: [String: GuestSession] = [:]
+    private var addressTimer: Timer?
 
     func appear() {
         refresh()
+        armAddressPoll()
         guard machines.isEmpty, !cloning, error == nil, snapshotReady else { return }
         cloneNew()
     }
@@ -93,6 +95,39 @@ final class LibraryModel: ObservableObject {
         }
         if selected == nil || !next.contains(where: { $0.disk == selected }) {
             selected = next.first?.disk
+        }
+    }
+
+    /// ARP is not ready at boot. Ask again for every machine, not only the one on screen.
+    private func armAddressPoll() {
+        guard addressTimer == nil else { return }
+        let timer = Timer(timeInterval: 2, repeats: true) { [weak self] _ in
+            self?.pollAddresses()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        addressTimer = timer
+        pollAddresses()
+    }
+
+    /// The IP next to each disk's MAC in `arp -an`. A miss leaves the last address in place.
+    private func pollAddresses() {
+        let disks = machines.map(\.disk)
+        guard !disks.isEmpty else { return }
+        DispatchQueue.global(qos: .utility).async {
+            var found: [(String, String)] = []
+            for disk in disks {
+                if let ip = Guest.addressForMAC(disk: URL(fileURLWithPath: disk)) {
+                    found.append((disk, ip))
+                }
+            }
+            DispatchQueue.main.async {
+                for (disk, ip) in found {
+                    self.setAddress(ip, disk: disk)
+                    if let session = self.sessions[disk], session.address != ip {
+                        session.address = ip
+                    }
+                }
+            }
         }
     }
 

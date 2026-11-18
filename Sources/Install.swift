@@ -552,22 +552,17 @@ final class GuestSession: ObservableObject {
             return
         }
         let path = disk
-        let mac = Guest.lookupMAC(disk: path)
         DispatchQueue.global(qos: .utility).async {
-            // The IP beside this MAC in `arp -an`. The worker is the same lookup if the app binary cannot run arp.
-            // The row is not there at boot. Nil means ask again, not that this MAC has no address.
-            let found = Guest.addressForMAC(disk: path) ?? Worker.guestAddress(disk: path, mac: mac)
+            // The IP beside this MAC in `arp -an`. Re-read the MAC file each pass; the NIC may not exist yet.
+            // `02:...:00` and `2:...:0` are the same row. Nil means ask again.
+            let found = Guest.addressForMAC(disk: path) ?? Worker.guestAddress(disk: path, mac: Guest.lookupMAC(disk: path))
             DispatchQueue.main.async {
                 guard token == self.addressGeneration, self.diskURL == path, !self.stopped, !self.paused else { return }
-                if let found {
-                    if self.address != found {
-                        self.address = found
-                        self.postAddress(found)
-                    }
-                } else if self.address != nil {
-                    self.address = nil
-                    self.postAddress(nil)
+                if let found, self.address != found {
+                    self.address = found
+                    self.postAddress(found)
                 }
+                // A miss is not "no address". ARP drops an idle row. Keep the last IP and ask again.
                 self.armAddressWatch()
             }
         }
