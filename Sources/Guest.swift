@@ -33,9 +33,22 @@ enum Guest {
 
     /// IP in `arp -an` whose MAC short form equals this disk. Nil until that row exists.
     static func ipInARP(disk: URL) -> String? {
+        lookup(disk: disk).ip
+    }
+
+    /// One `arp -an` pull. `note` is a line for the VM log when the IP is still missing.
+    static func lookup(disk: URL) -> (ip: String?, note: String) {
         let want = shortMAC(for: disk)
-        guard !want.isEmpty, let text = arpTable() else { return nil }
-        return ip(in: text, shortMAC: want)
+        guard !want.isEmpty else { return (nil, "no MAC for this disk") }
+        guard let text = arpTable() else { return (nil, "arp -an failed for \(want)") }
+        if let ip = ip(in: text, shortMAC: want) {
+            return (ip, "arp \(want) -> \(ip)")
+        }
+        let rows = text.split(whereSeparator: \.isNewline).map(String.init).filter { !$0.isEmpty }
+        if rows.isEmpty { return (nil, "arp -an empty; waiting for \(want)") }
+        let shown = rows.prefix(6).joined(separator: " | ")
+        let more = rows.count > 6 ? " | +\(rows.count - 6)" : ""
+        return (nil, "no row for \(want); \(shown)\(more)")
     }
 
     /// `? (192.168.64.51) at 2:56:4d:4d:a0:0 on bridge100 ifscope [bridge]`

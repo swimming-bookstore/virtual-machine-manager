@@ -150,19 +150,27 @@ struct Install: View {
 
     /// Under the screen, not in the toolbar. A toolbar label collapses into the overflow menu.
     /// The row stays even before the address is known, so it is not clipped away with the guest.
-    /// The MAC is the one we match in ARP. Compare it with `arp -an` when the IP stays empty.
+    /// The MAC is the one we match in ARP. The log is this VM's last `arp -an` checks.
     private var guestIPRow: some View {
-        HStack(spacing: 8) {
-            Text("Guest IP")
-                .foregroundStyle(.secondary)
-            Text(addressText)
-                .font(.body.monospaced())
-                .textSelection(.enabled)
-            Spacer(minLength: 12)
-            Text(macText.isEmpty ? "" : "MAC \(macText)")
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                Text("Guest IP")
+                    .foregroundStyle(.secondary)
+                Text(addressText)
+                    .font(.body.monospaced())
+                    .textSelection(.enabled)
+                Spacer(minLength: 12)
+                Text(macText.isEmpty ? "" : "MAC \(macText)")
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+            }
+            Text(guest.log.isEmpty ? "ARP log" : guest.log)
                 .font(.caption.monospaced())
                 .foregroundStyle(.secondary)
                 .textSelection(.enabled)
+                .lineLimit(5)
+                .frame(maxWidth: .infinity, minHeight: 32, alignment: .topLeading)
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 8)
@@ -480,8 +488,10 @@ final class GuestSession: ObservableObject {
     @Published var paused = false
     /// Last guest frame at pause. Shown while the machine is stopped.
     @Published var pausePreview: NSImage?
-    /// NAT address for this disk. Empty until the guest reports it, the way UTM waits for the guest agent.
+    /// NAT address for this disk. Empty until ARP has this disk's MAC.
     @Published var address: String?
+    /// Last ARP checks for this VM. Shown under Guest IP when the address stays on Looking up.
+    @Published var log = ""
     /// Quick start passes its own list. A clone keeps the rows on this session.
     var steps: Binding<[WizardStep]>?
     let view = InstallScreen()
@@ -550,20 +560,31 @@ final class GuestSession: ObservableObject {
                 address = nil
                 postAddress(nil)
             }
+            if diskURL == nil {
+                note("no disk yet")
+            } else if !fromSnapshotBoot {
+                note("not a clone")
+            } else if stopped {
+                note("stopped")
+            } else if paused {
+                note("paused")
+            }
             return
         }
+        note("polling arp -an")
         let timer = Timer(timeInterval: 1, repeats: true) { [weak self] timer in
             guard let self, !self.stopped, !self.paused, let disk = self.diskURL else {
                 timer.invalidate()
                 return
             }
             DispatchQueue.global(qos: .utility).async {
-                let found = Guest.ipInARP(disk: disk)
+                let found = Guest.lookup(disk: disk)
                 DispatchQueue.main.async {
                     guard !self.stopped, !self.paused, self.diskURL == disk else { return }
-                    guard let found, self.address != found else { return }
-                    self.address = found
-                    self.postAddress(found)
+                    self.note(found.note)
+                    guard let ip = found.ip, self.address != ip else { return }
+                    self.address = ip
+                    self.postAddress(ip)
                 }
             }
         }
@@ -571,6 +592,21 @@ final class GuestSession: ObservableObject {
         arpPoll = timer
         timer.fire()
     }
+
+    /// Keep the last few ARP lines. Repeating the same miss does not grow the box.
+    private func note(_ line: String) {
+        let stamp = Self.logStamp.string(from: Date())
+        let row = "\(stamp) \(line)"
+        if log.split(separator: "\n").last == Substring(row) { return }
+        let kept = log.split(separator: "\n", omittingEmptySubsequences: false).suffix(4)
+        log = (kept + [Substring(row)]).joined(separator: "\n")
+    }
+
+    private static let logStamp: DateFormatter = {
+        let stamp = DateFormatter()
+        stamp.dateFormat = "HH:mm:ss"
+        return stamp
+    }()
 
     /// The library list shows this. It does not own the guest session.
     private func postAddress(_ address: String?) {
@@ -659,6 +695,7 @@ final class GuestSession: ObservableObject {
         diskURL = URL(fileURLWithPath: path)
         stopped = false
         error = nil
+        note("start")
         // The snapshot is the artifact. Do not boot it just to check SSH again.
         if !fromSnapshotBoot && SupportDir.snapshotReady {
             holdFinished(path)
@@ -1222,6 +1259,7 @@ final class GuestSession: ObservableObject {
         } catch {
             stopped = true
             fail(error.localizedDescription)
+            note("boot failed")
         }
     }
 
@@ -1229,6 +1267,7 @@ final class GuestSession: ObservableObject {
         guard token == generation, machine != nil else { return }
         if let message {
             stopped = true
+            note("start failed: \(message)")
             if checking, !leaving, !snapshotReady {
                 retrySSH()
             } else {
