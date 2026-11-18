@@ -143,9 +143,9 @@ struct Install: View {
                     .disabled(guest.stopped && !guest.paused)
             }
         }
-        .onChange(of: guest.stopped) { _, _ in guest.refreshAddress() }
-        .onChange(of: guest.paused) { _, _ in guest.refreshAddress() }
-        .onAppear { guest.refreshAddress() }
+        .onChange(of: guest.stopped) { _, _ in guest.watchARP() }
+        .onChange(of: guest.paused) { _, _ in guest.watchARP() }
+        .onAppear { guest.watchARP() }
     }
 
     /// Under the screen, not in the toolbar. A toolbar label collapses into the overflow menu.
@@ -182,7 +182,7 @@ struct Install: View {
     /// Attachment MAC for this disk. Empty until the window has a disk path.
     private var macText: String {
         guard !disk.isEmpty else { return "" }
-        let mac = Guest.arpMAC(disk: URL(fileURLWithPath: disk))
+        let mac = Guest.shortMAC(for: URL(fileURLWithPath: disk))
         return mac.isEmpty ? "" : mac
     }
 
@@ -497,8 +497,8 @@ final class GuestSession: ObservableObject {
     private var checking = false
     private var saved = false
     private var watch: Timer?
-    private var addressWatch: Timer?
-    private var addressGeneration = 0
+    /// After Start, pull `arp -an` until this disk's short MAC is in the table.
+    private var arpPoll: Timer?
     private var probing = false
     private var savingSnapshot = false
     /// Boots of the installed disk while Verify with host key has not logged in. A quit used to leave that row waiting.
@@ -540,32 +540,36 @@ final class GuestSession: ObservableObject {
         }
     }
 
-    /// The first pass is not enough. Apple writes the ARP row after the guest answers DHCP.
-    func refreshAddress() {
-        addressWatch?.invalidate()
-        addressWatch = nil
-        addressGeneration += 1
-        let token = addressGeneration
-        guard fromSnapshotBoot, !stopped, !paused, let disk = diskURL else {
-            address = nil
-            postAddress(nil)
+    /// After the VM is running, pull `arp -an` until the short MAC matches a row.
+    /// `02:56:4d:4d:a0:00` matches `2:56:4d:4d:a0:0`. Stop clears the address.
+    func watchARP() {
+        arpPoll?.invalidate()
+        arpPoll = nil
+        guard fromSnapshotBoot, !stopped, !paused, diskURL != nil else {
+            if stopped || paused {
+                address = nil
+                postAddress(nil)
+            }
             return
         }
-        let path = disk
-        DispatchQueue.global(qos: .utility).async {
-            // The IP beside this MAC in `arp -an`. Re-read the MAC file each pass; the NIC may not exist yet.
-            // `02:...:00` and `2:...:0` are the same row. Nil means ask again.
-            let found = Guest.addressForMAC(disk: path) ?? Worker.guestAddress(disk: path, mac: Guest.lookupMAC(disk: path))
-            DispatchQueue.main.async {
-                guard token == self.addressGeneration, self.diskURL == path, !self.stopped, !self.paused else { return }
-                if let found, self.address != found {
+        let timer = Timer(timeInterval: 1, repeats: true) { [weak self] timer in
+            guard let self, !self.stopped, !self.paused, let disk = self.diskURL else {
+                timer.invalidate()
+                return
+            }
+            DispatchQueue.global(qos: .utility).async {
+                let found = Guest.ipInARP(disk: disk)
+                DispatchQueue.main.async {
+                    guard !self.stopped, !self.paused, self.diskURL == disk else { return }
+                    guard let found, self.address != found else { return }
                     self.address = found
                     self.postAddress(found)
                 }
-                // A miss is not "no address". ARP drops an idle row. Keep the last IP and ask again.
-                self.armAddressWatch()
             }
         }
+        RunLoop.main.add(timer, forMode: .common)
+        arpPoll = timer
+        timer.fire()
     }
 
     /// The library list shows this. It does not own the guest session.
@@ -584,19 +588,6 @@ final class GuestSession: ObservableObject {
         )
     }
 
-    /// Apple writes the ARP row after the guest answers DHCP. Two seconds is not always enough.
-    /// Keep the same MAC and ask again until Stop. A miss stays "Looking up…".
-    private func armAddressWatch() {
-        guard !stopped, !paused else { return }
-        addressWatch?.invalidate()
-        let wait: TimeInterval = address == nil ? 5 : 10
-        let timer = Timer(timeInterval: wait, repeats: false) { [weak self] _ in
-            self?.refreshAddress()
-        }
-        RunLoop.main.add(timer, forMode: .common)
-        addressWatch = timer
-    }
-
     /// A clone stays off until Start. A pause save is restored then, not on open.
     func holdClone(_ path: String) {
         if started && !stopped { return }
@@ -610,7 +601,7 @@ final class GuestSession: ObservableObject {
         paused = GuestPause.isPaused(beside: diskURL!)
         pausePreview = paused ? NSImage(contentsOf: GuestPause.preview(beside: diskURL!)) : nil
         headline = paused ? "Debian is paused." : "Debian is stopped. The guest disk is the installed system."
-        refreshAddress()
+        watchARP()
     }
 
     /// Quick start came back after the snapshot. Do not start the installer virtual machine.
@@ -784,7 +775,7 @@ final class GuestSession: ObservableObject {
                 self.stopped = false
                 self.headline = "Debian is running from the guest disk."
                 self.publishLibrary()
-                self.refreshAddress()
+                self.watchARP()
             }
         }
     }
@@ -857,10 +848,10 @@ final class GuestSession: ObservableObject {
         probing = false
         watch?.invalidate()
         watch = nil
-        refreshAddress()
         // The host-key login is still running. Kill it, or the next open stays on Verify with host key.
         GuestSSH.stop()
         stopped = true
+        watchARP()
         let running = machine
         dropMachine()
         running?.stop { _ in }
@@ -874,7 +865,7 @@ final class GuestSession: ObservableObject {
         watch = nil
         stopped = true
         headline = "Debian stopped. The guest disk is the installed system."
-        refreshAddress()
+        watchARP()
         let running = machine
         dropMachine()
         running?.stop { _ in }
@@ -990,7 +981,7 @@ final class GuestSession: ObservableObject {
                     pane.show(self.pausePreview)
                 }
                 self.headline = "Debian is paused."
-                self.refreshAddress()
+                self.watchARP()
                 self.publishLibrary()
                 // A visible still can cover the guest. Without one, keep the paused machine so Metal still shows the last frame.
                 if self.pausePreview != nil {
@@ -1255,7 +1246,7 @@ final class GuestSession: ObservableObject {
                 markSetup("ssh", state: "now")
             } else {
                 headline = "Debian is running from the guest disk."
-                refreshAddress()
+                watchARP()
             }
             // start() can report success before state becomes .running. Probe from here.
             // A saved snapshot is the artifact. Do not probe it again.

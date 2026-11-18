@@ -398,28 +398,6 @@ enum Worker {
 
     /// One SSH attempt in the worker. A closed port is not a finished install.
     /// `cancel` is set when the app closes so a scan cannot keep the next open on "Checking SSH".
-    /// The address the guest has in ARP for this disk's MAC. Empty until that row appears.
-    /// `mac` is this disk's attachment address.
-    static func guestAddress(disk: URL, mac: String) -> String? {
-        var args = ["address", "--disk", disk.path]
-        if !mac.isEmpty { args += ["--mac", mac] }
-        let (code, text) = run(args)
-        guard code == 0, let host = message(text), isGuestIP(host) else { return nil }
-        return host
-    }
-
-    /// Not this Mac. `.1` is the gateway. `.2` on a vmnet shared network is this Mac as well
-    /// (`192.168.64.2` on the first bridge, `192.168.65.2` when `.1` was already taken).
-    static func isGuestIP(_ host: String) -> Bool {
-        let parts = host.split(separator: ".")
-        guard parts.count == 4,
-              let a = Int(parts[0]), let b = Int(parts[1]),
-              let c = Int(parts[2]), let d = Int(parts[3]) else { return false }
-        if a == 0 || a == 127 || a >= 224 || d == 0 || d == 1 || d == 255 { return false }
-        if a == 192 && b == 168 && c >= 64 && (d == 1 || d == 2) { return false }
-        return true
-    }
-
     static func probe(disk: URL, cancel: @escaping () -> Bool) -> Bool {
         guard let url = WorkerPath.url() else { return false }
         let process = Process()

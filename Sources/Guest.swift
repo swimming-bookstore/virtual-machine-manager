@@ -26,69 +26,76 @@ enum Guest {
         return String(format: "02:56:4d:4d:%02x:%02x", UInt8(sum >> 8), UInt8(truncatingIfNeeded: sum))
     }
 
-    /// The MAC the attachment wrote, or the stable address for this disk when that file is missing.
-    static func lookupMAC(disk: URL) -> String {
-        normalizeMAC(assignedMAC(disk: disk) ?? macString(for: disk))
+    /// Short form `arp -an` prints. `02:56:4d:4d:a0:00` is `2:56:4d:4d:a0:0`.
+    static func shortMAC(for disk: URL) -> String {
+        shortMAC(assignedMAC(disk: disk) ?? macString(for: disk))
     }
 
-    /// How `arp -an` prints it. `02:56:4d:4d:a0:00` is `2:56:4d:4d:a0:0` in that table.
-    static func arpMAC(disk: URL) -> String {
-        arpForm(lookupMAC(disk: disk))
-    }
-
-    /// IP beside this disk's MAC in live `arp -an`. Nil until that row exists.
-    /// `? (192.168.64.51) at 2:56:4d:4d:a0:0 on bridge100 ifscope [bridge]` is `.51`.
-    static func addressForMAC(disk: URL) -> String? {
-        let want = lookupMAC(disk: disk)
-        guard !want.isEmpty else { return nil }
-        for path in ["/usr/sbin/arp", "/usr/bin/arp", "/sbin/arp"] {
-            guard let text = commandText(path, ["-an"]) else { continue }
-            if let host = ip(for: want, in: text) { return host }
-        }
-        return nil
+    /// IP in `arp -an` whose MAC short form equals this disk. Nil until that row exists.
+    static func ipInARP(disk: URL) -> String? {
+        let want = shortMAC(for: disk)
+        guard !want.isEmpty, let text = arpTable() else { return nil }
+        return ip(in: text, shortMAC: want)
     }
 
     /// `? (192.168.64.51) at 2:56:4d:4d:a0:0 on bridge100 ifscope [bridge]`
-    /// Compare the unpadded form. `02:...:00` and `2:...:0` are the same address.
-    private static func ip(for want: String, in text: String) -> String? {
-        let needle = arpForm(want)
-        guard !needle.isEmpty else { return nil }
+    static func ip(in arp: String, shortMAC want: String) -> String? {
+        let want = shortMAC(want)
+        guard !want.isEmpty else { return nil }
         var found: String?
-        for raw in text.split(whereSeparator: \.isNewline) {
+        for raw in arp.split(whereSeparator: \.isNewline) {
             let line = String(raw)
-            guard let open = line.firstIndex(of: "("),
-                  let close = line[line.index(after: open)...].firstIndex(of: ")"),
-                  open < close else { continue }
-            let host = String(line[line.index(after: open)..<close])
-            guard isGuestIP(host) else { continue }
-            guard line.split(whereSeparator: \.isWhitespace).contains(where: { arpForm(String($0)) == needle }) else { continue }
-            found = host
+            guard let host = ipv4(in: line), hostIsGuest(host) else { continue }
+            let hit = line.split(whereSeparator: \.isWhitespace).contains { shortMAC(String($0)) == want }
+            if hit { found = host }
         }
         return found
     }
 
-    /// Drop leading zeros so the MAC on screen is the token in `arp -an`.
-    private static func arpForm(_ text: String) -> String {
-        let padded = normalizeMAC(text)
-        guard !padded.isEmpty else { return "" }
-        return padded.split(separator: ":").map { octet in
-            let trimmed = octet.drop { $0 == "0" }
-            return trimmed.isEmpty ? "0" : String(trimmed)
-        }.joined(separator: ":")
+    static func shortMAC(_ text: String) -> String {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let token = trimmed.split(whereSeparator: \.isWhitespace).first.map(String.init) ?? trimmed
+        let body = token.split(separator: ",").last.map(String.init) ?? token
+        var parts = body.split { $0 == ":" || $0 == "-" }.map { String($0.filter(\.isHexDigit)) }
+        if parts.count == 7 { parts.removeFirst() }
+        guard parts.count == 6 else { return "" }
+        var octets: [String] = []
+        for part in parts {
+            guard let value = UInt8(part, radix: 16) else { return "" }
+            octets.append(String(value, radix: 16))
+        }
+        return octets.joined(separator: ":")
+    }
+
+    private static func arpTable() -> String? {
+        for path in ["/usr/sbin/arp", "/usr/bin/arp", "/sbin/arp"] {
+            if let text = run(path, ["-an"]), !text.isEmpty { return text }
+        }
+        return run("/bin/sh", ["-c", "arp -an"])
+    }
+
+    private static func ipv4(in line: String) -> String? {
+        guard let open = line.firstIndex(of: "("),
+              let close = line[line.index(after: open)...].firstIndex(of: ")"),
+              open < close else { return nil }
+        let host = String(line[line.index(after: open)..<close])
+        let parts = host.split(separator: ".")
+        guard parts.count == 4, parts.allSatisfy({ Int($0) != nil }) else { return nil }
+        return host
     }
 
     /// Not this Mac. `.1` and `.2` on a vmnet shared network are the host.
-    private static func isGuestIP(_ host: String) -> Bool {
+    private static func hostIsGuest(_ host: String) -> Bool {
         let parts = host.split(separator: ".")
         guard parts.count == 4,
-              let a = Int(parts[0]), let b = Int(parts[1]),
-              let c = Int(parts[2]), let d = Int(parts[3]) else { return false }
-        if a == 0 || a == 127 || a >= 224 || d == 0 || d == 1 || d == 255 { return false }
+              let a = Int(parts[0]), let c = Int(parts[2]), let d = Int(parts[3]),
+              let b = Int(parts[1]) else { return false }
+        if a == 0 || a == 127 || a >= 224 || d == 0 || d == 255 { return false }
         if a == 192 && b == 168 && c >= 64 && (d == 1 || d == 2) { return false }
         return true
     }
 
-    private static func commandText(_ path: String, _ args: [String]) -> String? {
+    private static func run(_ path: String, _ args: [String]) -> String? {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: path)
         process.arguments = args
@@ -100,30 +107,6 @@ enum Guest {
         let data = out.fileHandleForReading.readDataToEndOfFile()
         guard !data.isEmpty else { return nil }
         return String(data: data, encoding: .utf8) ?? String(data: data, encoding: .isoLatin1)
-    }
-
-    private static func normalizeMAC(_ text: String) -> String {
-        let raw = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        let body = raw.split(separator: ",").last.map { $0.trimmingCharacters(in: .whitespaces) } ?? raw
-        let token = body.split(whereSeparator: \.isWhitespace).first.map(String.init) ?? body
-        let parts = token.split { $0 == ":" || $0 == "-" }.map(String.init)
-        var octets = parts
-        if octets.count == 7, let kind = UInt8(octets[0], radix: 16), kind <= 1 {
-            octets.removeFirst()
-        }
-        guard octets.count == 6 else { return "" }
-        var bytes: [String] = []
-        for part in octets {
-            guard let value = UInt8(hexOctet(part), radix: 16) else { return "" }
-            bytes.append(String(format: "%02x", value))
-        }
-        return bytes.joined(separator: ":")
-    }
-
-    /// `arp` may leave a comma or bracket on the last octet. Only the hex counts.
-    private static func hexOctet(_ part: String) -> String {
-        let body = part.drop { !$0.isHexDigit }
-        return String(body.prefix { $0.isHexDigit })
     }
 
     private static var assigned: [String: String] = [:]

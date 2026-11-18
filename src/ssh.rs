@@ -178,26 +178,55 @@ fn arp_guests() -> Vec<(String, String)> {
     parse_arp(&arp_output())
 }
 
-/// Guest IP for this disk. The caller polls. Each machine has its own MAC, and ARP has the IP for that MAC.
-/// The row may be on `bridge100` or another interface. Match the MAC, not the interface name.
+/// Guest IP for this disk. The caller polls. Match the short MAC `arp -an` prints.
+/// `02:56:4d:4d:a0:00` is `2:56:4d:4d:a0:0` in `? (192.168.64.51) at 2:56:4d:4d:a0:0 on bridge100`.
 pub fn guest_address(disk: &Path, mac: Option<&str>) -> Option<String> {
     let wants = macs_for(disk, mac);
     if wants.is_empty() {
         return None;
     }
-    let text = net_text("VMM_ARP", arp_output);
-    let gateways = host_gateways(&net_text("VMM_IFCONFIG", ifconfig_text));
-    mac_in_arp(&wants, &text, &gateways)
+    ip_for_short_mac(&wants, &net_text("VMM_ARP", arp_output))
 }
 
-/// Any ARP row for this disk's MAC, except the host gateway. Interface name is not part of the match.
-fn mac_in_arp(wants: &[String], text: &str, gateways: &HashSet<String>) -> Option<String> {
-    let rows: Vec<(String, String)> = arp_rows(text)
-        .into_iter()
-        .filter(|(host, mac, _)| !mac.is_empty() && !gateways.contains(host) && !host_side(host))
-        .map(|(host, mac, _)| (host, mac))
-        .collect();
-    live_match(wants, &rows)
+/// The IP whose short MAC equals this disk. The interface name is not part of the match.
+fn ip_for_short_mac(wants: &[String], text: &str) -> Option<String> {
+    let shorts: Vec<String> = wants.iter().map(|mac| short_mac(mac)).filter(|mac| !mac.is_empty()).collect();
+    if shorts.is_empty() {
+        return None;
+    }
+    let mut found = None;
+    for line in text.lines() {
+        let Some((host, mac, _)) = arp_row(line) else {
+            continue;
+        };
+        if mac.is_empty() || host_side(&host) || !usable_ipv4(&host) {
+            continue;
+        }
+        if shorts.iter().any(|want| want == &short_mac(&mac)) {
+            found = Some(host.clone());
+            if host.starts_with("192.168.") {
+                return found;
+            }
+        }
+    }
+    found
+}
+
+/// `arp -an` drops leading zeros. `02:56:4d:4d:a0:00` and `2:56:4d:4d:a0:0` are the same NIC.
+fn short_mac(mac: &str) -> String {
+    normalize_mac(mac)
+        .split(':')
+        .filter(|part| !part.is_empty())
+        .map(|octet| {
+            let trimmed = octet.trim_start_matches('0');
+            if trimmed.is_empty() {
+                "0".to_string()
+            } else {
+                trimmed.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(":")
 }
 
 fn macs_for(disk: &Path, mac: Option<&str>) -> Vec<String> {
@@ -215,16 +244,6 @@ fn macs_for(disk: &Path, mac: Option<&str>) -> Vec<String> {
         wants.push(computed);
     }
     wants
-}
-
-/// ARP is the live address. A lease for the same MAC is not used while ARP already has it.
-fn live_match(wants: &[String], arp: &[(String, String)]) -> Option<String> {
-    for want in wants {
-        if let Some(host) = address_for_mac(want, arp) {
-            return Some(host);
-        }
-    }
-    None
 }
 
 /// Addresses on vmnet bridges, plus the other host address on that subnet.
@@ -386,43 +405,6 @@ fn usable_ipv4(host: &str) -> bool {
         return false;
     };
     parts.next().is_none() && a != 0 && a != 127 && a < 224 && d != 0 && d != 1 && d != 255
-}
-
-fn address_for_mac(want: &str, arp: &[(String, String)]) -> Option<String> {
-    let want = normalize_mac(want);
-    if want.is_empty() {
-        return None;
-    }
-    // `2:56:4d:4d:a0:0` and `02:56:4d:4d:a0:00` are the same NIC.
-    let matched: Vec<&(String, String)> = arp
-        .iter()
-        .filter(|(_, seen)| normalize_mac(seen) == want)
-        .collect();
-    // The current grant is last. A later en0 row is not this guest when a vmnet address is present.
-    matched
-        .iter()
-        .rev()
-        .find(|(host, _)| nat_guest(host))
-        .or_else(|| matched.last())
-        .map(|(host, _)| (*host).clone())
-}
-
-/// A vmnet shared-network address. `192.168.64.51` is one. `10.0.0.2` on en0 is not.
-fn nat_guest(host: &str) -> bool {
-    let mut parts = host.split('.');
-    let Some(a) = parts.next() else {
-        return false;
-    };
-    let Some(b) = parts.next() else {
-        return false;
-    };
-    let Some(c) = parts.next().and_then(|part| part.parse::<u8>().ok()) else {
-        return false;
-    };
-    let Some(d) = parts.next().and_then(|part| part.parse::<u8>().ok()) else {
-        return false;
-    };
-    parts.next().is_none() && a == "192" && b == "168" && c >= 64 && d != 1 && d != 2
 }
 
 /// Tests pass `VMM_ARP` and `VMM_IFCONFIG`. The app leaves them unset.
@@ -608,54 +590,50 @@ mod tests {
         );
         let mac = "02:56:4d:4d:09:35";
         assert_eq!(
-            address_for_mac(mac, &parse_arp(text)),
+            ip_for_short_mac(&[mac.into()], text),
             Some("192.168.64.7".into())
         );
-        assert_eq!(address_for_mac(mac, &[]), None);
+        assert_eq!(ip_for_short_mac(&[mac.into()], ""), None);
         let guest = "\
 ? (192.168.64.1) at aa:bb:cc:dd:ee:ff on bridge100
 ? (192.168.64.2) at bb:bb:cc:dd:ee:ff on bridge100
 ? (192.168.64.51) at 02:56:4d:4d:09:35 on bridge100
 ";
         assert_eq!(
-            address_for_mac("02:56:4d:4d:09:35", &parse_arp(guest)),
-            Some("192.168.64.51".into())
-        );
-        let moved = vec![
-            ("192.168.64.3".into(), "02:56:4d:4d:09:35".into()),
-            ("192.168.64.51".into(), "02:56:4d:4d:09:35".into()),
-        ];
-        assert_eq!(
-            address_for_mac("02:56:4d:4d:09:35", &moved),
+            ip_for_short_mac(&["02:56:4d:4d:09:35".into()], guest),
             Some("192.168.64.51".into())
         );
         assert_eq!(normalize_mac("1,01:02:56:4d:4d:09:35"), "02:56:4d:4d:09:35");
-        assert_eq!(normalize_mac("2:56:4d:4d:a0:0"), "02:56:4d:4d:a0:00");
+        assert_eq!(short_mac("2:56:4d:4d:a0:0"), "2:56:4d:4d:a0:0");
+        assert_eq!(short_mac("02:56:4d:4d:a0:00"), "2:56:4d:4d:a0:0");
         assert_eq!(
-            address_for_mac(
-                "02:56:4d:4d:a0:00",
-                &parse_arp("? (192.168.64.51) at 2:56:4d:4d:a0:0 on bridge100 ifscope [bridge]\n")
+            ip_for_short_mac(
+                &["02:56:4d:4d:a0:00".into()],
+                "? (192.168.64.51) at 2:56:4d:4d:a0:0 on bridge100 ifscope [bridge]\n"
             ),
             Some("192.168.64.51".into())
         );
         assert_eq!(
-            address_for_mac(
-                "02:56:4d:4d:09:00",
-                &parse_arp("? (192.168.64.8) at 2:56:4d:4d:9:0 on bridge100\n")
+            ip_for_short_mac(
+                &["02:56:4d:4d:09:00".into()],
+                "? (192.168.64.8) at 2:56:4d:4d:9:0 on bridge100\n"
             ),
             Some("192.168.64.8".into())
         );
         let bridge100 = "? (192.168.64.51) at 2:56:4d:4d:9:35 on bridge100 ifscope [bridge]\n";
         assert_eq!(
-            address_for_mac("02:56:4d:4d:09:35", &parse_arp(bridge100)),
+            ip_for_short_mac(&["02:56:4d:4d:09:35".into()], bridge100),
             Some("192.168.64.51".into())
         );
         let en0 = "? (192.168.64.51) at 2:56:4d:4d:9:35 on en0 ifscope [ethernet]\n";
         assert_eq!(
-            mac_in_arp(
-                &["02:56:4d:4d:09:35".into()],
-                en0,
-                &HashSet::new()
+            ip_for_short_mac(&["02:56:4d:4d:09:35".into()], en0),
+            Some("192.168.64.51".into())
+        );
+        assert_eq!(
+            ip_for_short_mac(
+                &["02:56:4d:4d:a0:00".into()],
+                "? (192.168.64.51) at 2:56:4d:4d:a0:0 on bridge100 ifscope [bridge]\n"
             ),
             Some("192.168.64.51".into())
         );
