@@ -2,8 +2,84 @@
 # Why Guest IP says "no ARP row". Run this on the Mac while the guest is up:
 #   ./debug-arp.sh
 set -eu
+set -f
 cd "$(dirname "$0")"
 SUP="${HOME}/Library/Application Support/virtual-machine-manager"
+
+# Compare the way the app does: lowercase, six octets, leading zeros. No awk.
+norm_mac() {
+  token=$(printf '%s' "$1" | tr 'A-F' 'a-f' | tr '-' ':')
+  token=${token##*,}
+  token=${token%% *}
+  old_ifs=$IFS
+  IFS=:
+  # shellcheck disable=SC2086
+  set -- $token
+  IFS=$old_ifs
+  if [ "$#" -eq 7 ]; then
+    shift
+  fi
+  if [ "$#" -ne 6 ]; then
+    return 1
+  fi
+  out=""
+  for part in "$@"; do
+    part=$(printf '%s' "$part" | tr -cd '0-9a-f')
+    case "$part" in
+      [0-9a-f]) part="0$part" ;;
+      [0-9a-f][0-9a-f]) ;;
+      *) return 1 ;;
+    esac
+    if [ -z "$out" ]; then
+      out=$part
+    else
+      out="$out:$part"
+    fi
+  done
+  printf '%s\n' "$out"
+}
+wanted() {
+  for item in $macs; do
+    seen=$(norm_mac "$item" || true)
+    if [ -n "$seen" ] && [ "$seen" = "$1" ]; then
+      return 0
+    fi
+  done
+  return 1
+}
+# Four dotted numbers. Sets a b c d.
+split4() {
+  old_ifs=$IFS
+  IFS=.
+  # shellcheck disable=SC2086
+  set -- $1
+  IFS=$old_ifs
+  if [ "$#" -ne 4 ]; then
+    return 1
+  fi
+  a=$1 b=$2 c=$3 d=$4
+  case "$a$b$c$d" in
+    *[!0-9]*) return 1 ;;
+  esac
+  return 0
+}
+host_side() {
+  split4 "$1" || return 1
+  [ "$a" = 192 ] && [ "$b" = 168 ] && [ "$c" -ge 64 ] && { [ "$d" = 1 ] || [ "$d" = 2 ]; }
+}
+usable() {
+  split4 "$1" || return 1
+  [ "$a" -ne 0 ] && [ "$a" -ne 127 ] && [ "$a" -lt 224 ] && [ "$d" -ne 0 ] && [ "$d" -ne 1 ] && [ "$d" -ne 255 ]
+}
+# Count colon-separated pieces. 6 or 7 is a MAC token.
+colon_count() {
+  old_ifs=$IFS
+  IFS=:
+  # shellcheck disable=SC2086
+  set -- $1
+  IFS=$old_ifs
+  echo "$#"
+}
 
 echo "=== mac files (what the app matches) ==="
 macs=""
@@ -28,7 +104,8 @@ fi
 
 echo
 echo "=== $ARPBIN -an ==="
-"$ARPBIN" -an || true
+arptext=$("$ARPBIN" -an 2>&1 || true)
+printf '%s\n' "$arptext"
 
 echo
 echo "=== bridge addresses (.1 and .2 are this Mac) ==="
@@ -39,96 +116,65 @@ ifconfig -a 2>/dev/null | awk '
 
 echo
 echo "=== why each ARP row is kept or dropped ==="
-"$ARPBIN" -an | awk -v macs="$macs" '
-BEGIN {
-  n = split(macs, line, " ")
-  for (i = 1; i <= n; i++) {
-    m = norm(line[i])
-    if (m != "") print "match MAC  " m
-  }
-}
-function hexval(s,    i, c, v, h) {
-  h = "0123456789abcdef"
-  v = 0
-  for (i = 1; i <= length(s); i++) {
-    c = index(h, substr(s, i, 1))
-    if (c == 0) return -1
-    v = v * 16 + c - 1
-  }
-  return v
-}
-function norm(token,    n, i, start, parts, v, piece, out) {
-  token = tolower(token)
-  n = split(token, parts, ":")
-  if (n == 7) start = 2
-  else if (n == 6) start = 1
-  else return ""
-  out = ""
-  for (i = start; i <= n; i++) {
-    gsub(/[^0-9a-f]/, "", parts[i])
-    v = hexval(parts[i])
-    if (v < 0 || v > 255 || length(parts[i]) == 0) return ""
-    piece = sprintf("%02x", v)
-    out = (out == "" ? piece : out ":" piece)
-  }
-  return out
-}
-function wanted(mac,    i, n, line) {
-  n = split(macs, line, " ")
-  for (i = 1; i <= n; i++) {
-    if (mac != "" && norm(line[i]) == mac) return 1
-  }
-  return 0
-}
-function host_side(host,    n, p) {
-  n = split(host, p, ".")
-  if (n != 4) return 0
-  if (p[1] != 192 || p[2] != 168) return 0
-  if (p[3] + 0 < 64) return 0
-  return (p[4] == 1 || p[4] == 2)
-}
-function usable(host,    n, p) {
-  n = split(host, p, ".")
-  if (n != 4) return 0
-  if (p[1] + 0 == 0 || p[1] + 0 == 127 || p[1] + 0 >= 224) return 0
-  if (p[4] + 0 == 0 || p[4] + 0 == 1 || p[4] + 0 == 255) return 0
-  return 1
-}
-{
-  if ($0 ~ /incomplete/) {
-    print "DROP  incomplete (no MAC yet)  " $0
-    next
-  }
-  host = ""
-  if (match($0, /\([^)]+\)/)) host = substr($0, RSTART + 1, RLENGTH - 2)
-  mac = ""
-  for (i = 1; i <= NF; i++) {
-    n = split($i, p, ":")
-    if (n == 6 || n == 7) { mac = norm($i); break }
-  }
-  if (host == "" || mac == "") {
-    print "DROP  unparsed  " $0
-    next
-  }
-  if (host_side(host)) {
-    print "DROP  this Mac (.1 or .2)  " host "  " mac
-    next
-  }
-  if (!usable(host)) {
-    print "DROP  not a guest IP  " host "  " mac
-    next
-  }
-  if (wanted(mac)) {
-    keep++
-    print "KEEP  " host "  " mac
-  } else {
-    print "DROP  MAC is not in a mac file  " host "  " mac
-  }
-}
-END {
-  if (keep == 0) print "KEEP  (none) — this is the app log \"no ARP row\""
-}
-' || echo "awk failed; the worker check below still runs"
+echo "match MACs (files only, not ARP):"
+for item in $macs; do
+  seen=$(norm_mac "$item" || true)
+  echo "  $item -> ${seen:-unparsed}"
+done
+# Shell, not awk. macOS awk printed the match MACs and then no rows.
+keep=0
+rows=0
+while IFS= read -r line || [ -n "$line" ]; do
+  if [ -z "$line" ]; then
+    continue
+  fi
+  rows=$((rows + 1))
+  case "$line" in
+    *incomplete*)
+      echo "DROP  incomplete (no MAC yet)  $line"
+      continue
+      ;;
+  esac
+  echo "ROW  $line"
+  host=${line#*(}
+  host=${host%%)*}
+  if [ "$host" = "$line" ]; then
+    host=""
+  fi
+  mac=""
+  for word in $line; do
+    n=$(colon_count "$word")
+    if [ "$n" -eq 6 ] || [ "$n" -eq 7 ]; then
+      mac=$word
+      break
+    fi
+  done
+  mac=$(norm_mac "$mac" || true)
+  if [ -z "$host" ] || [ -z "$mac" ]; then
+    echo "DROP  unparsed  $line"
+    continue
+  fi
+  if host_side "$host"; then
+    echo "DROP  this Mac (.1 or .2)  $host  $mac"
+    continue
+  fi
+  if ! usable "$host"; then
+    echo "DROP  not a guest IP  $host  $mac"
+    continue
+  fi
+  if wanted "$mac"; then
+    keep=$((keep + 1))
+    echo "KEEP  $host  $mac"
+  else
+    echo "DROP  MAC is not in a mac file  $host  $mac"
+  fi
+done <<EOF
+$arptext
+EOF
+echo "rows: $rows  keep: $keep"
+if [ "$keep" -eq 0 ]; then
+  echo 'KEEP  (none) — this is the app log "no ARP row"'
+fi
 
 echo
 echo "=== worker address (the call the app makes) ==="
