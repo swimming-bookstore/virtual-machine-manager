@@ -3653,6 +3653,10 @@ fn quick_start_swift_gates_the_bar_on_a_real_download() {
     assert!(include_str!("../src/ssh.rs").contains("ConnectTimeout=1"));
     assert!(include_str!("../Sources/QuickStart.swift").contains("terminationHandler"));
     assert!(include_str!("../Sources/QuickStart.swift").contains("[\"ssh\", \"--disk\", disk.path]"));
+    assert!(include_str!("../Sources/QuickStart.swift").contains("[\"address\", \"--disk\", disk.path]"));
+    assert!(include_str!("../Sources/Install.swift").contains("timeInterval: 5"));
+    assert!(include_str!("../src/ssh.rs").contains("sysctl_arp_text"));
+    assert!(include_str!("../src/ssh.rs").contains("lease_text_to_arp"));
     assert!(include_str!("../Sources/Install.swift").contains("watchSSH()"));
     assert!(include_str!("../Sources/Install.swift").contains("A saved snapshot is the artifact"));
     assert!(!include_str!("../Sources/Install.swift").contains("login file was removed"));

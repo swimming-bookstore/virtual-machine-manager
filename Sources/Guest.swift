@@ -31,38 +31,24 @@ enum Guest {
         shortMAC(assignedMAC(disk: disk) ?? macString(for: disk))
     }
 
-    /// IP in `arp -an` whose MAC short form equals this disk. Nil until that row exists.
+    /// IP whose MAC short form equals this disk. Nil until the worker finds that row.
     static func ipInARP(disk: URL) -> String? {
         lookup(disk: disk).ip
     }
 
-    /// One `arp -an` pull. `note` is a line for the VM log when the IP is still missing.
+    /// One worker lookup. `note` is a line for the VM log when the IP is still missing.
     static func lookup(disk: URL) -> (ip: String?, note: String) {
-        let want = shortMAC(for: disk)
+        let mac = assignedMAC(disk: disk) ?? macString(for: disk)
+        let want = shortMAC(mac)
         guard !want.isEmpty else { return (nil, "no MAC for this disk") }
-        guard let text = arpTable() else { return (nil, "arp -an failed for \(want)") }
-        if let ip = ip(in: text, shortMAC: want) {
+        switch Worker.address(disk: disk, mac: mac) {
+        case .found(let ip):
             return (ip, "arp \(want) -> \(ip)")
+        case .missing:
+            return (nil, "waiting for \(want)")
+        case .failed(let message):
+            return (nil, "lookup failed for \(want): \(message)")
         }
-        let rows = text.split(whereSeparator: \.isNewline).map(String.init).filter { !$0.isEmpty }
-        if rows.isEmpty { return (nil, "arp -an empty; waiting for \(want)") }
-        let shown = rows.prefix(6).joined(separator: " | ")
-        let more = rows.count > 6 ? " | +\(rows.count - 6)" : ""
-        return (nil, "no row for \(want); \(shown)\(more)")
-    }
-
-    /// `? (192.168.64.51) at 2:56:4d:4d:a0:0 on bridge100 ifscope [bridge]`
-    static func ip(in arp: String, shortMAC want: String) -> String? {
-        let want = shortMAC(want)
-        guard !want.isEmpty else { return nil }
-        var found: String?
-        for raw in arp.split(whereSeparator: \.isNewline) {
-            let line = String(raw)
-            guard let host = ipv4(in: line), hostIsGuest(host) else { continue }
-            let hit = line.split(whereSeparator: \.isWhitespace).contains { shortMAC(String($0)) == want }
-            if hit { found = host }
-        }
-        return found
     }
 
     static func shortMAC(_ text: String) -> String {
@@ -78,48 +64,6 @@ enum Guest {
             octets.append(String(value, radix: 16))
         }
         return octets.joined(separator: ":")
-    }
-
-    private static func arpTable() -> String? {
-        for path in ["/usr/sbin/arp", "/usr/bin/arp", "/sbin/arp"] {
-            if let text = run(path, ["-an"]), !text.isEmpty { return text }
-        }
-        return run("/bin/sh", ["-c", "arp -an"])
-    }
-
-    private static func ipv4(in line: String) -> String? {
-        guard let open = line.firstIndex(of: "("),
-              let close = line[line.index(after: open)...].firstIndex(of: ")"),
-              open < close else { return nil }
-        let host = String(line[line.index(after: open)..<close])
-        let parts = host.split(separator: ".")
-        guard parts.count == 4, parts.allSatisfy({ Int($0) != nil }) else { return nil }
-        return host
-    }
-
-    /// Not this Mac. `.1` and `.2` on a vmnet shared network are the host.
-    private static func hostIsGuest(_ host: String) -> Bool {
-        let parts = host.split(separator: ".")
-        guard parts.count == 4,
-              let a = Int(parts[0]), let c = Int(parts[2]), let d = Int(parts[3]),
-              let b = Int(parts[1]) else { return false }
-        if a == 0 || a == 127 || a >= 224 || d == 0 || d == 255 { return false }
-        if a == 192 && b == 168 && c >= 64 && (d == 1 || d == 2) { return false }
-        return true
-    }
-
-    private static func run(_ path: String, _ args: [String]) -> String? {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: path)
-        process.arguments = args
-        let out = Pipe()
-        process.standardOutput = out
-        process.standardError = Pipe()
-        guard (try? process.run()) != nil else { return nil }
-        process.waitUntilExit()
-        let data = out.fileHandleForReading.readDataToEndOfFile()
-        guard !data.isEmpty else { return nil }
-        return String(data: data, encoding: .utf8) ?? String(data: data, encoding: .isoLatin1)
     }
 
     private static var assigned: [String: String] = [:]

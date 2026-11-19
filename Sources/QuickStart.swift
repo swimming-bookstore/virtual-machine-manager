@@ -369,6 +369,12 @@ enum ClonedDisk {
     case failure(String)
 }
 
+enum GuestAddress {
+    case found(String)
+    case missing
+    case failed(String)
+}
+
 enum Worker {
     static func snapshot(dir: URL) -> String? {
         let (code, text) = run(["snapshot", "--dir", dir.path])
@@ -394,6 +400,28 @@ enum Worker {
             return .failure("The clone did not name a disk.")
         }
         return .success(disk)
+    }
+
+    /// Guest IP for this disk. The worker reads ARP and bootpd leases.
+    static func address(disk: URL, mac: String? = nil) -> GuestAddress {
+        var args = ["address", "--disk", disk.path]
+        if let mac, !mac.isEmpty {
+            args.append(contentsOf: ["--mac", mac])
+        }
+        let (code, text) = run(args)
+        if code != 0 {
+            return .failed(message(text) ?? "Could not look up the guest IP.")
+        }
+        for line in text.split(separator: "\n") {
+            if let data = line.data(using: .utf8),
+               let event = try? JSONDecoder().decode(WorkerEvent.self, from: data) {
+                if let ip = event.detail, !ip.isEmpty {
+                    return .found(ip)
+                }
+                return .missing
+            }
+        }
+        return .missing
     }
 
     /// One SSH attempt in the worker. A closed port is not a finished install.

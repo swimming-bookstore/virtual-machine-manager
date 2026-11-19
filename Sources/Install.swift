@@ -150,7 +150,7 @@ struct Install: View {
 
     /// Under the screen, not in the toolbar. A toolbar label collapses into the overflow menu.
     /// The row stays even before the address is known, so it is not clipped away with the guest.
-    /// The MAC is the one we match in ARP. The log is this VM's last `arp -an` checks.
+    /// The MAC is the one we match in ARP. The log is this VM's last guest IP checks.
     private var guestIPRow: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 8) {
@@ -165,7 +165,7 @@ struct Install: View {
                     .foregroundStyle(.secondary)
                     .textSelection(.enabled)
             }
-            Text(guest.log.isEmpty ? "ARP log" : guest.log)
+            Text(guest.log.isEmpty ? "Guest IP log" : guest.log)
                 .font(.caption.monospaced())
                 .foregroundStyle(.secondary)
                 .textSelection(.enabled)
@@ -490,7 +490,7 @@ final class GuestSession: ObservableObject {
     @Published var pausePreview: NSImage?
     /// NAT address for this disk. Empty until ARP has this disk's MAC.
     @Published var address: String?
-    /// Last ARP checks for this VM. Shown under Guest IP when the address stays on Looking up.
+    /// Last guest IP checks for this VM. Shown under Guest IP when the address stays on Looking up.
     @Published var log = ""
     /// Quick start passes its own list. A clone keeps the rows on this session.
     var steps: Binding<[WizardStep]>?
@@ -507,7 +507,7 @@ final class GuestSession: ObservableObject {
     private var checking = false
     private var saved = false
     private var watch: Timer?
-    /// After Start, pull `arp -an` until this disk's short MAC is in the table.
+    /// After Start, pull the guest IP every 5 seconds until this disk's short MAC is in ARP.
     private var arpPoll: Timer?
     private var probing = false
     private var savingSnapshot = false
@@ -550,7 +550,7 @@ final class GuestSession: ObservableObject {
         }
     }
 
-    /// After the VM is running, pull `arp -an` until the short MAC matches a row.
+    /// After the VM is running, pull the guest IP every 5 seconds until the short MAC matches a row.
     /// `02:56:4d:4d:a0:00` matches `2:56:4d:4d:a0:0`. Stop clears the address.
     func watchARP() {
         arpPoll?.invalidate()
@@ -571,8 +571,8 @@ final class GuestSession: ObservableObject {
             }
             return
         }
-        note("polling arp -an")
-        let timer = Timer(timeInterval: 1, repeats: true) { [weak self] timer in
+        note("polling guest IP")
+        let timer = Timer(timeInterval: 5, repeats: true) { [weak self] timer in
             guard let self, !self.stopped, !self.paused, let disk = self.diskURL else {
                 timer.invalidate()
                 return

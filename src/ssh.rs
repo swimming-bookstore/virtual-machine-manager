@@ -185,7 +185,32 @@ pub fn guest_address(disk: &Path, mac: Option<&str>) -> Option<String> {
     if wants.is_empty() {
         return None;
     }
-    ip_for_short_mac(&wants, &net_text("VMM_ARP", arp_output))
+    ip_for_short_mac(&wants, &lookup_text())
+}
+
+/// Tests pass `VMM_ARP`. Live lookup reads the kernel table, `arp -an`, and bootpd leases.
+fn lookup_text() -> String {
+    if let Ok(text) = std::env::var("VMM_ARP") {
+        return text;
+    }
+    let mut text = String::new();
+    #[cfg(target_os = "macos")]
+    {
+        text.push_str(&sysctl_arp_text());
+    }
+    push_table(&mut text, &arp_output());
+    push_table(&mut text, &lease_text_to_arp(&dhcp_leases_file()));
+    text
+}
+
+fn push_table(text: &mut String, extra: &str) {
+    if extra.is_empty() {
+        return;
+    }
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str(extra);
 }
 
 /// The IP whose short MAC equals this disk. The interface name is not part of the match.
@@ -407,24 +432,160 @@ fn usable_ipv4(host: &str) -> bool {
     parts.next().is_none() && a != 0 && a != 127 && a < 224 && d != 0 && d != 1 && d != 255
 }
 
-/// Tests pass `VMM_ARP` and `VMM_IFCONFIG`. The app leaves them unset.
-fn net_text(key: &str, live: fn() -> String) -> String {
-    std::env::var(key).unwrap_or_else(|_| live())
-}
-
 fn arp_output() -> String {
-    for bin in ["/usr/sbin/arp", "/usr/bin/arp", "arp"] {
+    for bin in ["/usr/sbin/arp", "/usr/bin/arp", "/sbin/arp", "arp"] {
         if let Ok(out) = Command::new(bin)
             .arg("-an")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .output()
         {
-            return String::from_utf8_lossy(&out.stdout).into_owned();
+            let text = String::from_utf8_lossy(&out.stdout).into_owned();
+            if !text.is_empty() {
+                return text;
+            }
         }
     }
     String::new()
+}
+
+fn dhcp_leases_file() -> String {
+    for path in ["/var/db/dhcpd_leases", "/private/var/db/dhcpd_leases"] {
+        if let Some(text) = fs::read_to_string(path).ok().filter(|text| !text.is_empty()) {
+            return text;
+        }
+    }
+    String::new()
+}
+
+/// bootpd writes `{ ip_address=... hw_address=1,2:56:4d:4d:a0:0 }`. Same rows as ARP.
+fn lease_text_to_arp(text: &str) -> String {
+    let mut out = String::new();
+    let mut ip = None;
+    let mut mac = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if line == "{" {
+            ip = None;
+            mac = None;
+            continue;
+        }
+        if line == "}" {
+            if let (Some(host), Some(hw)) = (ip.take(), mac.take()) {
+                out.push_str(&format!("? ({host}) at {hw} on bridge100\n"));
+            }
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("ip_address=") {
+            ip = Some(rest.trim().to_string());
+        } else if let Some(rest) = line.strip_prefix("hw_address=") {
+            mac = Some(rest.trim().to_string());
+        }
+    }
+    out
+}
+
+/// Kernel ARP table. Spawning `arp` from the app can fail while `arp -an` in a shell still works.
+#[cfg(target_os = "macos")]
+fn sysctl_arp_text() -> String {
+    const NET_RT_FLAGS: i32 = 2;
+    const RTF_LLINFO: i32 = 0x400;
+    let mut mib = [
+        libc::CTL_NET,
+        libc::PF_ROUTE,
+        0,
+        libc::AF_INET,
+        NET_RT_FLAGS,
+        RTF_LLINFO,
+    ];
+    let mut len = 0usize;
+    let rc = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as u32,
+            std::ptr::null_mut(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc < 0 || len == 0 {
+        return String::new();
+    }
+    let mut buf = vec![0u8; len];
+    let rc = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as u32,
+            buf.as_mut_ptr().cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc < 0 {
+        return String::new();
+    }
+    buf.truncate(len);
+    parse_route_arp(&buf)
+}
+
+#[cfg(target_os = "macos")]
+fn parse_route_arp(buf: &[u8]) -> String {
+    let hdr = std::mem::size_of::<libc::rt_msghdr>();
+    let mut text = String::new();
+    let mut off = 0;
+    while off + hdr <= buf.len() {
+        let msglen = u16::from_ne_bytes(buf[off..off + 2].try_into().unwrap()) as usize;
+        if msglen < hdr || off + msglen > buf.len() {
+            break;
+        }
+        let addrs = i32::from_ne_bytes(buf[off + 12..off + 16].try_into().unwrap());
+        let end = off + msglen;
+        let mut p = off + hdr;
+        let mut ip = None;
+        let mut mac = None;
+        for bit in 0..8 {
+            if addrs & (1 << bit) == 0 {
+                continue;
+            }
+            if p >= end {
+                break;
+            }
+            let sa_len = buf[p] as usize;
+            let family = if p + 1 < end { buf[p + 1] } else { 0 };
+            let take = if sa_len == 0 { 8 } else { (sa_len + 7) & !7 };
+            if bit == 0 && family == libc::AF_INET as u8 && p + 8 <= end {
+                let addr = u32::from_be_bytes(buf[p + 4..p + 8].try_into().unwrap());
+                ip = Some(format!(
+                    "{}.{}.{}.{}",
+                    (addr >> 24) & 0xff,
+                    (addr >> 16) & 0xff,
+                    (addr >> 8) & 0xff,
+                    addr & 0xff
+                ));
+            }
+            if bit == 1 && family == libc::AF_LINK as u8 && p + 8 <= end {
+                let nlen = buf[p + 5] as usize;
+                let alen = buf[p + 6] as usize;
+                let data = p + 8 + nlen;
+                if alen == 6 && data + 6 <= end {
+                    let hw = &buf[data..data + 6];
+                    mac = Some(format!(
+                        "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                        hw[0], hw[1], hw[2], hw[3], hw[4], hw[5]
+                    ));
+                }
+            }
+            p = end.min(p + take);
+        }
+        if let (Some(host), Some(hw)) = (ip, mac) {
+            text.push_str(&format!("? ({host}) at {hw} on bridge100\n"));
+        }
+        off += msglen;
+    }
+    text
 }
 
 fn parse_arp(text: &str) -> Vec<(String, String)> {
@@ -713,5 +874,23 @@ bridge100: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
         assert!(!is_guest_host("192.168.64.2"));
         assert!(!host_side("192.168.64.3"));
         assert!(!host_side("10.0.0.2"));
+    }
+
+    #[test]
+    fn bootpd_leases_match_the_guest_mac() {
+        let leases = "\
+{
+	name=debian
+	ip_address=192.168.64.51
+	hw_address=1,2:56:4d:4d:a0:0
+}
+";
+        let arp = lease_text_to_arp(leases);
+        assert_eq!(
+            ip_for_short_mac(&["02:56:4d:4d:a0:00".into()], &arp),
+            Some("192.168.64.51".into())
+        );
+        assert!(arp.contains("192.168.64.51"));
+        assert!(arp.contains("2:56:4d:4d:a0:0"));
     }
 }
