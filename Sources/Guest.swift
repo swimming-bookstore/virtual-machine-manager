@@ -31,19 +31,19 @@ enum Guest {
         shortMAC(assignedMAC(disk: disk) ?? macString(for: disk))
     }
 
-    /// IP the SSH check already reached. Nil until that login answers.
+    /// IP from the ARP row for this disk's MAC. Nil until that row exists.
     static func ipInARP(disk: URL) -> String? {
         lookup(disk: disk).ip
     }
 
-    /// One worker login. The log line is the address, or why SSH did not answer.
+    /// One ARP read. The log line is the address, or that the row is not there yet.
     static func lookup(disk: URL) -> (ip: String?, note: String) {
         let mac = assignedMAC(disk: disk) ?? macString(for: disk)
         switch Worker.address(disk: disk, mac: mac) {
         case .found(let ip):
             return (ip, ip)
         case .missing:
-            return (nil, "waiting for SSH")
+            return (nil, "no ARP row for \(shortMAC(mac))")
         case .failed(let message):
             return (nil, message)
         }

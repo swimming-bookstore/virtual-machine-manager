@@ -486,7 +486,7 @@ final class GuestSession: ObservableObject {
     @Published var paused = false
     /// Last guest frame at pause. Shown while the machine is stopped.
     @Published var pausePreview: NSImage?
-    /// NAT address for this disk. Empty until SSH reaches the guest.
+    /// NAT address for this disk. Empty until ARP has a row for this MAC.
     @Published var address: String?
     /// Last guest IP checks for this VM. Shown under Guest IP when the address stays on Looking up.
     @Published var log = ""
@@ -505,7 +505,7 @@ final class GuestSession: ObservableObject {
     private var checking = false
     private var saved = false
     private var watch: Timer?
-    /// After Start, pull the guest IP every 5 seconds until SSH answers.
+    /// After Start, read the guest IP from ARP every 5 seconds.
     private var arpPoll: Timer?
     private var lookingUp = false
     private var probing = false
@@ -549,7 +549,7 @@ final class GuestSession: ObservableObject {
         }
     }
 
-    /// After the VM is running, ask SSH for the guest IP every 5 seconds.
+    /// After the VM is running, read the ARP row for this MAC every 5 seconds.
     /// Stop clears the address.
     func watchARP() {
         arpPoll?.invalidate()

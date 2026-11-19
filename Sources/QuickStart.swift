@@ -402,7 +402,7 @@ enum Worker {
         return .success(disk)
     }
 
-    /// Guest IP for this disk. The worker logs in to the ARP row for this MAC.
+    /// Guest IP for this disk. The ARP row for this MAC. No SSH.
     static func address(disk: URL, mac: String) -> GuestAddress {
         let (code, text) = run(["address", "--disk", disk.path, "--mac", mac])
         if code != 0 {

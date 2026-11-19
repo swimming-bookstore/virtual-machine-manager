@@ -178,66 +178,23 @@ fn arp_guests() -> Vec<(String, String)> {
     parse_arp(&arp_output())
 }
 
-/// Guest IP for this disk. SSH the ARP row for the MAC beside the disk.
-/// The caller polls. Empty until that login answers.
+/// Guest IP for this disk. The ARP row for the MAC beside the disk.
+/// The caller polls. Empty until `arp -an` has that row. No SSH.
 pub fn guest_address(disk: &Path, mac: Option<&str>) -> Result<Option<String>> {
-    let guest_mac = mac
+    let want = mac
         .map(normalize_mac)
         .filter(|text| !text.is_empty())
         .or_else(|| assigned_mac(disk))
         .unwrap_or_else(|| mac_string(disk));
-    reach(disk, &guest_mac)
-}
-
-/// Log in and return the address that answered.
-fn reach(disk: &Path, mac: &str) -> Result<Option<String>> {
-    let Some(guest) = disk.parent() else {
-        return Ok(None);
-    };
-    let Some(support) = guest.parent().and_then(|dir| dir.parent()) else {
-        return Ok(None);
-    };
-    let dir = support.join("ssh");
-    let private = dir.join(PRIVATE);
-    if !private.is_file() {
-        bail!("no SSH key");
-    }
-    if let Some(saved) = saved_address(disk) {
-        if login(&private, &saved)? {
-            write_new(&guest.join(PROOF), format!("{USER} ok\n").as_bytes())?;
-            write_new(&dir.join(PROOF), format!("{USER} ok\n").as_bytes())?;
-            return Ok(Some(saved));
-        }
-    }
-    let want = normalize_mac(mac);
-    let mut tried = false;
     for (host, seen) in arp_guests() {
-        if seen != want || !is_guest_host(&host) {
-            continue;
-        }
-        tried = true;
-        if login(&private, &host)? {
-            write_new(&guest.join(PROOF), format!("{USER} ok\n").as_bytes())?;
-            write_new(&dir.join(PROOF), format!("{USER} ok\n").as_bytes())?;
-            write_new(&guest.join(IP), format!("{host}\n").as_bytes())?;
+        if seen == want && is_guest_host(&host) {
+            if let Some(guest) = disk.parent() {
+                let _ = write_new(&guest.join(IP), format!("{host}\n").as_bytes());
+            }
             return Ok(Some(host));
         }
     }
-    if !tried {
-        bail!("no ARP row for {want}");
-    }
-    bail!("SSH refused {want}");
-}
-
-fn saved_address(disk: &Path) -> Option<String> {
-    let guest = disk.parent()?;
-    let text = fs::read_to_string(guest.join(IP)).ok()?;
-    let host = text.trim();
-    if is_guest_host(host) {
-        Some(host.to_string())
-    } else {
-        None
-    }
+    Ok(None)
 }
 
 /// Addresses on vmnet bridges, plus the other host address on that subnet.
@@ -667,20 +624,5 @@ bridge100: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
         assert!(!is_guest_host("192.168.64.2"));
         assert!(!host_side("192.168.64.3"));
         assert!(!host_side("10.0.0.2"));
-    }
-
-    #[test]
-    fn guest_address_needs_the_ssh_login() {
-        let root = PathBuf::from(format!("/tmp/vmm-ssh-ip-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        let disk = root.join("machines/debian-1/disk.img");
-        fs::create_dir_all(disk.parent().unwrap()).unwrap();
-        fs::write(&disk, b"disk").unwrap();
-        assert!(guest_address(&disk, None).is_err());
-        // A file is not a login. No key, so the lookup says so.
-        fs::write(disk.parent().unwrap().join(IP), b"192.168.64.51\n").unwrap();
-        let err = guest_address(&disk, None).unwrap_err().to_string();
-        assert!(err.contains("no SSH key"), "{err}");
-        let _ = fs::remove_dir_all(&root);
     }
 }

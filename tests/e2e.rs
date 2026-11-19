@@ -415,55 +415,38 @@ fn ssh_probe_is_true_only_after_login() {
     assert_eq!(event["state"], "done");
 }
 
-/// The guest IP is the host SSH logs into, not a saved file and not another machine's row.
+/// The guest IP is the ARP row for this disk's MAC, not a saved file and not another machine's row.
 #[test]
-fn guest_ip_is_the_host_ssh_reached() {
+fn guest_ip_is_the_arp_row_for_this_mac() {
     let dir = dir();
     let disk = dir.join("machines/debian-1/disk.img");
     std::fs::create_dir_all(disk.parent().unwrap()).unwrap();
     std::fs::write(&disk, b"disk").unwrap();
-    std::fs::create_dir_all(dir.join("ssh")).unwrap();
-    std::fs::write(dir.join("ssh/id_ed25519"), b"key").unwrap();
     std::fs::write(disk.parent().unwrap().join("ip"), b"192.168.64.3\n").unwrap();
     let mac = mac_of(disk.to_str().unwrap());
-    let bin = dir.join("bin");
-    std::fs::create_dir_all(&bin).unwrap();
-    std::fs::write(
-        bin.join("ssh"),
-        "#!/bin/sh\ncase \" $* \" in *192.168.64.51*) exit 0;; *) exit 1;; esac\n",
-    )
-    .unwrap();
-    let _ = std::process::Command::new("chmod")
-        .arg("+x")
-        .arg(bin.join("ssh"))
-        .status();
-    let bridge = "bridge100: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500\n\tinet 192.168.64.1 netmask 0xffffff00 broadcast 192.168.64.255\n";
-    let arp = format!("? (192.168.64.51) at {mac} on bridge100\n");
+    let arp = format!("? (192.168.64.51) at {mac} on bridge100\n? (192.168.64.2) at {mac} on bridge100\n");
     let out = Command::new(env!("CARGO_BIN_EXE_virtual-machine-worker"))
         .args(["address", "--disk", disk.to_str().unwrap()])
         .env("VMM_ARP", &arp)
-        .env("VMM_IFCONFIG", bridge)
-        .env("PATH", bin)
         .output()
         .unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(one_event(&out.stdout)["detail"], "192.168.64.51");
+    let saved = std::fs::read_to_string(disk.parent().unwrap().join("ip")).unwrap();
+    assert_eq!(saved.trim(), "192.168.64.51");
+    let other = Command::new(env!("CARGO_BIN_EXE_virtual-machine-worker"))
+        .args(["address", "--disk", disk.to_str().unwrap(), "--mac", "aa:bb:cc:dd:ee:ff"])
+        .env("VMM_ARP", "? (192.168.64.9) at aa:bb:cc:dd:ee:ff on bridge100\n")
+        .output()
+        .unwrap();
+    assert!(other.status.success(), "{}", String::from_utf8_lossy(&other.stderr));
+    assert_eq!(one_event(&other.stdout)["detail"], "192.168.64.9");
 }
 
-/// The second and third guests are not the first address. Each disk keeps the host its own SSH reached.
+/// The second and third guests are not the first address. Each disk takes the ARP row for its own MAC.
 #[test]
 fn later_guests_keep_their_own_ip() {
     let dir = dir();
-    let bin = dir.join("bin");
-    std::fs::create_dir_all(&bin).unwrap();
-    std::fs::create_dir_all(dir.join("ssh")).unwrap();
-    std::fs::write(dir.join("ssh/id_ed25519"), b"key").unwrap();
-    std::fs::write(bin.join("ssh"), "#!/bin/sh\nexit 0\n").unwrap();
-    let _ = std::process::Command::new("chmod")
-        .arg("+x")
-        .arg(bin.join("ssh"))
-        .status();
-    let bridge = "bridge100: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500\n\tinet 192.168.64.1 netmask 0xffffff00 broadcast 192.168.64.255\n";
     let cases = [
         ("debian-2", "192.168.64.51"),
         ("debian-3", "192.168.64.4"),
@@ -483,8 +466,6 @@ fn later_guests_keep_their_own_ip() {
         let out = Command::new(env!("CARGO_BIN_EXE_virtual-machine-worker"))
             .args(["address", "--disk", disk.to_str().unwrap()])
             .env("VMM_ARP", &arp)
-            .env("VMM_IFCONFIG", bridge)
-            .env("PATH", &bin)
             .output()
             .unwrap();
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
@@ -3673,7 +3654,7 @@ fn quick_start_swift_gates_the_bar_on_a_real_download() {
     assert!(include_str!("../Sources/QuickStart.swift").contains("[\"ssh\", \"--disk\", disk.path]"));
     assert!(include_str!("../Sources/QuickStart.swift").contains("[\"address\", \"--disk\", disk.path, \"--mac\", mac]"));
     assert!(include_str!("../Sources/Install.swift").contains("timeInterval: 5"));
-    assert!(include_str!("../src/ssh.rs").contains("fn reach"));
+    assert!(include_str!("../src/ssh.rs").contains("fn guest_address"));
     assert!(include_str!("../Sources/Install.swift").contains("watchSSH()"));
     assert!(include_str!("../Sources/Install.swift").contains("A saved snapshot is the artifact"));
     assert!(!include_str!("../Sources/Install.swift").contains("login file was removed"));
