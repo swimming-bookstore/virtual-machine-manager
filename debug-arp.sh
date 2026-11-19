@@ -13,8 +13,8 @@ for f in "$SUP"/machines/*/mac "$SUP"/snapshots/debian/mac; do
     found=1
     text=$(tr -d '[:space:]' < "$f")
     echo "$f: $text"
-    macs="${macs}${text}
-"
+    # One line. macOS awk rejects a newline in -v ("newline in string").
+    macs="${macs}${text} "
   fi
 done
 if [ "$found" -eq 0 ]; then
@@ -40,6 +40,13 @@ ifconfig -a 2>/dev/null | awk '
 echo
 echo "=== why each ARP row is kept or dropped ==="
 "$ARPBIN" -an | awk -v macs="$macs" '
+BEGIN {
+  n = split(macs, line, " ")
+  for (i = 1; i <= n; i++) {
+    m = norm(line[i])
+    if (m != "") print "match MAC  " m
+  }
+}
 function hexval(s,    i, c, v, h) {
   h = "0123456789abcdef"
   v = 0
@@ -67,7 +74,7 @@ function norm(token,    n, i, start, parts, v, piece, out) {
   return out
 }
 function wanted(mac,    i, n, line) {
-  n = split(macs, line, "\n")
+  n = split(macs, line, " ")
   for (i = 1; i <= n; i++) {
     if (mac != "" && norm(line[i]) == mac) return 1
   }
@@ -121,7 +128,7 @@ function usable(host,    n, p) {
 END {
   if (keep == 0) print "KEEP  (none) — this is the app log \"no ARP row\""
 }
-'
+' || echo "awk failed; the worker check below still runs"
 
 echo
 echo "=== worker address (the call the app makes) ==="
