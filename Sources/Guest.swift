@@ -31,23 +31,20 @@ enum Guest {
         shortMAC(assignedMAC(disk: disk) ?? macString(for: disk))
     }
 
-    /// IP whose MAC short form equals this disk. Nil until the worker finds that row.
+    /// IP the SSH check already reached. Nil until that login answers.
     static func ipInARP(disk: URL) -> String? {
         lookup(disk: disk).ip
     }
 
-    /// One worker lookup. `note` is a line for the VM log when the IP is still missing.
+    /// One worker login. `note` is a line for the VM log when the IP is still missing.
     static func lookup(disk: URL) -> (ip: String?, note: String) {
-        let mac = assignedMAC(disk: disk) ?? macString(for: disk)
-        let want = shortMAC(mac)
-        guard !want.isEmpty else { return (nil, "no MAC for this disk") }
-        switch Worker.address(disk: disk, mac: mac) {
+        switch Worker.address(disk: disk) {
         case .found(let ip):
-            return (ip, "arp \(want) -> \(ip)")
+            return (ip, ip)
         case .missing:
-            return (nil, "waiting for \(want)")
+            return (nil, "waiting for SSH")
         case .failed(let message):
-            return (nil, "lookup failed for \(want): \(message)")
+            return (nil, message)
         }
     }
 
@@ -68,7 +65,7 @@ enum Guest {
 
     private static var assigned: [String: String] = [:]
     private static let macLock = NSLock()
-    /// The MAC the attachment actually uses. Written beside the disk so the next lookup matches the lease.
+    /// The MAC the attachment actually uses. Written beside the disk.
     static func noteMAC(_ mac: VZMACAddress, disk: URL) {
         let text = mac.string.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }

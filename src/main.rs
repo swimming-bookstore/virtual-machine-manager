@@ -547,12 +547,12 @@ enum Command {
         #[arg(long, value_name = "PATH")]
         disk: PathBuf,
     },
-    /// Guest IP for this disk. Empty when the VM is off.
+    /// Guest IP for this disk. The host SSH reached. Empty until that login answers.
     Address {
-        /// Guest disk whose MAC should be looked up.
+        /// Guest disk.
         #[arg(long, value_name = "PATH")]
         disk: PathBuf,
-        /// MAC the attachment wrote for this disk. The lookup reads that row from ARP.
+        /// Ignored. An older app build still passes the MAC.
         #[arg(long, value_name = "MAC")]
         mac: Option<String>,
     },

@@ -402,13 +402,9 @@ enum Worker {
         return .success(disk)
     }
 
-    /// Guest IP for this disk. The worker reads ARP and bootpd leases.
-    static func address(disk: URL, mac: String? = nil) -> GuestAddress {
-        var args = ["address", "--disk", disk.path]
-        if let mac, !mac.isEmpty {
-            args.append(contentsOf: ["--mac", mac])
-        }
-        let (code, text) = run(args)
+    /// Guest IP for this disk. The worker logs in with the same key the install check uses.
+    static func address(disk: URL) -> GuestAddress {
+        let (code, text) = run(["address", "--disk", disk.path])
         if code != 0 {
             return .failed(message(text) ?? "Could not look up the guest IP.")
         }

@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 use std::io::{BufRead, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -414,72 +415,88 @@ fn ssh_probe_is_true_only_after_login() {
     assert_eq!(event["state"], "done");
 }
 
-/// Each machine's MAC has its own ARP row. A stale `.3` is not this guest when ARP already has `.51`.
+/// The guest IP is the host SSH logs into, not a saved file and not another machine's row.
 #[test]
-fn guest_ip_shows_51_not_a_stale_lease() {
+fn guest_ip_is_the_host_ssh_reached() {
     let dir = dir();
     let disk = dir.join("machines/debian-1/disk.img");
     std::fs::create_dir_all(disk.parent().unwrap()).unwrap();
     std::fs::write(&disk, b"disk").unwrap();
-    let mac = "02:56:4d:4d:09:35";
+    std::fs::create_dir_all(dir.join("ssh")).unwrap();
+    std::fs::write(dir.join("ssh/id_ed25519"), b"key").unwrap();
+    std::fs::write(disk.parent().unwrap().join("ip"), b"192.168.64.3\n").unwrap();
+    let mac = mac_of(disk.to_str().unwrap());
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::write(
+        bin.join("ssh"),
+        "#!/bin/sh\ncase \" $* \" in *192.168.64.51*) exit 0;; *) exit 1;; esac\n",
+    )
+    .unwrap();
+    let _ = std::process::Command::new("chmod")
+        .arg("+x")
+        .arg(bin.join("ssh"))
+        .status();
     let bridge = "bridge100: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500\n\tinet 192.168.64.1 netmask 0xffffff00 broadcast 192.168.64.255\n";
-    let ask = |arp: &str| {
-        let out = Command::new(env!("CARGO_BIN_EXE_virtual-machine-worker"))
-            .args(["address", "--disk", disk.to_str().unwrap(), "--mac", mac])
-            .env("VMM_ARP", arp)
-            .env("VMM_IFCONFIG", bridge)
-            .output()
-            .unwrap();
-        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-        one_event(&out.stdout)
-    };
-    let at_51 = "? (192.168.64.51) at 2:56:4d:4d:9:35 on bridge100 ifscope [bridge]\n";
-    assert_eq!(ask(at_51)["detail"], "192.168.64.51");
-    // `arp -an` prints `2:56:4d:4d:a0:0`. The stored MAC is `02:56:4d:4d:a0:00`. Same NIC.
-    let unpadded = "? (192.168.64.51) at 2:56:4d:4d:a0:0 on bridge100 ifscope [bridge]\n";
-    let padded = "02:56:4d:4d:a0:00";
+    let arp = format!("? (192.168.64.51) at {mac} on bridge100\n");
     let out = Command::new(env!("CARGO_BIN_EXE_virtual-machine-worker"))
-        .args(["address", "--disk", disk.to_str().unwrap(), "--mac", padded])
-        .env("VMM_ARP", unpadded)
+        .args(["address", "--disk", disk.to_str().unwrap()])
+        .env("VMM_ARP", &arp)
         .env("VMM_IFCONFIG", bridge)
+        .env("PATH", bin)
         .output()
         .unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(one_event(&out.stdout)["detail"], "192.168.64.51");
-    // The MAC is enough. The interface does not have to be named bridge100.
-    let other_iface = "? (192.168.64.51) at 2:56:4d:4d:9:35 on en0 ifscope [ethernet]\n";
-    assert_eq!(ask(other_iface)["detail"], "192.168.64.51");
-    let other = "? (192.168.64.3) at aa:bb:cc:dd:ee:ff on bridge100\n? (192.168.64.51) at 02:56:4d:4d:00:02 on bridge100\n";
-    let missing = ask(other);
-    assert!(missing.get("detail").is_none() || missing["detail"].is_null());
-    let none = ask("");
-    assert!(none.get("detail").is_none() || none["detail"].is_null());
 }
 
-/// The second and third guests are not the first ARP row. Each MAC keeps its own address.
+/// The second and third guests are not the first address. Each disk keeps the host its own SSH reached.
 #[test]
 fn later_guests_keep_their_own_ip() {
     let dir = dir();
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(dir.join("ssh")).unwrap();
+    std::fs::write(dir.join("ssh/id_ed25519"), b"key").unwrap();
+    std::fs::write(bin.join("ssh"), "#!/bin/sh\nexit 0\n").unwrap();
+    let _ = std::process::Command::new("chmod")
+        .arg("+x")
+        .arg(bin.join("ssh"))
+        .status();
     let bridge = "bridge100: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500\n\tinet 192.168.64.1 netmask 0xffffff00 broadcast 192.168.64.255\n";
-    let arp = "? (192.168.64.51) at 02:56:4d:4d:00:01 on bridge100\n? (192.168.64.4) at 02:56:4d:4d:00:02 on bridge100\n? (192.168.64.5) at 02:56:4d:4d:00:03 on bridge100\n";
     let cases = [
-        ("debian-2", "02:56:4d:4d:00:01", "192.168.64.51"),
-        ("debian-3", "02:56:4d:4d:00:02", "192.168.64.4"),
-        ("debian-4", "02:56:4d:4d:00:03", "192.168.64.5"),
+        ("debian-2", "192.168.64.51"),
+        ("debian-3", "192.168.64.4"),
+        ("debian-4", "192.168.64.5"),
     ];
-    for (name, mac, want) in cases {
+    let mut arp = String::new();
+    for (name, ip) in cases {
         let disk = dir.join(format!("machines/{name}/disk.img"));
         std::fs::create_dir_all(disk.parent().unwrap()).unwrap();
         std::fs::write(&disk, b"disk").unwrap();
+        let mac = mac_of(disk.to_str().unwrap());
+        arp.push_str(&format!("? ({ip}) at {mac} on bridge100\n"));
+    }
+    for (name, want) in cases {
+        let disk = dir.join(format!("machines/{name}/disk.img"));
         let out = Command::new(env!("CARGO_BIN_EXE_virtual-machine-worker"))
-            .args(["address", "--disk", disk.to_str().unwrap(), "--mac", mac])
-            .env("VMM_ARP", arp)
+            .args(["address", "--disk", disk.to_str().unwrap()])
+            .env("VMM_ARP", &arp)
             .env("VMM_IFCONFIG", bridge)
+            .env("PATH", &bin)
             .output()
             .unwrap();
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
         assert_eq!(one_event(&out.stdout)["detail"], want, "{name}");
     }
+}
+
+fn mac_of(path: &str) -> String {
+    let mut sum: u16 = 0x564d;
+    for byte in std::path::Path::new(path).as_os_str().as_bytes() {
+        sum = sum.wrapping_mul(33).wrapping_add(u16::from(*byte));
+    }
+    format!("02:56:4d:4d:{:02x}:{:02x}", (sum >> 8) as u8, sum as u8)
 }
 
 fn spawn(base: &str, dir: &Path) -> std::process::Child {
@@ -3655,8 +3672,7 @@ fn quick_start_swift_gates_the_bar_on_a_real_download() {
     assert!(include_str!("../Sources/QuickStart.swift").contains("[\"ssh\", \"--disk\", disk.path]"));
     assert!(include_str!("../Sources/QuickStart.swift").contains("[\"address\", \"--disk\", disk.path]"));
     assert!(include_str!("../Sources/Install.swift").contains("timeInterval: 5"));
-    assert!(include_str!("../src/ssh.rs").contains("sysctl_arp_text"));
-    assert!(include_str!("../src/ssh.rs").contains("lease_text_to_arp"));
+    assert!(include_str!("../src/ssh.rs").contains("fn reach"));
     assert!(include_str!("../Sources/Install.swift").contains("watchSSH()"));
     assert!(include_str!("../Sources/Install.swift").contains("A saved snapshot is the artifact"));
     assert!(!include_str!("../Sources/Install.swift").contains("login file was removed"));

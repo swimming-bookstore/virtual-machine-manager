@@ -1914,7 +1914,6 @@ dependencies = [
  "anyhow",
  "clap",
  "flate2",
- "libc",
  "pgp",
  "serde",
  "serde_json",

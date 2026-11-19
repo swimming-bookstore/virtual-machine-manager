@@ -150,7 +150,6 @@ struct Install: View {
 
     /// Under the screen, not in the toolbar. A toolbar label collapses into the overflow menu.
     /// The row stays even before the address is known, so it is not clipped away with the guest.
-    /// The MAC is the one we match in ARP. The log is this VM's last guest IP checks.
     private var guestIPRow: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 8) {
@@ -183,7 +182,6 @@ struct Install: View {
         if let address = guest.address { return address }
         if guest.paused { return "Paused" }
         if guest.stopped { return "Start the machine" }
-        // The ARP row is written after DHCP. A miss is not a failure; the timer keeps asking.
         return "Looking up…"
     }
 
@@ -488,7 +486,7 @@ final class GuestSession: ObservableObject {
     @Published var paused = false
     /// Last guest frame at pause. Shown while the machine is stopped.
     @Published var pausePreview: NSImage?
-    /// NAT address for this disk. Empty until ARP has this disk's MAC.
+    /// NAT address for this disk. Empty until SSH reaches the guest.
     @Published var address: String?
     /// Last guest IP checks for this VM. Shown under Guest IP when the address stays on Looking up.
     @Published var log = ""
@@ -507,8 +505,9 @@ final class GuestSession: ObservableObject {
     private var checking = false
     private var saved = false
     private var watch: Timer?
-    /// After Start, pull the guest IP every 5 seconds until this disk's short MAC is in ARP.
+    /// After Start, pull the guest IP every 5 seconds until SSH answers.
     private var arpPoll: Timer?
+    private var lookingUp = false
     private var probing = false
     private var savingSnapshot = false
     /// Boots of the installed disk while Verify with host key has not logged in. A quit used to leave that row waiting.
@@ -550,8 +549,8 @@ final class GuestSession: ObservableObject {
         }
     }
 
-    /// After the VM is running, pull the guest IP every 5 seconds until the short MAC matches a row.
-    /// `02:56:4d:4d:a0:00` matches `2:56:4d:4d:a0:0`. Stop clears the address.
+    /// After the VM is running, ask SSH for the guest IP every 5 seconds.
+    /// Stop clears the address.
     func watchARP() {
         arpPoll?.invalidate()
         arpPoll = nil
@@ -577,9 +576,12 @@ final class GuestSession: ObservableObject {
                 timer.invalidate()
                 return
             }
+            if self.lookingUp { return }
+            self.lookingUp = true
             DispatchQueue.global(qos: .utility).async {
                 let found = Guest.lookup(disk: disk)
                 DispatchQueue.main.async {
+                    self.lookingUp = false
                     guard !self.stopped, !self.paused, self.diskURL == disk else { return }
                     self.note(found.note)
                     guard let ip = found.ip, self.address != ip else { return }

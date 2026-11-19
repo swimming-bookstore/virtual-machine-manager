@@ -14,6 +14,7 @@ const PRIVATE: &str = "id_ed25519";
 const PUBLIC: &str = "id_ed25519.pub";
 const PROOF: &str = "ssh-ok";
 const SCAN: &str = "scan";
+const IP: &str = "ip";
 const SSH_PORT: u16 = 22;
 
 /// Create the host key once. The public half is what the installer copies.
@@ -87,34 +88,12 @@ pub fn own_group() {
 }
 
 /// One attempt. A closed port or a refused key is not a finished install.
-/// ARP first, then the next slice of the vmnet subnet. `.1` is the host gateway, not the guest.
-/// DHCP is not limited to .2–.8, so one probe must not stop there, and it must not walk the whole subnet.
+/// The address that answers is the guest IP.
 pub fn probe_disk(disk: &Path) -> Result<bool> {
     if logged_in_beside(disk)? {
         return Ok(true);
     }
-    let Some(guest) = disk.parent() else {
-        return Ok(false);
-    };
-    let Some(support) = guest.parent().and_then(|dir| dir.parent()) else {
-        return Ok(false);
-    };
-    let dir = support.join("ssh");
-    let private = dir.join(PRIVATE);
-    if !private.is_file() {
-        return Ok(false);
-    }
-    let mac = mac_string(disk);
-    let text = ifconfig_text();
-    let prefixes = nat_prefixes(&text);
-    for host in next_on_bridge(&prefixes, &host_gateways(&text), &dir, &mac, &arp_guests()) {
-        if login(&private, &host)? {
-            write_new(&guest.join(PROOF), format!("{USER} ok\n").as_bytes())?;
-            write_new(&dir.join(PROOF), format!("{USER} ok\n").as_bytes())?;
-            return Ok(true);
-        }
-    }
-    Ok(false)
+    Ok(reach(disk)?.is_some())
 }
 
 /// Locally administered MAC, stable for this disk, so the DHCP lease can be found again.
@@ -178,97 +157,57 @@ fn arp_guests() -> Vec<(String, String)> {
     parse_arp(&arp_output())
 }
 
-/// Guest IP for this disk. The caller polls. Match the short MAC `arp -an` prints.
-/// `02:56:4d:4d:a0:00` is `2:56:4d:4d:a0:0` in `? (192.168.64.51) at 2:56:4d:4d:a0:0 on bridge100`.
+/// Guest IP for this disk. The host the SSH check logs into.
+/// The caller polls. Empty until that login answers.
 pub fn guest_address(disk: &Path, mac: Option<&str>) -> Option<String> {
-    let wants = macs_for(disk, mac);
-    if wants.is_empty() {
-        return None;
-    }
-    ip_for_short_mac(&wants, &lookup_text())
+    let _ = mac;
+    reach(disk).ok().flatten()
 }
 
-/// Tests pass `VMM_ARP`. Live lookup reads the kernel table, `arp -an`, and bootpd leases.
-fn lookup_text() -> String {
-    if let Ok(text) = std::env::var("VMM_ARP") {
-        return text;
+/// Log in and return the address that answered. A miss is not an error.
+fn reach(disk: &Path) -> Result<Option<String>> {
+    let Some(guest) = disk.parent() else {
+        return Ok(None);
+    };
+    let Some(support) = guest.parent().and_then(|dir| dir.parent()) else {
+        return Ok(None);
+    };
+    let dir = support.join("ssh");
+    let private = dir.join(PRIVATE);
+    if !private.is_file() {
+        return Ok(None);
     }
-    let mut text = String::new();
-    #[cfg(target_os = "macos")]
-    {
-        text.push_str(&sysctl_arp_text());
-    }
-    push_table(&mut text, &arp_output());
-    push_table(&mut text, &lease_text_to_arp(&dhcp_leases_file()));
-    text
-}
-
-fn push_table(text: &mut String, extra: &str) {
-    if extra.is_empty() {
-        return;
-    }
-    if !text.is_empty() && !text.ends_with('\n') {
-        text.push('\n');
-    }
-    text.push_str(extra);
-}
-
-/// The IP whose short MAC equals this disk. The interface name is not part of the match.
-fn ip_for_short_mac(wants: &[String], text: &str) -> Option<String> {
-    let shorts: Vec<String> = wants.iter().map(|mac| short_mac(mac)).filter(|mac| !mac.is_empty()).collect();
-    if shorts.is_empty() {
-        return None;
-    }
-    let mut found = None;
-    for line in text.lines() {
-        let Some((host, mac, _)) = arp_row(line) else {
-            continue;
-        };
-        if mac.is_empty() || host_side(&host) || !usable_ipv4(&host) {
-            continue;
-        }
-        if shorts.iter().any(|want| want == &short_mac(&mac)) {
-            found = Some(host.clone());
-            if host.starts_with("192.168.") {
-                return found;
-            }
+    let mac = mac_string(disk);
+    let private = dir.join(PRIVATE);
+    if let Some(saved) = saved_address(disk) {
+        if login(&private, &saved)? {
+            write_new(&guest.join(PROOF), format!("{USER} ok\n").as_bytes())?;
+            write_new(&dir.join(PROOF), format!("{USER} ok\n").as_bytes())?;
+            return Ok(Some(saved));
         }
     }
-    found
-}
-
-/// `arp -an` drops leading zeros. `02:56:4d:4d:a0:00` and `2:56:4d:4d:a0:0` are the same NIC.
-fn short_mac(mac: &str) -> String {
-    normalize_mac(mac)
-        .split(':')
-        .filter(|part| !part.is_empty())
-        .map(|octet| {
-            let trimmed = octet.trim_start_matches('0');
-            if trimmed.is_empty() {
-                "0".to_string()
-            } else {
-                trimmed.to_string()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(":")
-}
-
-fn macs_for(disk: &Path, mac: Option<&str>) -> Vec<String> {
-    let mut wants = Vec::new();
-    if let Some(mac) = mac.map(normalize_mac).filter(|text| !text.is_empty()) {
-        wants.push(mac);
-    }
-    if let Some(mac) = assigned_mac(disk) {
-        if !wants.contains(&mac) {
-            wants.push(mac);
+    let text = ifconfig_text();
+    let prefixes = nat_prefixes(&text);
+    for host in next_on_bridge(&prefixes, &host_gateways(&text), &dir, &mac, &arp_guests()) {
+        if login(&private, &host)? {
+            write_new(&guest.join(PROOF), format!("{USER} ok\n").as_bytes())?;
+            write_new(&dir.join(PROOF), format!("{USER} ok\n").as_bytes())?;
+            write_new(&guest.join(IP), format!("{host}\n").as_bytes())?;
+            return Ok(Some(host));
         }
     }
-    let computed = normalize_mac(&mac_string(disk));
-    if !computed.is_empty() && !wants.contains(&computed) {
-        wants.push(computed);
+    Ok(None)
+}
+
+fn saved_address(disk: &Path) -> Option<String> {
+    let guest = disk.parent()?;
+    let text = fs::read_to_string(guest.join(IP)).ok()?;
+    let host = text.trim();
+    if is_guest_host(host) {
+        Some(host.to_string())
+    } else {
+        None
     }
-    wants
 }
 
 /// Addresses on vmnet bridges, plus the other host address on that subnet.
@@ -363,6 +302,9 @@ fn nat_prefixes(text: &str) -> Vec<[u8; 3]> {
 }
 
 fn ifconfig_text() -> String {
+    if let Ok(text) = std::env::var("VMM_IFCONFIG") {
+        return text;
+    }
     for bin in ["/sbin/ifconfig", "/usr/sbin/ifconfig", "ifconfig"] {
         if let Ok(out) = Command::new(bin)
             .arg("-a")
@@ -378,17 +320,6 @@ fn ifconfig_text() -> String {
         }
     }
     String::new()
-}
-
-fn assigned_mac(disk: &Path) -> Option<String> {
-    let path = disk.parent()?.join("mac");
-    let text = fs::read_to_string(path).ok()?;
-    let mac = normalize_mac(text.trim());
-    if mac.is_empty() {
-        None
-    } else {
-        Some(mac)
-    }
 }
 
 /// Not this Mac, loopback, or a broadcast. The subnet is whichever bridge vmnet chose.
@@ -433,12 +364,15 @@ fn usable_ipv4(host: &str) -> bool {
 }
 
 fn arp_output() -> String {
+    if let Ok(text) = std::env::var("VMM_ARP") {
+        return text;
+    }
     for bin in ["/usr/sbin/arp", "/usr/bin/arp", "/sbin/arp", "arp"] {
         if let Ok(out) = Command::new(bin)
             .arg("-an")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::null())
             .output()
         {
             let text = String::from_utf8_lossy(&out.stdout).into_owned();
@@ -448,144 +382,6 @@ fn arp_output() -> String {
         }
     }
     String::new()
-}
-
-fn dhcp_leases_file() -> String {
-    for path in ["/var/db/dhcpd_leases", "/private/var/db/dhcpd_leases"] {
-        if let Some(text) = fs::read_to_string(path).ok().filter(|text| !text.is_empty()) {
-            return text;
-        }
-    }
-    String::new()
-}
-
-/// bootpd writes `{ ip_address=... hw_address=1,2:56:4d:4d:a0:0 }`. Same rows as ARP.
-fn lease_text_to_arp(text: &str) -> String {
-    let mut out = String::new();
-    let mut ip = None;
-    let mut mac = None;
-    for line in text.lines() {
-        let line = line.trim();
-        if line == "{" {
-            ip = None;
-            mac = None;
-            continue;
-        }
-        if line == "}" {
-            if let (Some(host), Some(hw)) = (ip.take(), mac.take()) {
-                out.push_str(&format!("? ({host}) at {hw} on bridge100\n"));
-            }
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix("ip_address=") {
-            ip = Some(rest.trim().to_string());
-        } else if let Some(rest) = line.strip_prefix("hw_address=") {
-            mac = Some(rest.trim().to_string());
-        }
-    }
-    out
-}
-
-/// Kernel ARP table. Spawning `arp` from the app can fail while `arp -an` in a shell still works.
-#[cfg(target_os = "macos")]
-fn sysctl_arp_text() -> String {
-    const NET_RT_FLAGS: i32 = 2;
-    const RTF_LLINFO: i32 = 0x400;
-    let mut mib = [
-        libc::CTL_NET,
-        libc::PF_ROUTE,
-        0,
-        libc::AF_INET,
-        NET_RT_FLAGS,
-        RTF_LLINFO,
-    ];
-    let mut len = 0usize;
-    let rc = unsafe {
-        libc::sysctl(
-            mib.as_mut_ptr(),
-            mib.len() as u32,
-            std::ptr::null_mut(),
-            &mut len,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    if rc < 0 || len == 0 {
-        return String::new();
-    }
-    let mut buf = vec![0u8; len];
-    let rc = unsafe {
-        libc::sysctl(
-            mib.as_mut_ptr(),
-            mib.len() as u32,
-            buf.as_mut_ptr().cast(),
-            &mut len,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    if rc < 0 {
-        return String::new();
-    }
-    buf.truncate(len);
-    parse_route_arp(&buf)
-}
-
-#[cfg(target_os = "macos")]
-fn parse_route_arp(buf: &[u8]) -> String {
-    let hdr = std::mem::size_of::<libc::rt_msghdr>();
-    let mut text = String::new();
-    let mut off = 0;
-    while off + hdr <= buf.len() {
-        let msglen = u16::from_ne_bytes(buf[off..off + 2].try_into().unwrap()) as usize;
-        if msglen < hdr || off + msglen > buf.len() {
-            break;
-        }
-        let addrs = i32::from_ne_bytes(buf[off + 12..off + 16].try_into().unwrap());
-        let end = off + msglen;
-        let mut p = off + hdr;
-        let mut ip = None;
-        let mut mac = None;
-        for bit in 0..8 {
-            if addrs & (1 << bit) == 0 {
-                continue;
-            }
-            if p >= end {
-                break;
-            }
-            let sa_len = buf[p] as usize;
-            let family = if p + 1 < end { buf[p + 1] } else { 0 };
-            let take = if sa_len == 0 { 8 } else { (sa_len + 7) & !7 };
-            if bit == 0 && family == libc::AF_INET as u8 && p + 8 <= end {
-                let addr = u32::from_be_bytes(buf[p + 4..p + 8].try_into().unwrap());
-                ip = Some(format!(
-                    "{}.{}.{}.{}",
-                    (addr >> 24) & 0xff,
-                    (addr >> 16) & 0xff,
-                    (addr >> 8) & 0xff,
-                    addr & 0xff
-                ));
-            }
-            if bit == 1 && family == libc::AF_LINK as u8 && p + 8 <= end {
-                let nlen = buf[p + 5] as usize;
-                let alen = buf[p + 6] as usize;
-                let data = p + 8 + nlen;
-                if alen == 6 && data + 6 <= end {
-                    let hw = &buf[data..data + 6];
-                    mac = Some(format!(
-                        "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-                        hw[0], hw[1], hw[2], hw[3], hw[4], hw[5]
-                    ));
-                }
-            }
-            p = end.min(p + take);
-        }
-        if let (Some(host), Some(hw)) = (ip, mac) {
-            text.push_str(&format!("? ({host}) at {hw} on bridge100\n"));
-        }
-        off += msglen;
-    }
-    text
 }
 
 fn parse_arp(text: &str) -> Vec<(String, String)> {
@@ -749,55 +545,9 @@ mod tests {
                 ("10.0.0.2".into(), "02:56:4d:4d:09:35".into()),
             ]
         );
-        let mac = "02:56:4d:4d:09:35";
-        assert_eq!(
-            ip_for_short_mac(&[mac.into()], text),
-            Some("192.168.64.7".into())
-        );
-        assert_eq!(ip_for_short_mac(&[mac.into()], ""), None);
-        let guest = "\
-? (192.168.64.1) at aa:bb:cc:dd:ee:ff on bridge100
-? (192.168.64.2) at bb:bb:cc:dd:ee:ff on bridge100
-? (192.168.64.51) at 02:56:4d:4d:09:35 on bridge100
-";
-        assert_eq!(
-            ip_for_short_mac(&["02:56:4d:4d:09:35".into()], guest),
-            Some("192.168.64.51".into())
-        );
         assert_eq!(normalize_mac("1,01:02:56:4d:4d:09:35"), "02:56:4d:4d:09:35");
-        assert_eq!(short_mac("2:56:4d:4d:a0:0"), "2:56:4d:4d:a0:0");
-        assert_eq!(short_mac("02:56:4d:4d:a0:00"), "2:56:4d:4d:a0:0");
-        assert_eq!(
-            ip_for_short_mac(
-                &["02:56:4d:4d:a0:00".into()],
-                "? (192.168.64.51) at 2:56:4d:4d:a0:0 on bridge100 ifscope [bridge]\n"
-            ),
-            Some("192.168.64.51".into())
-        );
-        assert_eq!(
-            ip_for_short_mac(
-                &["02:56:4d:4d:09:00".into()],
-                "? (192.168.64.8) at 2:56:4d:4d:9:0 on bridge100\n"
-            ),
-            Some("192.168.64.8".into())
-        );
+        assert_eq!(normalize_mac("2:56:4d:4d:a0:0"), "02:56:4d:4d:a0:00");
         let bridge100 = "? (192.168.64.51) at 2:56:4d:4d:9:35 on bridge100 ifscope [bridge]\n";
-        assert_eq!(
-            ip_for_short_mac(&["02:56:4d:4d:09:35".into()], bridge100),
-            Some("192.168.64.51".into())
-        );
-        let en0 = "? (192.168.64.51) at 2:56:4d:4d:9:35 on en0 ifscope [ethernet]\n";
-        assert_eq!(
-            ip_for_short_mac(&["02:56:4d:4d:09:35".into()], en0),
-            Some("192.168.64.51".into())
-        );
-        assert_eq!(
-            ip_for_short_mac(
-                &["02:56:4d:4d:a0:00".into()],
-                "? (192.168.64.51) at 2:56:4d:4d:a0:0 on bridge100 ifscope [bridge]\n"
-            ),
-            Some("192.168.64.51".into())
-        );
         let row = arp_row(bridge100.trim()).expect("bridge100 row");
         assert_eq!(row.0, "192.168.64.51");
         assert_eq!(row.1, "02:56:4d:4d:09:35");
@@ -877,20 +627,18 @@ bridge100: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
     }
 
     #[test]
-    fn bootpd_leases_match_the_guest_mac() {
-        let leases = "\
-{
-	name=debian
-	ip_address=192.168.64.51
-	hw_address=1,2:56:4d:4d:a0:0
-}
-";
-        let arp = lease_text_to_arp(leases);
-        assert_eq!(
-            ip_for_short_mac(&["02:56:4d:4d:a0:00".into()], &arp),
-            Some("192.168.64.51".into())
-        );
-        assert!(arp.contains("192.168.64.51"));
-        assert!(arp.contains("2:56:4d:4d:a0:0"));
+    fn guest_address_needs_the_ssh_login() {
+        let root = PathBuf::from(format!("/tmp/vmm-ssh-ip-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let disk = root.join("machines/debian-1/disk.img");
+        fs::create_dir_all(disk.parent().unwrap()).unwrap();
+        fs::write(&disk, b"disk").unwrap();
+        assert_eq!(guest_address(&disk, None), None);
+        // A file is not a login. The host address is not a guest either.
+        fs::write(disk.parent().unwrap().join(IP), b"192.168.64.51\n").unwrap();
+        assert_eq!(guest_address(&disk, None), None);
+        fs::write(disk.parent().unwrap().join(IP), b"192.168.64.2\n").unwrap();
+        assert_eq!(guest_address(&disk, None), None);
+        let _ = fs::remove_dir_all(&root);
     }
 }
