@@ -36,9 +36,10 @@ enum Guest {
         lookup(disk: disk).ip
     }
 
-    /// One worker login. `note` is a line for the VM log when the IP is still missing.
+    /// One worker login. The log line is the address, or why SSH did not answer.
     static func lookup(disk: URL) -> (ip: String?, note: String) {
-        switch Worker.address(disk: disk) {
+        let mac = assignedMAC(disk: disk) ?? macString(for: disk)
+        switch Worker.address(disk: disk, mac: mac) {
         case .found(let ip):
             return (ip, ip)
         case .missing:

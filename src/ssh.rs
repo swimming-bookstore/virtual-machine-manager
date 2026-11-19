@@ -93,7 +93,28 @@ pub fn probe_disk(disk: &Path) -> Result<bool> {
     if logged_in_beside(disk)? {
         return Ok(true);
     }
-    Ok(reach(disk)?.is_some())
+    let Some(guest) = disk.parent() else {
+        return Ok(false);
+    };
+    let Some(support) = guest.parent().and_then(|dir| dir.parent()) else {
+        return Ok(false);
+    };
+    let dir = support.join("ssh");
+    let private = dir.join(PRIVATE);
+    if !private.is_file() {
+        return Ok(false);
+    }
+    let mac = mac_string(disk);
+    let text = ifconfig_text();
+    for host in next_on_bridge(&nat_prefixes(&text), &host_gateways(&text), &dir, &mac, &arp_guests()) {
+        if login(&private, &host)? {
+            write_new(&guest.join(PROOF), format!("{USER} ok\n").as_bytes())?;
+            write_new(&dir.join(PROOF), format!("{USER} ok\n").as_bytes())?;
+            write_new(&guest.join(IP), format!("{host}\n").as_bytes())?;
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Locally administered MAC, stable for this disk, so the DHCP lease can be found again.
@@ -157,15 +178,19 @@ fn arp_guests() -> Vec<(String, String)> {
     parse_arp(&arp_output())
 }
 
-/// Guest IP for this disk. The host the SSH check logs into.
+/// Guest IP for this disk. SSH the ARP row for the MAC beside the disk.
 /// The caller polls. Empty until that login answers.
-pub fn guest_address(disk: &Path, mac: Option<&str>) -> Option<String> {
-    let _ = mac;
-    reach(disk).ok().flatten()
+pub fn guest_address(disk: &Path, mac: Option<&str>) -> Result<Option<String>> {
+    let guest_mac = mac
+        .map(normalize_mac)
+        .filter(|text| !text.is_empty())
+        .or_else(|| assigned_mac(disk))
+        .unwrap_or_else(|| mac_string(disk));
+    reach(disk, &guest_mac)
 }
 
-/// Log in and return the address that answered. A miss is not an error.
-fn reach(disk: &Path) -> Result<Option<String>> {
+/// Log in and return the address that answered.
+fn reach(disk: &Path, mac: &str) -> Result<Option<String>> {
     let Some(guest) = disk.parent() else {
         return Ok(None);
     };
@@ -175,10 +200,8 @@ fn reach(disk: &Path) -> Result<Option<String>> {
     let dir = support.join("ssh");
     let private = dir.join(PRIVATE);
     if !private.is_file() {
-        return Ok(None);
+        bail!("no SSH key");
     }
-    let mac = mac_string(disk);
-    let private = dir.join(PRIVATE);
     if let Some(saved) = saved_address(disk) {
         if login(&private, &saved)? {
             write_new(&guest.join(PROOF), format!("{USER} ok\n").as_bytes())?;
@@ -186,9 +209,13 @@ fn reach(disk: &Path) -> Result<Option<String>> {
             return Ok(Some(saved));
         }
     }
-    let text = ifconfig_text();
-    let prefixes = nat_prefixes(&text);
-    for host in next_on_bridge(&prefixes, &host_gateways(&text), &dir, &mac, &arp_guests()) {
+    let want = normalize_mac(mac);
+    let mut tried = false;
+    for (host, seen) in arp_guests() {
+        if seen != want || !is_guest_host(&host) {
+            continue;
+        }
+        tried = true;
         if login(&private, &host)? {
             write_new(&guest.join(PROOF), format!("{USER} ok\n").as_bytes())?;
             write_new(&dir.join(PROOF), format!("{USER} ok\n").as_bytes())?;
@@ -196,7 +223,10 @@ fn reach(disk: &Path) -> Result<Option<String>> {
             return Ok(Some(host));
         }
     }
-    Ok(None)
+    if !tried {
+        bail!("no ARP row for {want}");
+    }
+    bail!("SSH refused {want}");
 }
 
 fn saved_address(disk: &Path) -> Option<String> {
@@ -320,6 +350,17 @@ fn ifconfig_text() -> String {
         }
     }
     String::new()
+}
+
+fn assigned_mac(disk: &Path) -> Option<String> {
+    let path = disk.parent()?.join("mac");
+    let text = fs::read_to_string(path).ok()?;
+    let mac = normalize_mac(text.trim());
+    if mac.is_empty() {
+        None
+    } else {
+        Some(mac)
+    }
 }
 
 /// Not this Mac, loopback, or a broadcast. The subnet is whichever bridge vmnet chose.
@@ -487,7 +528,9 @@ fn login(private: &Path, host: &str) -> Result<bool> {
         "-o",
         "UserKnownHostsFile=/dev/null",
         "-o",
-        "ConnectTimeout=1",
+        "ConnectTimeout=2",
+        "-o",
+        "ConnectionAttempts=1",
         "-p",
         &port,
         "-i",
@@ -633,12 +676,11 @@ bridge100: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
         let disk = root.join("machines/debian-1/disk.img");
         fs::create_dir_all(disk.parent().unwrap()).unwrap();
         fs::write(&disk, b"disk").unwrap();
-        assert_eq!(guest_address(&disk, None), None);
-        // A file is not a login. The host address is not a guest either.
+        assert!(guest_address(&disk, None).is_err());
+        // A file is not a login. No key, so the lookup says so.
         fs::write(disk.parent().unwrap().join(IP), b"192.168.64.51\n").unwrap();
-        assert_eq!(guest_address(&disk, None), None);
-        fs::write(disk.parent().unwrap().join(IP), b"192.168.64.2\n").unwrap();
-        assert_eq!(guest_address(&disk, None), None);
+        let err = guest_address(&disk, None).unwrap_err().to_string();
+        assert!(err.contains("no SSH key"), "{err}");
         let _ = fs::remove_dir_all(&root);
     }
 }

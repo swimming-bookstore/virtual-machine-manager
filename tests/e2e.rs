@@ -475,6 +475,7 @@ fn later_guests_keep_their_own_ip() {
         std::fs::create_dir_all(disk.parent().unwrap()).unwrap();
         std::fs::write(&disk, b"disk").unwrap();
         let mac = mac_of(disk.to_str().unwrap());
+        std::fs::write(disk.parent().unwrap().join("mac"), format!("{mac}\n")).unwrap();
         arp.push_str(&format!("? ({ip}) at {mac} on bridge100\n"));
     }
     for (name, want) in cases {
@@ -3667,10 +3668,10 @@ fn quick_start_swift_gates_the_bar_on_a_real_download() {
     assert!(!include_str!("../Sources/Guest.swift").contains("VZNATNetworkDeviceForwardingRules"));
     assert!(include_str!("../src/ssh.rs").contains("192.168.64."));
     assert!(include_str!("../src/ssh.rs").contains("% 253"));
-    assert!(include_str!("../src/ssh.rs").contains("ConnectTimeout=1"));
+    assert!(include_str!("../src/ssh.rs").contains("ConnectTimeout=2"));
     assert!(include_str!("../Sources/QuickStart.swift").contains("terminationHandler"));
     assert!(include_str!("../Sources/QuickStart.swift").contains("[\"ssh\", \"--disk\", disk.path]"));
-    assert!(include_str!("../Sources/QuickStart.swift").contains("[\"address\", \"--disk\", disk.path]"));
+    assert!(include_str!("../Sources/QuickStart.swift").contains("[\"address\", \"--disk\", disk.path, \"--mac\", mac]"));
     assert!(include_str!("../Sources/Install.swift").contains("timeInterval: 5"));
     assert!(include_str!("../src/ssh.rs").contains("fn reach"));
     assert!(include_str!("../Sources/Install.swift").contains("watchSSH()"));

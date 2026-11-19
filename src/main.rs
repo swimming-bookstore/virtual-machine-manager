@@ -604,10 +604,15 @@ fn main() {
             }
         }
         Command::Address { disk, mac } => {
-            let mut event = ev("address", None, Some("done"));
-            event.disk = Some(disk.display().to_string());
-            event.detail = ssh::guest_address(&disk, mac.as_deref());
-            emit(event);
+            match ssh::guest_address(&disk, mac.as_deref()) {
+                Ok(ip) => {
+                    let mut event = ev("address", None, Some("done"));
+                    event.disk = Some(disk.display().to_string());
+                    event.detail = ip;
+                    emit(event);
+                }
+                Err(err) => die(err),
+            }
         }
         Command::Pause { disk } => match pause::mark(&disk) {
             Ok(()) => {
