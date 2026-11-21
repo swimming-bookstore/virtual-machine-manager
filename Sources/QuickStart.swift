@@ -602,6 +602,7 @@ struct QuickStart: View {
                         .accessibilityHidden(true)
                 }
             }
+            .background { installerPreview }
             .background { FitWindowHeight() }
         .onAppear { wizard.start() }
     }
@@ -740,12 +741,32 @@ struct QuickStart: View {
         return session.needsInstallGuest && !session.showWindow
     }
 
-    /// A small 16:10 thumbnail, not a full-width preview.
+    /// A small 16:10 thumbnail. One click opens a preview at the original 1280 by 800 scanout.
+    /// The guest view does not take hits. A button does, including inside the scrolling step list.
     private var installerView: some View {
         InstallGuest(session: installSlot.session!)
             .frame(width: 160, height: 100)
+            .allowsHitTesting(false)
             .accessibilityLabel("Installer")
-            .accessibilityHint("The installer")
+            .overlay {
+                Button {
+                    installSlot.session?.showWindow = true
+                } label: {
+                    Rectangle().fill(Color.white.opacity(0.001)).contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .accessibilityLabel("Installer")
+                .accessibilityHint("Opens a preview at the original size")
+            }
+    }
+
+    /// The embedded install is invisible, so it cannot open this panel. The thumbnail click sets showWindow.
+    @ViewBuilder private var installerPreview: some View {
+        if wizard.error == nil, let session = installSlot.session, session.needsInstallGuest {
+            InstallerPreview(session: session)
+                .id(ObjectIdentifier(session))
+        }
     }
 
     private func icon(_ state: String) -> String {
@@ -764,5 +785,20 @@ struct QuickStart: View {
         case "fail": return .red
         default: return Color.secondary.opacity(0.45)
         }
+    }
+}
+
+/// Watches the running installer. Quick start's slot does not publish showWindow, so this view does.
+private struct InstallerPreview: View {
+    @ObservedObject var session: GuestSession
+
+    var body: some View {
+        InstallerWindow(guest: session, presented: $session.showWindow) {
+            GuestMirror(session: session)
+                .frame(width: Guest.scanoutSize.width, height: Guest.scanoutSize.height)
+                .background(.black, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        }
+        .accessibilityHidden(true)
     }
 }

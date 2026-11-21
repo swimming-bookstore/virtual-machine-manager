@@ -67,11 +67,11 @@ struct Install: View {
         }
         .background {
             // The window stays with the mounted guest. Quick start draws the thumbnail, not this page.
-            // The embedded copy is invisible, so it must not also open the installer panel.
+            // Quick start opens the panel itself. This page only opens it when the install is visible.
             if setup && !embedded {
                 InstallerWindow(guest: guest, presented: $guest.showWindow) {
                     GuestMirror(session: guest)
-                        .frame(width: 800, height: 500)
+                        .frame(width: Guest.scanoutSize.width, height: Guest.scanoutSize.height)
                         .background(.black, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
                         .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
                 }
@@ -310,7 +310,6 @@ struct InstallGuest: View {
         GuestView(session: session, capture: false)
             .background(.black, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
             .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-            .allowsHitTesting(false)
     }
 }
 
@@ -1186,9 +1185,10 @@ final class GuestSession: ObservableObject {
     }
 }
 
-/// Opens the guest in its own window. The wizard stays the download size.
-/// The view is not in the wizard while this window is open, so the thumbnail mirrors it.
-private struct InstallerWindow<Content: View>: NSViewRepresentable {
+/// Opens a preview of the guest at its original scanout. The wizard stays the download size.
+/// Quick start mounts this. The embedded install is invisible, so it cannot be the only owner.
+/// The thumbnail keeps its own view. This window uses a second one, so opening does not blank it.
+struct InstallerWindow<Content: View>: NSViewRepresentable {
     let guest: GuestSession
     @Binding var presented: Bool
     @ViewBuilder var content: () -> Content
@@ -1229,11 +1229,13 @@ private struct InstallerWindow<Content: View>: NSViewRepresentable {
 
         func open(near parent: NSWindow?) {
             if let panel {
-                panel.orderFront(nil)
+                panel.orderFrontRegardless()
                 return
             }
+            // The panel is the scanout, not a size that grows or shrinks with the screen.
+            let guestSize = Guest.scanoutSize
             let host = NSHostingView(rootView: content().padding(16))
-            host.frame = NSRect(x: 0, y: 0, width: 832, height: 532)
+            host.frame = NSRect(x: 0, y: 0, width: guestSize.width + 32, height: guestSize.height + 32)
             let panel = NSPanel(
                 contentRect: host.frame,
                 styleMask: [.titled, .closable, .miniaturizable],
@@ -1247,18 +1249,29 @@ private struct InstallerWindow<Content: View>: NSViewRepresentable {
             // A non-activating panel does not become key, so it cannot take the keyboard.
             // The guest view also ignores the pointer. Quick start never attaches one.
             panel.styleMask.insert(.nonactivatingPanel)
+            panel.isFloatingPanel = true
             panel.becomesKeyOnlyIfNeeded = true
             panel.level = .floating
-            if let parent {
-                var origin = parent.frame.origin
-                origin.x += parent.frame.width + 16
+            let anchor = parent ?? NSApp.windows.first { $0.title == "Quick start" && $0.isVisible }
+            if let anchor {
+                var origin = anchor.frame.origin
+                origin.x += anchor.frame.width + 16
+                if let visible = (anchor.screen ?? NSScreen.main)?.visibleFrame {
+                    if origin.x + panel.frame.width > visible.maxX {
+                        origin.x = max(visible.minX, visible.maxX - panel.frame.width)
+                    }
+                    if origin.y + panel.frame.height > visible.maxY {
+                        origin.y = visible.maxY - panel.frame.height
+                    }
+                    if origin.y < visible.minY { origin.y = visible.minY }
+                }
                 panel.setFrameOrigin(origin)
             }
             panel.makeFirstResponder(nil)
             let delegate = PanelClose(guest: guest)
             panel.delegate = delegate
             objc_setAssociatedObject(panel, &panelCloseKey, delegate, .OBJC_ASSOCIATION_RETAIN)
-            panel.orderFront(nil)
+            panel.orderFrontRegardless()
             self.panel = panel
         }
 
@@ -1378,6 +1391,14 @@ final class GuestPane: NSView {
     }
 
     override var isOpaque: Bool { true }
+
+    /// The thumbnail's click is a SwiftUI control above this pane. A Metal guest must not keep that click.
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard let screen = subviews.first(where: { $0 is InstallScreen }) as? InstallScreen, screen.capture else {
+            return nil
+        }
+        return super.hitTest(point)
+    }
 }
 
 /// Second view of the same guest, used only by the installer window.

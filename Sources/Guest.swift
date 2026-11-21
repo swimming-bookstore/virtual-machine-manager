@@ -8,6 +8,9 @@ enum Guest {
     static let user = "debian"
     /// sshd in the guest listens here. The NAT attachment cannot map it to a host port.
     static let sshPort: UInt16 = 22
+    /// The guest framebuffer in pixels. Virtio wants Int. The preview uses the same numbers as CGFloat.
+    static let scanout = (width: 1280, height: 800)
+    static let scanoutSize = CGSize(width: 1280, height: 800)
 
     static func boot(iso: URL, preseed: URL, disk: URL) throws -> VZVirtualMachine {
         return try machine(disk: disk, extra: [iso, preseed], pointer: false)
@@ -44,7 +47,7 @@ enum Guest {
         devices.append(try guestDisk(disk))
         config.storageDevices = devices
         let graphics = VZVirtioGraphicsDeviceConfiguration()
-        graphics.scanouts = [VZVirtioGraphicsScanoutConfiguration(widthInPixels: 1280, heightInPixels: 800)]
+        graphics.scanouts = [VZVirtioGraphicsScanoutConfiguration(widthInPixels: scanout.width, heightInPixels: scanout.height)]
         config.graphicsDevices = [graphics]
         config.keyboards = [VZUSBKeyboardConfiguration()]
         // Attaching a pointer makes the guest view capture the host cursor.

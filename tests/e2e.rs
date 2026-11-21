@@ -3503,6 +3503,8 @@ fn quick_start_swift_gates_the_bar_on_a_real_download() {
     assert!(!src.contains("Button(\"Show installer\")"));
     assert!(!src.contains("Button(\"Open"));
     assert!(src.contains(".frame(width: 160, height: 100)"));
+    assert!(src.contains("installSlot.session?.showWindow = true"));
+    assert!(src.contains(".onTapGesture { installSlot.session?.showWindow = true }"));
     assert!(!src.contains("onTapGesture(count: 2)"));
     assert!(!include_str!("../Sources/Install.swift").contains("Button(\"Show installer\")"));
     assert!(!include_str!("../Sources/Install.swift").contains("onTapGesture(count: 2)"));
@@ -3569,6 +3571,12 @@ fn quick_start_swift_gates_the_bar_on_a_real_download() {
     assert!(include_str!("../Sources/Install.swift").contains("struct InstallerWindow"));
     assert!(!include_str!("../Sources/Install.swift").contains(".popover(isPresented:"));
     assert!(include_str!("../Sources/Install.swift").contains("frame(width: setup ? 440 : 848"));
+    assert!(include_str!("../Sources/Install.swift").contains("Guest.scanoutSize.width"));
+    assert!(include_str!("../Sources/Install.swift").contains("Guest.scanoutSize.height"));
+    assert!(include_str!("../Sources/Install.swift").contains("let guestSize = Guest.scanoutSize"));
+    assert!(!include_str!("../Sources/Install.swift").contains("min(1280, max(640, screen.width - 32))"));
+    assert!(include_str!("../Sources/Guest.swift").contains("static let scanout = (width: 1280, height: 800)"));
+    assert!(include_str!("../Sources/Guest.swift").contains("static let scanoutSize = CGSize(width: 1280, height: 800)"));
     assert!(!include_str!("../Sources/Install.swift").contains("frame(height: 96)"));
     assert!(include_str!("../Sources/Install.swift")
         .contains("private var capturePointer: Bool { fromSnapshot && !guest.stopped }"));
