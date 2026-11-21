@@ -59,10 +59,13 @@ pub fn preseed_cfg(example: &str) -> Result<String> {
 
 /// Overrides loaded after the official example. The example already sets the mirror
 /// layout, partitioning confirms, and GRUB. Locale and keymap are also kernel
-/// parameters, because the installer asks them before this file is read. xfce-desktop
-/// installs keyboard-configuration in the target. That package asks "Please select
-/// the layout matching the keyboard for this machine" unless the variant is answered
-/// by its owner and marked seen; a `d-i` answer is not copied into the target.
+/// parameters, because the installer asks them before this file is read.
+///
+/// `priority=critical` does not hide this question. xfce-desktop installs
+/// keyboard-configuration in the target, and that package asks "Please select the
+/// layout matching the keyboard for this machine" at critical priority. It skips
+/// the question only when `/etc/default/keyboard` names a layout it does not know.
+/// early_command writes that file; late_command puts a normal US layout back.
 /// The guest disk is virtio, and the installer is a USB disk, so the disk has to be
 /// named or partman may pick the USB stick.
 pub fn answers() -> String {
@@ -71,16 +74,7 @@ pub fn answers() -> String {
 d-i keyboard-configuration/xkb-keymap select us
 d-i debian-installer/keymap string us
 d-i console-setup/ask_detect boolean false
-keyboard-configuration keyboard-configuration/xkb-keymap select us
-keyboard-configuration keyboard-configuration/modelcode string pc105
-keyboard-configuration keyboard-configuration/layoutcode string us
-keyboard-configuration keyboard-configuration/variantcode string
-keyboard-configuration keyboard-configuration/model select Generic 105-key PC
-keyboard-configuration keyboard-configuration/model seen true
-keyboard-configuration keyboard-configuration/layout select English (US)
-keyboard-configuration keyboard-configuration/layout seen true
-keyboard-configuration keyboard-configuration/variant select English (US)
-keyboard-configuration keyboard-configuration/variant seen true
+d-i preseed/early_command string {early}
 d-i mirror/http/hostname string deb.debian.org
 d-i passwd/root-login boolean false
 d-i passwd/user-fullname string debian
@@ -99,8 +93,17 @@ tasksel tasksel/first multiselect \
 
 popularity-contest popularity-contest/participate boolean false
 "#,
+        early = early_command(),
         late = late_command(),
     )
+}
+
+/// Writes a keyboard file the target package will not ask about, then copies it
+/// into the guest before tasksel. `skip` is not a real variant, so the package
+/// treats the layout as unsupported and does not show the critical question.
+/// `\043` is the script's shebang. A `#` in this line is a debconf comment.
+fn early_command() -> String {
+    "mkdir -p /etc/default /usr/lib/pre-pkgsel.d /usr/lib/base-installer.d && printf '%s\\n' XKBMODEL=pc105 XKBLAYOUT=us XKBVARIANT=skip XKBOPTIONS= BACKSPACE=guess > /etc/default/keyboard && printf '\\043!/bin/sh\\nmkdir -p /target/etc/default\\ncp /etc/default/keyboard /target/etc/default/keyboard\\n' > /usr/lib/pre-pkgsel.d/10keyboard && cp /usr/lib/pre-pkgsel.d/10keyboard /usr/lib/base-installer.d/15keyboard && chmod 755 /usr/lib/pre-pkgsel.d/10keyboard /usr/lib/base-installer.d/15keyboard".to_string()
 }
 
 /// Runs in the installer, with `/target` still mounted. A non-zero exit does not
@@ -110,7 +113,7 @@ popularity-contest popularity-contest/participate boolean false
 fn late_command() -> String {
     let home = format!("/target/home/{USER}");
     format!(
-        "test -s /target/etc/debian_version && test -e /target/boot/grub/grub.cfg && mkdir -p {home}/.ssh && cp /authorized_keys {home}/.ssh/authorized_keys && chmod 700 {home}/.ssh && chmod 600 {home}/.ssh/authorized_keys && chroot /target chown -R {USER}:{USER} /home/{USER}/.ssh && chroot /target systemctl enable ssh && sync && poweroff"
+        "mkdir -p /target/etc/default && printf '%s\\n' XKBMODEL=pc105 XKBLAYOUT=us XKBVARIANT= XKBOPTIONS= BACKSPACE=guess > /target/etc/default/keyboard && test -s /target/etc/debian_version && test -e /target/boot/grub/grub.cfg && mkdir -p {home}/.ssh && cp /authorized_keys {home}/.ssh/authorized_keys && chmod 700 {home}/.ssh && chmod 600 {home}/.ssh/authorized_keys && chroot /target chown -R {USER}:{USER} /home/{USER}/.ssh && chroot /target systemctl enable ssh && sync && poweroff"
     )
 }
 
@@ -125,10 +128,8 @@ pub fn authorized_keys(public_key: &str) -> String {
 }
 
 /// Boot parameters from the guide's auto mode. They belong before `---`.
-/// Locale and keymap are kernel parameters, not debconf keys: the installer asks
-/// them before it loads preseed.cfg. The matching aliases are in the installation
-/// guide. The target keyboard package asks again once xfce-desktop is installed;
-/// that question is answered in the preseed, not here.
+/// Locale and keymap are kernel parameters. `priority=critical` still asks
+/// critical questions, so it does not answer the target layout prompt.
 pub fn boot_args() -> String {
     "auto=true priority=critical locale=en_US.UTF-8 keymap=us".to_string()
 }
@@ -1017,9 +1018,11 @@ mod tests {
         assert!(boot_args().contains("locale=en_US.UTF-8"));
         assert!(boot_args().contains("keymap=us"));
         assert!(answers.contains("keyboard-configuration/xkb-keymap select us"));
-        assert!(answers.contains("keyboard-configuration/variant select English (US)"));
-        assert!(answers.contains("keyboard-configuration/model select Generic 105-key PC"));
-        assert!(answers.contains("keyboard-configuration/variant seen true"));
+        assert!(answers.contains("XKBVARIANT=skip"));
+        assert!(answers.contains("preseed/early_command"));
+        assert!(answers.contains("pre-pkgsel.d/10keyboard"));
+        assert!(answers.contains("\\043!/bin/sh"));
+        assert!(!answers.contains('#'));
         assert!(answers.contains("debian-installer/locale string en_US.UTF-8"));
         assert!(answers.contains("deb.debian.org"));
         assert!(answers.contains("partman-auto/disk string /dev/vda"));
