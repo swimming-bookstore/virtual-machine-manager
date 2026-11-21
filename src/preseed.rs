@@ -6,6 +6,9 @@
 //! key. `preseed.cfg` is appended to that initrd. The graphical initrd does not see it.
 //! Virtualization.framework has no CD drive, so the boot copy is a USB disk.
 //!
+//! `preseed.cfg` is the official example, with the local answers appended.
+//! <https://www.debian.org/releases/trixie/example-preseed.txt>
+//!
 //! When the target has a Debian version and a GRUB config, late_command copies
 //! `/authorized_keys` from the text initrd into the debian account and enables
 //! sshd. The host treats the install as finished only after it can log in.
@@ -36,7 +39,25 @@ pub const USER: &str = "debian";
 /// Written into the guest so the host can log in without a password.
 pub const AUTHORIZED: &str = "authorized_keys";
 
-/// Answers the installer loads from `/preseed.cfg` in the text initrd.
+/// Official example. Downloaded, not kept in the binary.
+/// <https://www.debian.org/releases/trixie/example-preseed.txt>
+pub const EXAMPLE: &str = "example-preseed.txt";
+pub const EXAMPLE_URL: &str = "https://www.debian.org/releases/trixie/example-preseed.txt";
+
+/// The downloaded example, then the local answers. The installer reads this as `/preseed.cfg`.
+pub fn preseed_cfg(example: &str) -> Result<String> {
+    if !example.contains("#_preseed_V1") || !example.contains("d-i ") {
+        bail!("{EXAMPLE} is not a Debian preseed");
+    }
+    let mut text = example.to_string();
+    if !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str(&answers());
+    Ok(text)
+}
+
+/// Answers the installer loads after the official example.
 pub fn answers() -> String {
     format!(
         "\
@@ -113,7 +134,10 @@ pub struct Prepared {
 /// Those files are not downloads, so they stay out of the cache, in installer/.
 pub fn write_preseed(support: &Path) -> Result<()> {
     let key = read_key(&support.join("ssh").join(AUTHORIZED))?;
-    let _ = write_image(&installer_dir(support)?.join(FILE), &image(&key)?)?;
+    let _ = write_image(
+        &installer_dir(support)?.join(FILE),
+        &image(&key, &read_example(support)?)?,
+    )?;
     Ok(())
 }
 
@@ -147,7 +171,16 @@ pub fn prepare_installer(iso: &Path, support: &Path) -> Result<bool> {
         bail!("installer image is missing: {}", iso.display());
     }
     let key = read_key(&support.join("ssh").join(AUTHORIZED))?;
-    write_boot(iso, &installer_dir(support)?.join(BOOT), &key)
+    let example = read_example(support)?;
+    write_boot(iso, &installer_dir(support)?.join(BOOT), &key, &example)
+}
+
+fn read_example(support: &Path) -> Result<String> {
+    let path = support.join("cache").join(EXAMPLE);
+    let text = fs::read_to_string(&path)
+        .map_err(|err| anyhow!("cannot read {}: {err}", path.display()))?;
+    preseed_cfg(&text)?;
+    Ok(text)
 }
 
 /// Writes the answer disk, the empty guest disk, and the boot ISO.
@@ -196,20 +229,20 @@ fn write_image(dest: &Path, body: &[u8]) -> Result<PathBuf> {
     Ok(dest.to_path_buf())
 }
 
-fn write_boot(iso: &Path, dest: &Path, public_key: &str) -> Result<bool> {
-    if already_patched(dest, public_key) {
+fn write_boot(iso: &Path, dest: &Path, public_key: &str, example: &str) -> Result<bool> {
+    if already_patched(dest, public_key, example) {
         return Ok(false);
     }
     let tmp = dest.with_extension("partial");
     fs::copy(iso, &tmp).map_err(|err| anyhow!("cannot copy installer: {err}"))?;
     if is_eltorito(&tmp)? {
-        patch_installer(&tmp, public_key)?;
+        patch_installer(&tmp, public_key, example)?;
     }
     fs::rename(&tmp, dest)?;
     Ok(true)
 }
 
-fn already_patched(dest: &Path, public_key: &str) -> bool {
+fn already_patched(dest: &Path, public_key: &str, example: &str) -> bool {
     let Ok(mut file) = File::open(dest) else {
         return false;
     };
@@ -229,11 +262,11 @@ fn already_patched(dest: &Path, public_key: &str) -> bool {
     // A menu-only copy is stale once the answers or the SSH key change.
     read_at(&mut file, hit.extent as u64 * SECTOR, &mut body).is_ok()
         && menu_ready(&body, &install)
-        && initrd_has_preseed(&mut file, &install, public_key)
+        && initrd_has_preseed(&mut file, &install, public_key, example)
 }
 
-fn initrd_has_preseed(file: &mut File, install: &str, public_key: &str) -> bool {
-    let Ok(extra) = preseed_gzip(public_key) else {
+fn initrd_has_preseed(file: &mut File, install: &str, public_key: &str, example: &str) -> bool {
+    let Ok(extra) = preseed_gzip(public_key, example) else {
         return false;
     };
     let Ok(hits) = walk_install(file, install) else {
@@ -267,10 +300,10 @@ fn is_eltorito(path: &Path) -> Result<bool> {
 
 /// The GRUB menu is `/boot/grub/grub.cfg`. The EFI stub only sources that file.
 /// Appending the preseed to the text initrd is the initrd method in the guide.
-fn patch_installer(path: &Path, public_key: &str) -> Result<()> {
+fn patch_installer(path: &Path, public_key: &str, example: &str) -> Result<()> {
     let mut file = OpenOptions::new().read(true).write(true).open(path)?;
     let install = install_dir(&mut file)?;
-    append_preseed(&mut file, &install, public_key)?;
+    append_preseed(&mut file, &install, public_key, example)?;
     patch_menu(&mut file, &install)?;
     file.sync_all()?;
     Ok(())
@@ -502,7 +535,9 @@ struct Hit {
     is_dir: bool,
 }
 
-fn append_preseed(file: &mut File, install: &str, public_key: &str) -> Result<()> {
+/// The official example does not fit in the sector slack, so the initrd is copied to the
+/// end of the image and both directory records are pointed at that copy.
+fn append_preseed(file: &mut File, install: &str, public_key: &str, example: &str) -> Result<()> {
     let hits = walk_install(file, install)?;
     let Some(initrd) = hits
         .iter()
@@ -512,14 +547,87 @@ fn append_preseed(file: &mut File, install: &str, public_key: &str) -> Result<()
     };
     let old = initrd.size;
     let extent = initrd.extent;
-    let extra = preseed_gzip(public_key)?;
-    let slack = sector_slack(old);
-    if extra.len() as u32 > slack {
-        bail!("installer initrd has no room for preseed.cfg");
+    if old > 256 * 1024 * 1024 {
+        bail!("installer initrd is unexpectedly large");
     }
-    let at = extent as u64 * SECTOR + old as u64;
-    write_at(file, at, &extra)?;
-    write_size(file, &hits, extent, old, old + extra.len() as u32, Some("initrd.gz"))
+    let extra = preseed_gzip(public_key, example)?;
+    if (extra.len() as u32) <= sector_slack(old) {
+        write_at(file, extent as u64 * SECTOR + old as u64, &extra)?;
+        return write_size(
+            file,
+            &hits,
+            extent,
+            old,
+            old + extra.len() as u32,
+            Some("initrd.gz"),
+        );
+    }
+    let mut body = vec![0u8; old as usize];
+    read_at(file, extent as u64 * SECTOR, &mut body)?;
+    body.extend_from_slice(&extra);
+    let new_extent = append_extent(file, body.len() as u64)?;
+    write_at(file, new_extent as u64 * SECTOR, &body)?;
+    let new_size = u32::try_from(body.len()).map_err(|_| anyhow!("preseed initrd is too large"))?;
+    for hit in &hits {
+        if hit.extent == extent && hit.size == old && hit.name.eq_ignore_ascii_case("initrd.gz") {
+            write_u32_both(file, hit.at + 2, new_extent)?;
+            write_u32_both(file, hit.at + 10, new_size)?;
+        }
+    }
+    Ok(())
+}
+
+fn append_extent(file: &mut File, bytes: u64) -> Result<u32> {
+    let old_len = file.metadata()?.len();
+    let start = old_len.div_ceil(SECTOR) * SECTOR;
+    let extent = u32::try_from(start / SECTOR)
+        .map_err(|_| anyhow!("installer image is too large to extend"))?;
+    let end = start + bytes;
+    file.set_len(end.div_ceil(SECTOR) * SECTOR)
+        .map_err(|err| anyhow!("cannot extend installer image: {err}"))?;
+    extend_hybrid_mbr(file, old_len)?;
+    let mut sector = [0u8; SECTOR as usize];
+    let mut n = 16u64;
+    loop {
+        if read_at(file, n * SECTOR, &mut sector).is_err() || &sector[1..6] != b"CD001" {
+            break;
+        }
+        if sector[0] == 1 || sector[0] == 2 {
+            let old = u32::from_le_bytes(sector[80..84].try_into().unwrap());
+            let sectors = u32::try_from(file.metadata()?.len() / SECTOR)
+                .map_err(|_| anyhow!("installer image is too large to extend"))?;
+            if sectors > old {
+                write_u32_both(file, n * SECTOR + 80, sectors)?;
+            }
+        }
+        if sector[0] == 255 || n > 32 {
+            break;
+        }
+        n += 1;
+    }
+    Ok(extent)
+}
+
+/// The boot copy is a USB disk. Grow the hybrid partition that covers the whole file.
+fn extend_hybrid_mbr(file: &mut File, old_len: u64) -> Result<()> {
+    let new_len = file.metadata()?.len();
+    if new_len % 512 != 0 || new_len < 512 {
+        return Ok(());
+    }
+    let mut mbr = [0u8; 512];
+    read_at(file, 0, &mut mbr)?;
+    if mbr[510] != 0x55 || mbr[511] != 0xaa {
+        return Ok(());
+    }
+    let lba = u32::from_le_bytes(mbr[454..458].try_into().unwrap());
+    let count = u32::from_le_bytes(mbr[458..462].try_into().unwrap());
+    if lba != 0 || count as u64 * 512 != old_len {
+        return Ok(());
+    }
+    let new_count =
+        u32::try_from(new_len / 512).map_err(|_| anyhow!("installer image is too large"))?;
+    mbr[458..462].copy_from_slice(&new_count.to_le_bytes());
+    write_at(file, 0, &mbr)
 }
 
 fn sector_slack(size: u32) -> u32 {
@@ -531,19 +639,19 @@ fn sector_slack(size: u32) -> u32 {
     }
 }
 
-fn preseed_gzip(public_key: &str) -> Result<Vec<u8>> {
+fn preseed_gzip(public_key: &str, example: &str) -> Result<Vec<u8>> {
     let mut enc = GzEncoder::new(Vec::new(), Compression::new(9));
-    enc.write_all(&cpio_preseed(public_key))?;
+    enc.write_all(&cpio_preseed(public_key, example)?)?;
     enc.finish()
         .map_err(|err| anyhow!("cannot compress preseed: {err}"))
 }
 
-fn cpio_preseed(public_key: &str) -> Vec<u8> {
-    let body = answers();
+fn cpio_preseed(public_key: &str, example: &str) -> Result<Vec<u8>> {
+    let body = preseed_cfg(example)?;
     let mut archive = newc("preseed.cfg", body.as_bytes());
     archive.extend(newc(AUTHORIZED, authorized_keys(public_key).as_bytes()));
     archive.extend(newc("TRAILER!!!", b""));
-    archive
+    Ok(archive)
 }
 
 fn newc(name: &str, body: &[u8]) -> Vec<u8> {
@@ -687,15 +795,19 @@ fn write_at(file: &mut File, at: u64, buf: &[u8]) -> Result<()> {
 }
 
 fn write_size(file: &mut File, hits: &[Hit], extent: u32, old: u32, new_size: u32, name: Option<&str>) -> Result<()> {
-    let mut size = [0u8; 8];
-    size[..4].copy_from_slice(&new_size.to_le_bytes());
-    size[4..].copy_from_slice(&new_size.to_be_bytes());
     for hit in hits {
         if hit.extent == extent && hit.size == old && name.is_none_or(|want| hit.name.eq_ignore_ascii_case(want)) {
-            write_at(file, hit.at + 10, &size)?;
+            write_u32_both(file, hit.at + 10, new_size)?;
         }
     }
     Ok(())
+}
+
+fn write_u32_both(file: &mut File, at: u64, n: u32) -> Result<()> {
+    let mut size = [0u8; 8];
+    size[..4].copy_from_slice(&n.to_le_bytes());
+    size[4..].copy_from_slice(&n.to_be_bytes());
+    write_at(file, at, &size)
 }
 
 fn u32_at(buf: &[u8], at: usize) -> u32 {
@@ -714,13 +826,11 @@ fn sparse(dest: &Path, bytes: u64) -> Result<()> {
     Ok(())
 }
 
-fn image(public_key: &str) -> Result<Vec<u8>> {
+fn image(public_key: &str, example: &str) -> Result<Vec<u8>> {
     let _ = public_key;
-    let text = answers();
-    if text.len() > 512 * 8 {
-        bail!("preseed is too large for the disk");
-    }
-    let mut disk = vec![0u8; 64 * 1024];
+    let text = preseed_cfg(example)?;
+    let clusters = text.len().div_ceil(512).max(1);
+    let mut disk = vec![0u8; 512 * (3 + clusters)];
     write_fat12(&mut disk, LABEL, "preseed.cfg", text.as_bytes())?;
     Ok(disk)
 }
@@ -792,12 +902,27 @@ fn write_fat12(disk: &mut [u8], label: &str, path: &str, body: &[u8]) -> Result<
     disk[slot + 11] = 0x20;
     put_u16(&mut disk[slot + 26..], cluster);
     put_u32(&mut disk[slot + 28..], body.len() as u32);
-    let file_at = data + (cluster as usize - 2) * bps;
-    if file_at + body.len() > disk.len() {
-        bail!("preseed does not fit");
+    let mut left = body;
+    if left.is_empty() {
+        chain(disk, fat, cluster, 0x0fff)?;
+        return Ok(());
     }
-    disk[file_at..file_at + body.len()].copy_from_slice(body);
-    chain(disk, fat, cluster, 0x0fff)?;
+    while !left.is_empty() {
+        let file_at = data + (cluster as usize - 2) * bps;
+        if file_at >= disk.len() {
+            bail!("preseed does not fit");
+        }
+        let n = left.len().min(bps).min(disk.len() - file_at);
+        disk[file_at..file_at + n].copy_from_slice(&left[..n]);
+        left = &left[n..];
+        let current = cluster;
+        cluster += 1;
+        if left.is_empty() {
+            chain(disk, fat, current, 0x0fff)?;
+        } else {
+            chain(disk, fat, current, cluster)?;
+        }
+    }
     Ok(())
 }
 
@@ -855,13 +980,31 @@ mod tests {
     use flate2::read::GzDecoder;
     use std::io::Read;
 
+    fn example() -> String {
+        let mut text = String::from("#_preseed_V1\nd-i debian-installer/locale string en_US.UTF-8\n# ");
+        let mut n = 0x12345678u32;
+        for _ in 0..4000 {
+            n = n.wrapping_mul(1664525).wrapping_add(1013904223);
+            text.push(char::from(b'a' + (n % 26) as u8));
+        }
+        text.push('\n');
+        text
+    }
+
     #[test]
     fn preseed_disk_contains_the_installer_answers() {
-        let disk = image(PUB).unwrap();
+        let disk = image(PUB, &example()).unwrap();
         let text = String::from_utf8_lossy(&disk);
         let answers = answers();
+        let preseed = preseed_cfg(&example()).unwrap();
         assert!(text.contains("PRESEED"));
-        assert!(disk.windows(answers.len()).any(|w| w == answers.as_bytes()));
+        assert!(disk.windows(preseed.len()).any(|w| w == preseed.as_bytes()));
+        assert!(preseed.contains("#_preseed_V1"));
+        assert!(preseed_cfg("not a preseed").is_err());
+        assert_eq!(
+            EXAMPLE_URL,
+            "https://www.debian.org/releases/trixie/example-preseed.txt"
+        );
         assert!(boot_args().contains("auto=true"));
         assert!(answers.contains("partman-auto/disk string /dev/vda"));
         assert!(answers.contains("debian-installer/exit/poweroff boolean false"));
@@ -878,8 +1021,8 @@ mod tests {
             1
         );
         assert!(!disk.windows(b"PRESEED/".len()).any(|w| w == b"PRESEED/"));
-        let gzip = preseed_gzip(PUB).unwrap();
-        assert!(gzip.len() < 800, "preseed gzip is {} bytes", gzip.len());
+        let gzip = preseed_gzip(PUB, &example()).unwrap();
+        assert!(gzip.len() < 16 * 1024, "preseed gzip is {} bytes", gzip.len());
         let mut plain = Vec::new();
         GzDecoder::new(gzip.as_slice())
             .read_to_end(&mut plain)
@@ -892,6 +1035,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("vmm-grub-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(dir.join("cache")).unwrap();
+        fs::write(dir.join("cache").join(EXAMPLE), example()).unwrap();
         let iso = dir.join("cache").join("debian-13.7.0-arm64-netinst.iso");
         fs::write(&iso, installer_iso()).unwrap();
         fs::create_dir_all(dir.join("ssh")).unwrap();
@@ -910,14 +1054,16 @@ mod tests {
         assert!(!text[..gtk].contains("auto=true"));
         assert!(boot[30 * 2048..31 * 2048].iter().all(|byte| *byte == 0));
         let size = initrd_size(&boot);
+        let at = u32_at(&boot, 22 * 2048 + 34 + 2) as usize * 2048;
         assert!(size > 100);
-        let extra = &boot[initrd_at(&boot) + 100..initrd_at(&boot) + size as usize];
+        assert!(at >= 48 * 2048, "the example does not fit in the initrd slack");
+        let extra = &boot[at + 100..at + size as usize];
         let mut dec = GzDecoder::new(extra);
         let mut cpio = Vec::new();
         dec.read_to_end(&mut cpio).unwrap();
         assert!(cpio
-            .windows(answers().len())
-            .any(|w| w == answers().as_bytes()));
+            .windows(preseed_cfg(&example()).unwrap().len())
+            .any(|w| w == preseed_cfg(&example()).unwrap().as_bytes()));
         assert!(cpio.windows(PUB.len()).any(|w| w == PUB.as_bytes()));
         let (_, again) = prepare(&iso, &dir).unwrap();
         assert!(!again);
@@ -968,6 +1114,7 @@ menuentry 'Graphical install' {
         let dir = std::env::temp_dir().join(format!("vmm-preseed-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(dir.join("cache")).unwrap();
+        fs::write(dir.join("cache").join(EXAMPLE), example()).unwrap();
         let iso = dir.join("cache").join("debian.iso");
         fs::write(&iso, b"iso").unwrap();
         fs::create_dir_all(dir.join("ssh")).unwrap();
@@ -994,10 +1141,6 @@ menuentry 'Graphical install' {
     }
 
     const PUB: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestKeyForTheInstaller debian@host";
-
-    fn initrd_at(_iso: &[u8]) -> usize {
-        24 * 2048
-    }
 
     fn initrd_size(iso: &[u8]) -> u32 {
         u32_at(iso, 22 * 2048 + 34 + 10)

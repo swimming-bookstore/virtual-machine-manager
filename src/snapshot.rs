@@ -352,6 +352,11 @@ mod tests {
         ));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(dir.join("cache")).unwrap();
+        fs::write(
+            dir.join("cache").join(preseed::EXAMPLE),
+            "#_preseed_V1\nd-i debian-installer/locale string en_US.UTF-8\n",
+        )
+        .unwrap();
         fs::create_dir_all(dir.join("ssh")).unwrap();
         fs::write(
             dir.join("ssh").join("authorized_keys"),

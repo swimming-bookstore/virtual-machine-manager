@@ -22,6 +22,10 @@ The private key is:
 ~/Library/Application Support/virtual-machine-manager/ssh/id_ed25519
 ```
 
+```sh
+open -R ~/Library/Application\ Support/virtual-machine-manager
+```
+
 The app logs in by itself after install. To do it yourself, use the guest address on `192.168.64.0/24` (not `.1`, that is the host):
 
 ```sh
