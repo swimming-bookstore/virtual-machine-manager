@@ -57,12 +57,31 @@ pub fn preseed_cfg(example: &str) -> Result<String> {
     Ok(text)
 }
 
-/// Overrides loaded after the official example. The example already sets locale, mirror
-/// layout, partitioning confirms, and GRUB. The guest disk is virtio, and the installer
-/// is a USB disk, so the disk has to be named or partman may pick the USB stick.
+/// Overrides loaded after the official example. The example already sets the mirror
+/// layout, partitioning confirms, and GRUB. Locale and keymap are also kernel
+/// parameters, because the installer asks them before this file is read. xfce-desktop
+/// installs keyboard-configuration in the target. That package asks "Please select
+/// the layout matching the keyboard for this machine" unless the variant is answered
+/// by its owner and marked seen; a `d-i` answer is not copied into the target.
+/// The guest disk is virtio, and the installer is a USB disk, so the disk has to be
+/// named or partman may pick the USB stick.
 pub fn answers() -> String {
     format!(
-        r#"d-i mirror/http/hostname string deb.debian.org
+        r#"d-i debian-installer/locale string en_US.UTF-8
+d-i keyboard-configuration/xkb-keymap select us
+d-i debian-installer/keymap string us
+d-i console-setup/ask_detect boolean false
+keyboard-configuration keyboard-configuration/xkb-keymap select us
+keyboard-configuration keyboard-configuration/modelcode string pc105
+keyboard-configuration keyboard-configuration/layoutcode string us
+keyboard-configuration keyboard-configuration/variantcode string
+keyboard-configuration keyboard-configuration/model select Generic 105-key PC
+keyboard-configuration keyboard-configuration/model seen true
+keyboard-configuration keyboard-configuration/layout select English (US)
+keyboard-configuration keyboard-configuration/layout seen true
+keyboard-configuration keyboard-configuration/variant select English (US)
+keyboard-configuration keyboard-configuration/variant seen true
+d-i mirror/http/hostname string deb.debian.org
 d-i passwd/root-login boolean false
 d-i passwd/user-fullname string debian
 d-i passwd/user-password password debian
@@ -106,8 +125,12 @@ pub fn authorized_keys(public_key: &str) -> String {
 }
 
 /// Boot parameters from the guide's auto mode. They belong before `---`.
+/// Locale and keymap are kernel parameters, not debconf keys: the installer asks
+/// them before it loads preseed.cfg. The matching aliases are in the installation
+/// guide. The target keyboard package asks again once xfce-desktop is installed;
+/// that question is answered in the preseed, not here.
 pub fn boot_args() -> String {
-    "auto=true priority=critical".to_string()
+    "auto=true priority=critical locale=en_US.UTF-8 keymap=us".to_string()
 }
 
 pub struct Prepared {
@@ -991,6 +1014,13 @@ mod tests {
             "https://www.debian.org/releases/trixie/example-preseed.txt"
         );
         assert!(boot_args().contains("auto=true"));
+        assert!(boot_args().contains("locale=en_US.UTF-8"));
+        assert!(boot_args().contains("keymap=us"));
+        assert!(answers.contains("keyboard-configuration/xkb-keymap select us"));
+        assert!(answers.contains("keyboard-configuration/variant select English (US)"));
+        assert!(answers.contains("keyboard-configuration/model select Generic 105-key PC"));
+        assert!(answers.contains("keyboard-configuration/variant seen true"));
+        assert!(answers.contains("debian-installer/locale string en_US.UTF-8"));
         assert!(answers.contains("deb.debian.org"));
         assert!(answers.contains("partman-auto/disk string /dev/vda"));
         assert!(answers.contains("grub-installer/bootdev string /dev/vda"));
@@ -1037,7 +1067,7 @@ mod tests {
         let text = String::from_utf8_lossy(menu);
         assert!(text.contains("set default=1\n"), "{text}");
         assert!(text.contains("set timeout=0\n"), "{text}");
-        assert!(text.contains("linux /install.a64/vmlinuz auto=true priority=critical --- quiet"));
+        assert!(text.contains("linux /install.a64/vmlinuz auto=true priority=critical locale=en_US.UTF-8 keymap=us --- quiet"));
         assert!(text.contains("linux /install.a64/vmlinuz --- quiet"));
         let gtk = text.find("gtk/initrd.gz").unwrap();
         assert!(!text[..gtk].contains("auto=true"));
@@ -1073,7 +1103,7 @@ menuentry 'Install' {
 }
 submenu 'Advanced options' {
     menuentry '... Automated install' {
-        linux    /install.amd/vmlinuz auto=true priority=critical vga=788 --- quiet
+        linux    /install.amd/vmlinuz auto=true priority=critical locale=en_US.UTF-8 keymap=us vga=788 --- quiet
         initrd   /install.amd/initrd.gz
     }
 }
@@ -1081,8 +1111,8 @@ submenu 'Advanced options' {
         let patched = menu_body(amd64, "install.amd").unwrap();
         assert!(patched.starts_with(b"set default=1\nset timeout=0\n"));
         assert!(patched
-            .windows(b"vmlinuz vga=788 auto=true priority=critical --- quiet".len())
-            .any(|line| line == b"vmlinuz vga=788 auto=true priority=critical --- quiet"));
+            .windows(b"vmlinuz vga=788 auto=true priority=critical locale=en_US.UTF-8 keymap=us --- quiet".len())
+            .any(|line| line == b"vmlinuz vga=788 auto=true priority=critical locale=en_US.UTF-8 keymap=us --- quiet"));
         let arm64 = b"\
 menuentry 'Install' {
     linux /install.a64/vmlinuz --- quiet
@@ -1214,7 +1244,7 @@ menuentry 'Install' {
 }
 submenu 'Advanced options' {
     menuentry '... Automated install' {
-        linux /install.a64/vmlinuz auto=true priority=critical --- quiet
+        linux /install.a64/vmlinuz auto=true priority=critical locale=en_US.UTF-8 keymap=us --- quiet
         initrd /install.a64/initrd.gz
     }
 }
