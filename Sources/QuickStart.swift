@@ -740,12 +740,20 @@ struct QuickStart: View {
         return session.needsInstallGuest && !session.showWindow
     }
 
-    /// A small 16:10 thumbnail, not a full-width preview.
+    /// A small 16:10 thumbnail. A tap opens the guest at the 1280 by 800 scanout.
+    /// The guest view does not take hits, so the tap sits in a clear overlay above it.
     private var installerView: some View {
         InstallGuest(session: installSlot.session!)
             .frame(width: 160, height: 100)
             .accessibilityLabel("Installer")
-            .accessibilityHint("The installer")
+            .overlay {
+                Color.clear
+                    .contentShape(Rectangle())
+                    .onTapGesture { installSlot.session?.showWindow = true }
+                    .accessibilityLabel("Installer")
+                    .accessibilityHint("Opens a larger view")
+                    .accessibilityAddTraits(.isButton)
+            }
     }
 
     private func icon(_ state: String) -> String {

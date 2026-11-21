@@ -71,7 +71,6 @@ struct Install: View {
             if setup && !embedded {
                 InstallerWindow(guest: guest, presented: $guest.showWindow) {
                     GuestMirror(session: guest)
-                        .frame(width: 800, height: 500)
                         .background(.black, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
                         .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
                 }
@@ -310,7 +309,6 @@ struct InstallGuest: View {
         GuestView(session: session, capture: false)
             .background(.black, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
             .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-            .allowsHitTesting(false)
     }
 }
 
@@ -1232,8 +1230,10 @@ private struct InstallerWindow<Content: View>: NSViewRepresentable {
                 panel.orderFront(nil)
                 return
             }
-            let host = NSHostingView(rootView: content().padding(16))
-            host.frame = NSRect(x: 0, y: 0, width: 832, height: 532)
+            let screen = (parent?.screen ?? NSScreen.main)?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1312, height: 832)
+            let guest = CGSize(width: min(1280, max(640, screen.width - 32)), height: min(800, max(400, screen.height - 32)))
+            let host = NSHostingView(rootView: content().frame(width: guest.width, height: guest.height).padding(16))
+            host.frame = NSRect(x: 0, y: 0, width: guest.width + 32, height: guest.height + 32)
             let panel = NSPanel(
                 contentRect: host.frame,
                 styleMask: [.titled, .closable, .miniaturizable],
@@ -1252,6 +1252,15 @@ private struct InstallerWindow<Content: View>: NSViewRepresentable {
             if let parent {
                 var origin = parent.frame.origin
                 origin.x += parent.frame.width + 16
+                if let visible = (parent.screen ?? NSScreen.main)?.visibleFrame {
+                    if origin.x + panel.frame.width > visible.maxX {
+                        origin.x = max(visible.minX, visible.maxX - panel.frame.width)
+                    }
+                    if origin.y + panel.frame.height > visible.maxY {
+                        origin.y = visible.maxY - panel.frame.height
+                    }
+                    if origin.y < visible.minY { origin.y = visible.minY }
+                }
                 panel.setFrameOrigin(origin)
             }
             panel.makeFirstResponder(nil)
