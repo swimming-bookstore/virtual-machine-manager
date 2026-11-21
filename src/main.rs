@@ -378,6 +378,25 @@ fn cache_step(
     Ok(bytes)
 }
 
+/// Official example, cached like the key. A file already there is not fetched again.
+fn fetch_example(agent: &ureq::Agent, cache: &Path) -> Result<()> {
+    let dest = cache.join(preseed::EXAMPLE);
+    if dest.is_file() {
+        if let Ok(text) = fs::read_to_string(&dest) {
+            if preseed::preseed_cfg(&text).is_ok() {
+                return Ok(());
+            }
+        }
+    }
+    let body = verify::fetch(agent, preseed::EXAMPLE_URL)?;
+    let text = std::str::from_utf8(&body).map_err(|_| anyhow!("example-preseed.txt is not text"))?;
+    preseed::preseed_cfg(text)?;
+    let partial = cache.join(format!("{}.partial", preseed::EXAMPLE));
+    fs::write(&partial, &body)?;
+    fs::rename(&partial, &dest)?;
+    Ok(())
+}
+
 fn run(dir: &Path, order: &mut Order) -> Result<()> {
     let arch = guest_arch()?;
     let cache = dir.join("cache");
@@ -446,6 +465,9 @@ fn run(dir: &Path, order: &mut Order) -> Result<()> {
     for id in ["sshkey", "preseed", "disk", "patch"] {
         order.step(id, "now")?;
         if !wrote(dir, &cache, id) {
+            if id == "preseed" || id == "patch" {
+                fetch_example(&agent, &cache)?;
+            }
             keep(dir, &cache, id, || match id {
                 "sshkey" => ssh::ensure(&dir.join("ssh")),
                 "preseed" => preseed::write_preseed(dir).map(|_| ()),

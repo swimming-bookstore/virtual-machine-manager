@@ -19,6 +19,7 @@ const SUMS: &[u8] = include_bytes!("fixtures/e2e/SHA512SUMS");
 const SIGN: &[u8] = include_bytes!("fixtures/e2e/SHA512SUMS.sign");
 const ISO: &[u8] = include_bytes!("fixtures/e2e/iso.bin");
 const FP: &str = include_str!("fixtures/e2e/fp.txt");
+const EXAMPLE: &[u8] = b"#_preseed_V1\nd-i debian-installer/locale string en_US.UTF-8\n";
 
 fn arch() -> &'static str {
     if cfg!(target_arch = "aarch64") {
@@ -83,7 +84,10 @@ fn serve(
     hold: bool,
     pace: bool,
 ) -> (String, World) {
-    let mut files = vec![("/CD/key-DA87E80D6294BE9B.txt", key.to_vec())];
+    let mut files = vec![
+        ("/CD/key-DA87E80D6294BE9B.txt", key.to_vec()),
+        ("/releases/trixie/example-preseed.txt", EXAMPLE.to_vec()),
+    ];
     for arch in ["amd64", "arm64"] {
         files.push((
             Box::leak(format!("/debian-cd/current/{arch}/iso-cd/SHA512SUMS").into_boxed_str()),
@@ -500,6 +504,7 @@ fn quick_start_checks_the_signature_before_the_iso() {
             format!("/debian-cd/current/{}/iso-cd/SHA512SUMS", arch()),
             format!("/debian-cd/current/{}/iso-cd/SHA512SUMS.sign", arch()),
             iso.clone(),
+            "/releases/trixie/example-preseed.txt".into(),
         ]
     );
     assert!(
@@ -545,6 +550,7 @@ fn quick_start_checks_the_signature_before_the_iso() {
         "SHA512SUMS.sign",
         &iso_name(),
         "manifest.json",
+        "example-preseed.txt",
         "download.lock",
     ] {
         assert!(cache.join(file).is_file(), "{file}");
