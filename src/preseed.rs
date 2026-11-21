@@ -36,7 +36,7 @@ pub const SNAPSHOT: &str = "snapshots/debian";
 pub const GUEST: u64 = 16 * 1024 * 1024 * 1024;
 
 pub const USER: &str = "debian";
-/// Written into the guest so the host can log in without a password.
+/// Written into the guest so the host can log in with this key.
 pub const AUTHORIZED: &str = "authorized_keys";
 
 /// Official example. Downloaded, not kept in the binary.
@@ -57,45 +57,29 @@ pub fn preseed_cfg(example: &str) -> Result<String> {
     Ok(text)
 }
 
-/// Answers the installer loads after the official example.
+/// Overrides loaded after the official example. The example already sets locale, mirror
+/// layout, partitioning confirms, and GRUB. The guest disk is virtio, and the installer
+/// is a USB disk, so the disk has to be named or partman may pick the USB stick.
 pub fn answers() -> String {
     format!(
-        "\
-d-i debian-installer/locale string en_US.UTF-8
-d-i keyboard-configuration/xkb-keymap select us
-d-i netcfg/choose_interface select auto
-d-i netcfg/get_hostname string debian
-d-i netcfg/get_domain string local
-d-i mirror/country string manual
-d-i mirror/http/hostname string deb.debian.org
-d-i mirror/http/directory string /debian
-d-i mirror/http/proxy string
+        r#"d-i mirror/http/hostname string ftp.hk.debian.org
 d-i passwd/root-login boolean false
 d-i passwd/user-fullname string debian
-d-i passwd/username string debian
 d-i passwd/user-password password debian
 d-i passwd/user-password-again password debian
-d-i clock-setup/utc boolean true
-d-i time/zone string UTC
-d-i partman-auto/method string regular
+d-i passwd/username string debian
 d-i partman-auto/disk string /dev/vda
-d-i partman-auto/choose_recipe select atomic
-d-i partman-partitioning/confirm_write_new_label boolean true
-d-i partman/choose_partition select finish
-d-i partman/confirm boolean true
-d-i partman/confirm_nooverwrite boolean true
-d-i apt-setup/cdrom/set-first boolean false
-tasksel tasksel/first multiselect standard, xfce-desktop, ssh-server
-d-i pkgsel/include string openssh-server xfce4
 d-i grub-installer/bootdev string /dev/vda
-d-i grub-installer/only_debian boolean true
-d-i finish-install/reboot_in_progress note
-d-i cdrom-checker/start boolean false
-d-i cdrom-detect/eject boolean false
-d-i debian-installer/exit/halt boolean false
-d-i debian-installer/exit/poweroff boolean false
 d-i preseed/late_command string {late}
-",
+
+tasksel tasksel/first multiselect \
+  ssh-server, \
+  standard, \
+  xfce-desktop, \
+  ,
+
+popularity-contest popularity-contest/participate boolean false
+"#,
         late = late_command(),
     )
 }
@@ -1007,15 +991,14 @@ mod tests {
             "https://www.debian.org/releases/trixie/example-preseed.txt"
         );
         assert!(boot_args().contains("auto=true"));
+        assert!(answers.contains("ftp.hk.debian.org"));
         assert!(answers.contains("partman-auto/disk string /dev/vda"));
-        assert!(answers.contains("debian-installer/exit/poweroff boolean false"));
-        assert!(answers.contains("debian-installer/exit/halt boolean false"));
-        assert!(answers.contains("openssh-server"));
+        assert!(answers.contains("grub-installer/bootdev string /dev/vda"));
+        assert!(answers.contains("ssh-server"));
         assert!(answers.contains("xfce-desktop"));
-        assert!(answers.contains("xfce4"));
         assert!(answers.contains("user-password password debian"));
         assert!(answers.contains("user-password-again password debian"));
-        assert!(!answers.contains("run_tasksel boolean false"));
+        assert!(answers.contains("popularity-contest/participate boolean false"));
         assert!(answers.contains("cp /authorized_keys"));
         assert!(answers.contains("systemctl enable ssh && sync && poweroff"));
         assert!(!answers.contains('#'));
