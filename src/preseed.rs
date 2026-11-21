@@ -62,7 +62,7 @@ pub fn preseed_cfg(example: &str) -> Result<String> {
 /// is a USB disk, so the disk has to be named or partman may pick the USB stick.
 pub fn answers() -> String {
     format!(
-        r#"d-i mirror/http/hostname string ftp.hk.debian.org
+        r#"d-i mirror/http/hostname string deb.debian.org
 d-i passwd/root-login boolean false
 d-i passwd/user-fullname string debian
 d-i passwd/user-password password debian
@@ -991,7 +991,7 @@ mod tests {
             "https://www.debian.org/releases/trixie/example-preseed.txt"
         );
         assert!(boot_args().contains("auto=true"));
-        assert!(answers.contains("ftp.hk.debian.org"));
+        assert!(answers.contains("deb.debian.org"));
         assert!(answers.contains("partman-auto/disk string /dev/vda"));
         assert!(answers.contains("grub-installer/bootdev string /dev/vda"));
         assert!(answers.contains("ssh-server"));
