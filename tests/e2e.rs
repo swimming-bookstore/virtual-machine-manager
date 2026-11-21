@@ -993,6 +993,8 @@ struct Screen {
     downloading: bool,
     /// True only for the run Reset just started. A later open does not set this.
     rebuild: bool,
+    /// Set when start() consumes rebuild, which is the worker's --rebuild.
+    passed_rebuild: bool,
     /// Changes on Reset so the mounted install is a new guest.
     run_id: i32,
     started: bool,
@@ -1105,6 +1107,7 @@ impl Screen {
             cancelled: false,
             downloading: false,
             rebuild: false,
+            passed_rebuild: false,
             run_id: 0,
             started: false,
             running: false,
@@ -1121,6 +1124,14 @@ impl Screen {
         self.cancelled = false;
         self.error = None;
         self.ready_path = None;
+        self.disk_path = None;
+        // Reset already set this. Consuming it here is what the worker sees as --rebuild.
+        // A later open calls start() with it false and reuses the disk.
+        let rebuilding = self.rebuild;
+        self.rebuild = false;
+        if rebuilding {
+            self.passed_rebuild = true;
+        }
         self.running = true;
     }
 
@@ -1139,7 +1150,11 @@ impl Screen {
     }
 
     fn reset(&mut self) {
+        let run_id = self.run_id;
         *self = Self::new();
+        // The caller sets rebuild after this. Clearing it here made Reset reuse the stuck disk.
+        self.run_id = run_id;
+        self.passed_rebuild = false;
     }
 
     fn retry(&mut self) {
@@ -2157,7 +2172,8 @@ fn reset_keeps_the_download_cache_and_rebuilds_the_image() {
     let mut screen = finished;
     screen.reset_wizard();
     assert_eq!(screen.run_id, 1);
-    assert!(screen.rebuild, "Reset passes --rebuild; opening the window does not");
+    assert!(screen.passed_rebuild, "Reset passes --rebuild; opening the window does not");
+    assert!(!screen.rebuild, "the flag is consumed, so a later open reuses the disk");
     assert!(screen.steps.iter().all(|step| step.state == "wait"));
     for event in &again {
         screen.apply(event);
@@ -2185,6 +2201,7 @@ fn reset_keeps_the_download_cache_and_rebuilds_the_image() {
     let mut plain = Screen::new();
     plain.start();
     assert!(!plain.rebuild);
+    assert!(!plain.passed_rebuild);
     assert_eq!(plain.run_id, 0);
 }
 
@@ -3504,7 +3521,8 @@ fn quick_start_swift_gates_the_bar_on_a_real_download() {
     assert!(!src.contains("Button(\"Open"));
     assert!(src.contains(".frame(width: 160, height: 100)"));
     assert!(src.contains("installSlot.session?.showWindow = true"));
-    assert!(src.contains(".onTapGesture { installSlot.session?.showWindow = true }"));
+    assert!(src.contains("Button {"));
+    assert!(!src.contains(".onTapGesture { installSlot.session?.showWindow = true }"));
     assert!(!src.contains("onTapGesture(count: 2)"));
     assert!(!include_str!("../Sources/Install.swift").contains("Button(\"Show installer\")"));
     assert!(!include_str!("../Sources/Install.swift").contains("onTapGesture(count: 2)"));

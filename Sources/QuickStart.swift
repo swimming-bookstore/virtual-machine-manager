@@ -127,6 +127,9 @@ final class Wizard: ObservableObject {
         error = nil
         readyPath = nil
         diskPath = nil
+        // Reset already set this. A later open calls start() with it false and reuses the disk.
+        let rebuilding = rebuild
+        rebuild = false
         guard let worker = WorkerPath.url() else {
             error = "The worker is not built. Run cargo build --release, then try again."
             failCurrent()
@@ -137,7 +140,7 @@ final class Wizard: ObservableObject {
         process.executableURL = worker
         var arguments = ["download", "--dir", CacheFolder.url.deletingLastPathComponent().path]
         // Reset rebuilds the image. Opening the window again still reuses a disk that is already there.
-        if rebuild {
+        if rebuilding {
             arguments.append("--rebuild")
         }
         process.arguments = arguments
@@ -185,6 +188,7 @@ final class Wizard: ObservableObject {
         session?.stop()
         process?.terminate()
         reap(process)
+        // reset() clears the screen, including rebuild. Set it after that, or start() reuses the stuck disk.
         reset()
         rebuild = true
         runID += 1
@@ -207,7 +211,7 @@ final class Wizard: ObservableObject {
         cancelled = false
         headline = nil
         started = false
-        rebuild = false
+        // The caller sets rebuild after this. Clearing it here made Reset reuse the stuck disk.
     }
 
     private func reap(_ done: Process?) {
