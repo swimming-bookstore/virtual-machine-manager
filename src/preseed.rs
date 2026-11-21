@@ -71,9 +71,10 @@ d-i mirror/http/hostname string deb.debian.org
 d-i mirror/http/directory string /debian
 d-i mirror/http/proxy string
 d-i passwd/root-login boolean false
-d-i passwd/user-fullname string Debian
+d-i passwd/user-fullname string debian
 d-i passwd/username string debian
-d-i passwd/user-password-crypted password !
+d-i passwd/user-password password debian
+d-i passwd/user-password-again password debian
 d-i clock-setup/utc boolean true
 d-i time/zone string UTC
 d-i partman-auto/method string regular
@@ -84,8 +85,8 @@ d-i partman/choose_partition select finish
 d-i partman/confirm boolean true
 d-i partman/confirm_nooverwrite boolean true
 d-i apt-setup/cdrom/set-first boolean false
-d-i pkgsel/run_tasksel boolean false
-d-i pkgsel/include string openssh-server
+tasksel tasksel/first multiselect standard, xfce-desktop, ssh-server
+d-i pkgsel/include string openssh-server xfce4
 d-i grub-installer/bootdev string /dev/vda
 d-i grub-installer/only_debian boolean true
 d-i finish-install/reboot_in_progress note
@@ -1010,6 +1011,11 @@ mod tests {
         assert!(answers.contains("debian-installer/exit/poweroff boolean false"));
         assert!(answers.contains("debian-installer/exit/halt boolean false"));
         assert!(answers.contains("openssh-server"));
+        assert!(answers.contains("xfce-desktop"));
+        assert!(answers.contains("xfce4"));
+        assert!(answers.contains("user-password password debian"));
+        assert!(answers.contains("user-password-again password debian"));
+        assert!(!answers.contains("run_tasksel boolean false"));
         assert!(answers.contains("cp /authorized_keys"));
         assert!(answers.contains("systemctl enable ssh && sync && poweroff"));
         assert!(!answers.contains('#'));

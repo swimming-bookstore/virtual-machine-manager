@@ -14,7 +14,7 @@ open virtual-machine-manager.app
 
 ## Log in
 
-There is no password. The install writes your host key into the `debian` account.
+Log in as `debian` with password `debian`. The install also writes your host key into that account. The desktop is xfce4.
 
 The private key is:
 
