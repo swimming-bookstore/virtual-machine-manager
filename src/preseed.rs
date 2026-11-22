@@ -104,6 +104,9 @@ tasksel tasksel/first multiselect \
   xfce-desktop, \
   ,
 
+d-i finish-install/reboot_in_progress note
+d-i debian-installer/exit/poweroff boolean true
+d-i cdrom-detect/eject boolean false
 popularity-contest popularity-contest/participate boolean false
 "#,
         early = early_command(),
@@ -111,15 +114,17 @@ popularity-contest popularity-contest/participate boolean false
     )
 }
 
-/// Writes the target keyboard file and marks the layout question seen. The
-/// installer's keyboard setup replaces `/etc/default/keyboard` after early_command,
-/// so the hook writes the target file itself. `skip` is not a real variant: the
-/// package treats that layout as unsupported and does not ask. The seen flags
-/// cover the case where that file is replaced by a normal US layout before the
-/// package configures. The hook is one shell line. A `#` in this line is a
-/// debconf comment, so the script has no shebang.
+/// Writes the target keyboard file and marks the layout question seen.
+/// `base-installer.d` runs before `/target` exists, so the hook only acts once
+/// the base system is there. The installer's keyboard setup replaces
+/// `/etc/default/keyboard` after early_command, so the hook writes the target
+/// file itself. `skip` is not a real variant: the package treats that layout as
+/// unsupported and does not ask. The seen flags cover the case where that file
+/// is replaced by a normal US layout before the package configures. The hook is
+/// one shell line. A `#` in this line is a debconf comment, so the script has
+/// no shebang.
 fn early_command() -> String {
-    "mkdir -p /etc/default /usr/lib/pre-pkgsel.d /usr/lib/base-installer.d && printf '%s\\n' XKBMODEL=pc105 XKBLAYOUT=us XKBVARIANT=skip XKBOPTIONS= BACKSPACE=guess > /etc/default/keyboard && printf '%s\\n' 'mkdir -p /target/etc/default' 'printf '\\''%s\\n'\\'' XKBMODEL=pc105 XKBLAYOUT=us XKBVARIANT=skip XKBOPTIONS= BACKSPACE=guess > /target/etc/default/keyboard' 'printf '\\''%s\\n'\\'' '\\''keyboard-configuration keyboard-configuration/layout select English (US)'\\'' '\\''keyboard-configuration keyboard-configuration/variant select English (US)'\\'' '\\''keyboard-configuration keyboard-configuration/model select Generic 105-key PC'\\'' '\\''keyboard-configuration keyboard-configuration/layoutcode string us'\\'' '\\''keyboard-configuration keyboard-configuration/variantcode string '\\'' '\\''keyboard-configuration keyboard-configuration/modelcode string pc105'\\'' '\\''keyboard-configuration keyboard-configuration/optionscode string '\\'' '\\''keyboard-configuration keyboard-configuration/layout seen true'\\'' '\\''keyboard-configuration keyboard-configuration/variant seen true'\\'' '\\''keyboard-configuration keyboard-configuration/model seen true'\\'' | chroot /target debconf-set-selections' > /usr/lib/pre-pkgsel.d/10keyboard && cp /usr/lib/pre-pkgsel.d/10keyboard /usr/lib/base-installer.d/15keyboard && chmod 755 /usr/lib/pre-pkgsel.d/10keyboard /usr/lib/base-installer.d/15keyboard".to_string()
+    "mkdir -p /etc/default /usr/lib/pre-pkgsel.d /usr/lib/post-base-installer.d && printf '%s\\n' XKBMODEL=pc105 XKBLAYOUT=us XKBVARIANT=skip XKBOPTIONS= BACKSPACE=guess > /etc/default/keyboard && printf '%s\\n' '[ -d /target/usr/bin ] || exit 0' 'mkdir -p /target/etc/default' 'printf '\\''%s\\n'\\'' XKBMODEL=pc105 XKBLAYOUT=us XKBVARIANT=skip XKBOPTIONS= BACKSPACE=guess > /target/etc/default/keyboard' 'printf '\\''%s\\n'\\'' '\\''keyboard-configuration keyboard-configuration/layout select English (US)'\\'' '\\''keyboard-configuration keyboard-configuration/variant select English (US)'\\'' '\\''keyboard-configuration keyboard-configuration/model select Generic 105-key PC'\\'' '\\''keyboard-configuration keyboard-configuration/layoutcode string us'\\'' '\\''keyboard-configuration keyboard-configuration/variantcode string '\\'' '\\''keyboard-configuration keyboard-configuration/modelcode string pc105'\\'' '\\''keyboard-configuration keyboard-configuration/optionscode string '\\'' '\\''keyboard-configuration keyboard-configuration/layout seen true'\\'' '\\''keyboard-configuration keyboard-configuration/variant seen true'\\'' '\\''keyboard-configuration keyboard-configuration/model seen true'\\'' | chroot /target debconf-set-selections' > /usr/lib/pre-pkgsel.d/10keyboard && cp /usr/lib/pre-pkgsel.d/10keyboard /usr/lib/post-base-installer.d/15keyboard && chmod 755 /usr/lib/pre-pkgsel.d/10keyboard /usr/lib/post-base-installer.d/15keyboard".to_string()
 }
 
 /// Runs in the installer, with `/target` still mounted. A non-zero exit does not
@@ -144,8 +149,8 @@ pub fn authorized_keys(public_key: &str) -> String {
 }
 
 /// Boot parameters from the guide's auto mode. They belong before `---`.
-/// Locale and keymap are kernel parameters. `priority=critical` still asks
-/// critical questions, so it does not answer the target layout prompt.
+/// Locale and keymap are kernel parameters. The final install note is critical,
+/// so it is marked seen in the preseed file rather than here.
 pub fn boot_args() -> String {
     "auto=true priority=critical locale=en_US.UTF-8 keymap=us".to_string()
 }
@@ -1040,7 +1045,9 @@ mod tests {
         assert!(answers.contains("debconf-set-selections"));
         assert!(answers.contains("preseed/early_command"));
         assert!(answers.contains("pre-pkgsel.d/10keyboard"));
-        assert!(answers.contains("base-installer.d/15keyboard"));
+        assert!(answers.contains("post-base-installer.d/15keyboard"));
+        assert!(answers.contains("[ -d /target/usr/bin ] || exit 0"));
+        assert!(answers.contains("popularity-contest/participate boolean false"));
         assert!(!answers.contains('#'));
         assert!(answers.contains("debian-installer/locale string en_US.UTF-8"));
         assert!(answers.contains("deb.debian.org"));
@@ -1050,7 +1057,9 @@ mod tests {
         assert!(answers.contains("xfce-desktop"));
         assert!(answers.contains("user-password password debian"));
         assert!(answers.contains("user-password-again password debian"));
-        assert!(answers.contains("popularity-contest/participate boolean false"));
+        assert!(answers.contains("finish-install/reboot_in_progress note"));
+        assert!(answers.contains("debian-installer/exit/poweroff boolean true"));
+        assert!(answers.contains("cdrom-detect/eject boolean false"));
         assert!(answers.contains("cp /authorized_keys"));
         assert!(answers.contains("systemctl enable ssh && sync && poweroff"));
         assert!(!answers.contains('#'));
