@@ -51,8 +51,12 @@ struct Install: View {
     /// Quick start stays the download-sized wizard. A clone is the machine window.
     private var setup: Bool { !fromSnapshot }
 
-    /// A clone captures while it is running. Quick start does not, including the installer window opened from the thumbnail.
+    /// A clone captures the pointer while it is running. Quick start does not, including the installer window.
     private var capturePointer: Bool { fromSnapshot && !guest.stopped }
+
+    /// The library window is a normal key window, and the running clone has a USB keyboard.
+    /// Keys have to reach that keyboard. Pointer capture is separate, so typing does not grab the cursor.
+    private var captureKeyboard: Bool { fromSnapshot && !guest.stopped }
 
     var body: some View {
         Group {
@@ -67,13 +71,12 @@ struct Install: View {
         }
         .background {
             // The window stays with the mounted guest. Quick start draws the thumbnail, not this page.
-            // The embedded copy is invisible, so it must not also open the installer panel.
+            // Quick start opens the panel itself. This page only opens it when the install is visible.
             if setup && !embedded {
                 InstallerWindow(guest: guest, presented: $guest.showWindow) {
                     GuestMirror(session: guest)
-                        .frame(width: 800, height: 500)
-                        .background(.black, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-                        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                        .frame(minWidth: 640, maxWidth: .infinity, minHeight: 400, maxHeight: .infinity)
+                        .background(.black)
                 }
             }
         }
@@ -186,7 +189,7 @@ struct Install: View {
     /// GuestView stays mounted under that frame. Replacing it unhooks the virtual machine view, and the next pause has nothing to snapshot.
     /// The still is an AppKit sibling on top of the Metal guest. A SwiftUI Image in the ZStack does not cover it.
     private var guestScreen: some View {
-        GuestView(session: guest, capture: capturePointer, preview: guest.pausePreview)
+        GuestView(session: guest, capture: capturePointer, keyboard: captureKeyboard, preview: guest.pausePreview)
             .background(.black, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
             .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
     }
@@ -310,7 +313,6 @@ struct InstallGuest: View {
         GuestView(session: session, capture: false)
             .background(.black, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
             .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-            .allowsHitTesting(false)
     }
 }
 
@@ -698,6 +700,7 @@ final class GuestSession: ObservableObject {
         vm.delegate = callbacks
         view.virtualMachine = vm
         view.capture = false
+        view.keyboard = false
         machine = vm
     }
 
@@ -1097,6 +1100,7 @@ final class GuestSession: ObservableObject {
 
     func attach(_ screen: InstallScreen) {
         screen.capture = false
+        screen.keyboard = false
         if screen.virtualMachine !== machine {
             screen.virtualMachine = machine
         }
@@ -1151,7 +1155,6 @@ final class GuestSession: ObservableObject {
             }
         } else {
             markSetup("partition", state: "now")
-            headline = "The installer starts on its own and installs Debian."
         }
     }
 
@@ -1186,10 +1189,12 @@ final class GuestSession: ObservableObject {
     }
 }
 
-/// Opens the guest in its own window. The wizard stays the download size.
-/// The view is not in the wizard while this window is open, so the thumbnail mirrors it.
-private struct InstallerWindow<Content: View>: NSViewRepresentable {
-    let guest: GuestSession
+/// Opens a preview of the guest at its original scanout. The wizard stays the download size.
+/// The panel has a normal title bar. The guest fills the body, with no padding.
+/// Quick start mounts this. The embedded install is invisible, so it cannot be the only owner.
+/// The thumbnail keeps its own view. This window uses a second one, so opening does not blank it.
+struct InstallerWindow<Content: View>: NSViewRepresentable {
+    @ObservedObject var guest: GuestSession
     @Binding var presented: Bool
     @ViewBuilder var content: () -> Content
 
@@ -1229,36 +1234,52 @@ private struct InstallerWindow<Content: View>: NSViewRepresentable {
 
         func open(near parent: NSWindow?) {
             if let panel {
-                panel.orderFront(nil)
+                panel.orderFrontRegardless()
                 return
             }
-            let host = NSHostingView(rootView: content().padding(16))
-            host.frame = NSRect(x: 0, y: 0, width: 832, height: 532)
+            // Opens at the scanout. The guest fills the body under the title bar. Resize still works.
+            let guestSize = Guest.scanoutSize
+            let host = NSHostingView(rootView: content())
+            host.frame = NSRect(origin: .zero, size: guestSize)
             let panel = NSPanel(
                 contentRect: host.frame,
-                styleMask: [.titled, .closable, .miniaturizable],
+                styleMask: [.titled, .closable, .miniaturizable, .resizable],
                 backing: .buffered,
                 defer: false
             )
             panel.title = "Installer"
+            panel.backgroundColor = .black
+            panel.isMovableByWindowBackground = true
             panel.isReleasedWhenClosed = false
             panel.hidesOnDeactivate = false
             panel.contentView = host
+            panel.contentMinSize = NSSize(width: 640, height: 400)
             // A non-activating panel does not become key, so it cannot take the keyboard.
             // The guest view also ignores the pointer. Quick start never attaches one.
             panel.styleMask.insert(.nonactivatingPanel)
+            panel.isFloatingPanel = true
             panel.becomesKeyOnlyIfNeeded = true
             panel.level = .floating
-            if let parent {
-                var origin = parent.frame.origin
-                origin.x += parent.frame.width + 16
+            let anchor = parent ?? NSApp.windows.first { $0.title == "Quick start" && $0.isVisible }
+            if let anchor {
+                var origin = anchor.frame.origin
+                origin.x += anchor.frame.width + 16
+                if let visible = (anchor.screen ?? NSScreen.main)?.visibleFrame {
+                    if origin.x + panel.frame.width > visible.maxX {
+                        origin.x = max(visible.minX, visible.maxX - panel.frame.width)
+                    }
+                    if origin.y + panel.frame.height > visible.maxY {
+                        origin.y = visible.maxY - panel.frame.height
+                    }
+                    if origin.y < visible.minY { origin.y = visible.minY }
+                }
                 panel.setFrameOrigin(origin)
             }
             panel.makeFirstResponder(nil)
             let delegate = PanelClose(guest: guest)
             panel.delegate = delegate
             objc_setAssociatedObject(panel, &panelCloseKey, delegate, .OBJC_ASSOCIATION_RETAIN)
-            panel.orderFront(nil)
+            panel.orderFrontRegardless()
             self.panel = panel
         }
 
@@ -1278,19 +1299,23 @@ private final class PanelClose: NSObject, NSWindowDelegate {
         DispatchQueue.main.async { self.guest.showWindow = false }
     }
     func windowDidBecomeKey(_ notification: Notification) {
-        (notification.object as? NSWindow)?.makeFirstResponder(nil)
+        guard let window = notification.object as? NSWindow else { return }
+        window.makeFirstResponder(nil)
     }
 }
 
 struct GuestView: NSViewRepresentable {
     let session: GuestSession
     var capture: Bool
+    /// Send key events to the guest. The installer thumbnail leaves this off.
+    var keyboard: Bool = false
     var preview: NSImage? = nil
 
     func makeNSView(context: Context) -> GuestPane {
         let pane = GuestPane()
         pane.embed(session.view)
         session.view.capture = capture
+        session.view.keyboard = keyboard
         // The view's own size guess is a tiny blank. The slot proposes the real size.
         session.view.setContentHuggingPriority(.defaultLow, for: .horizontal)
         session.view.setContentHuggingPriority(.defaultLow, for: .vertical)
@@ -1303,6 +1328,7 @@ struct GuestView: NSViewRepresentable {
     func updateNSView(_ nsView: GuestPane, context: Context) {
         nsView.embed(session.view)
         session.view.capture = capture
+        session.view.keyboard = keyboard
         // A paused still must not be cleared by a SwiftUI pass that still has a nil preview.
         if let preview {
             nsView.show(preview)
@@ -1378,6 +1404,15 @@ final class GuestPane: NSView {
     }
 
     override var isOpaque: Bool { true }
+
+    /// The thumbnail's click is a SwiftUI control above this pane. A Metal guest must not keep that click.
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard let screen = subviews.first(where: { $0 is InstallScreen }) as? InstallScreen,
+              screen.capture || screen.keyboard else {
+            return nil
+        }
+        return super.hitTest(point)
+    }
 }
 
 /// Second view of the same guest, used only by the installer window.
@@ -1389,12 +1424,14 @@ struct GuestMirror: NSViewRepresentable {
     func makeNSView(context: Context) -> InstallScreen {
         let screen = InstallScreen()
         screen.capture = false
+        screen.keyboard = false
         session.attach(screen)
         return screen
     }
 
     func updateNSView(_ nsView: InstallScreen, context: Context) {
         nsView.capture = false
+        nsView.keyboard = false
         session.attach(nsView)
     }
 
@@ -1414,6 +1451,11 @@ final class InstallScreen: VZVirtualMachineView {
     private var drawn = CGSize(width: 800, height: 500)
 
     var capture = false {
+        didSet { applyCapture() }
+    }
+
+    /// Forward keys without capturing the pointer. The library window can type. The installer thumbnail cannot.
+    var keyboard = false {
         didSet { applyCapture() }
     }
 
@@ -1485,29 +1527,41 @@ final class InstallScreen: VZVirtualMachineView {
     }
 
     override func hitTest(_ point: NSPoint) -> NSView? {
-        capture ? super.hitTest(point) : nil
+        (capture || keyboard) ? super.hitTest(point) : nil
     }
 
-    override var acceptsFirstResponder: Bool { capture }
+    override var acceptsFirstResponder: Bool { capture || keyboard }
 
     override func becomeFirstResponder() -> Bool {
-        capture && super.becomeFirstResponder()
+        (capture || keyboard) && super.becomeFirstResponder()
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        if keyboard && !capture {
+            window?.makeFirstResponder(self)
+        }
+        if capture { super.mouseDown(with: event) }
     }
 
     override func mouseEntered(with event: NSEvent) { if capture { super.mouseEntered(with: event) } }
     override func mouseMoved(with event: NSEvent) { if capture { super.mouseMoved(with: event) } }
-    override func mouseDown(with event: NSEvent) { if capture { super.mouseDown(with: event) } }
     override func mouseUp(with event: NSEvent) { if capture { super.mouseUp(with: event) } }
     override func mouseDragged(with event: NSEvent) { if capture { super.mouseDragged(with: event) } }
     override func rightMouseDown(with event: NSEvent) { if capture { super.rightMouseDown(with: event) } }
     override func scrollWheel(with event: NSEvent) { if capture { super.scrollWheel(with: event) } }
 
-    override func keyDown(with event: NSEvent) { if capture { super.keyDown(with: event) } }
-    override func keyUp(with event: NSEvent) { if capture { super.keyUp(with: event) } }
-    override func flagsChanged(with event: NSEvent) { if capture { super.flagsChanged(with: event) } }
+    override func keyDown(with event: NSEvent) {
+        if capture || keyboard { super.keyDown(with: event) }
+    }
+    override func keyUp(with event: NSEvent) {
+        if capture || keyboard { super.keyUp(with: event) }
+    }
+    override func flagsChanged(with event: NSEvent) {
+        if capture || keyboard { super.flagsChanged(with: event) }
+    }
 
     private func applyCapture() {
-        capturesSystemKeys = capture
+        capturesSystemKeys = capture || keyboard
         if capture {
             updateTrackingAreas()
         } else {

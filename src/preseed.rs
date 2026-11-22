@@ -6,9 +6,16 @@
 //! key. `preseed.cfg` is appended to that initrd. The graphical initrd does not see it.
 //! Virtualization.framework has no CD drive, so the boot copy is a USB disk.
 //!
-//! `preseed.cfg` is the official example, with the local answers appended.
+//! `preseed.cfg` is the official example, downloaded into the cache under that name.
+//! Loading it appends one line, `preseed/include debian.cfg`. The guide loads that
+//! file after the one that names it, so the local answers override the example.
+//! The example is not prepended to the local answers.
 //! <https://www.debian.org/releases/trixie/example-preseed.txt>
+//! <https://www.debian.org/releases/stable/amd64/apbs05.en.html>
 //!
+//! The installer has no USB keyboard. A HID boot keyboard makes Keyboard
+//! configuration a critical question. The boot line is only `auto=true
+//! priority=critical`. debian.cfg answers the keymap.
 //! When the target has a Debian version and a GRUB config, late_command copies
 //! `/authorized_keys` from the text initrd into the debian account and enables
 //! sshd. The host treats the install as finished only after it can log in.
@@ -39,75 +46,35 @@ pub const USER: &str = "debian";
 /// Written into the guest so the host can log in without a password.
 pub const AUTHORIZED: &str = "authorized_keys";
 
-/// Official example. Downloaded, not kept in the binary.
+/// Official example. Downloaded into the cache, not kept in the binary.
 /// <https://www.debian.org/releases/trixie/example-preseed.txt>
-pub const EXAMPLE: &str = "example-preseed.txt";
+pub const EXAMPLE: &str = "preseed.cfg";
 pub const EXAMPLE_URL: &str = "https://www.debian.org/releases/trixie/example-preseed.txt";
+/// Appended as the last line. The installer loads that file after this one.
+pub const INCLUDE: &str = "d-i preseed/include string debian.cfg\n";
 
-/// The downloaded example, then the local answers. The installer reads this as `/preseed.cfg`.
+/// The downloaded example, then the include. The installer reads this as `/preseed.cfg`.
 pub fn preseed_cfg(example: &str) -> Result<String> {
     if !example.contains("#_preseed_V1") || !example.contains("d-i ") {
         bail!("{EXAMPLE} is not a Debian preseed");
     }
-    let mut text = example.to_string();
-    if !text.ends_with('\n') {
-        text.push('\n');
+    let mut text = example.trim_end().to_string();
+    text.push('\n');
+    if !text.contains("d-i preseed/include ") {
+        text.push_str(INCLUDE);
     }
-    text.push_str(&answers());
     Ok(text)
 }
 
-/// Answers the installer loads after the official example.
-pub fn answers() -> String {
-    format!(
-        "\
-d-i debian-installer/locale string en_US.UTF-8
-d-i keyboard-configuration/xkb-keymap select us
-d-i netcfg/choose_interface select auto
-d-i netcfg/get_hostname string debian
-d-i netcfg/get_domain string local
-d-i mirror/country string manual
-d-i mirror/http/hostname string deb.debian.org
-d-i mirror/http/directory string /debian
-d-i mirror/http/proxy string
-d-i passwd/root-login boolean false
-d-i passwd/user-fullname string Debian
-d-i passwd/username string debian
-d-i passwd/user-password-crypted password !
-d-i clock-setup/utc boolean true
-d-i time/zone string UTC
-d-i partman-auto/method string regular
-d-i partman-auto/disk string /dev/vda
-d-i partman-auto/choose_recipe select atomic
-d-i partman-partitioning/confirm_write_new_label boolean true
-d-i partman/choose_partition select finish
-d-i partman/confirm boolean true
-d-i partman/confirm_nooverwrite boolean true
-d-i apt-setup/cdrom/set-first boolean false
-d-i pkgsel/run_tasksel boolean false
-d-i pkgsel/include string openssh-server
-d-i grub-installer/bootdev string /dev/vda
-d-i grub-installer/only_debian boolean true
-d-i finish-install/reboot_in_progress note
-d-i cdrom-checker/start boolean false
-d-i cdrom-detect/eject boolean false
-d-i debian-installer/exit/halt boolean false
-d-i debian-installer/exit/poweroff boolean false
-d-i preseed/late_command string {late}
-",
-        late = late_command(),
-    )
-}
-
-/// Runs in the installer, with `/target` still mounted. A non-zero exit does not
-/// install the host key, so the installer stays up and the host does not boot the disk.
-/// Success powers off. The host logs in only after that disk boots.
-/// No `#`: debconf treats that as a comment.
-fn late_command() -> String {
-    let home = format!("/target/home/{USER}");
-    format!(
-        "test -s /target/etc/debian_version && test -e /target/boot/grub/grub.cfg && mkdir -p {home}/.ssh && cp /authorized_keys {home}/.ssh/authorized_keys && chmod 700 {home}/.ssh && chmod 600 {home}/.ssh/authorized_keys && chroot /target chown -R {USER}:{USER} /home/{USER}/.ssh && chroot /target systemctl enable ssh && sync && poweroff"
-    )
+/// Local overrides. Loaded by `preseed/include`, so they replace the example.
+/// The example already sets locale, keyboard, partitioning confirms, and GRUB.
+/// The guest disk is virtio and the installer is a USB disk, so both have to be named.
+/// The account is debian / debian. The host key is still copied in late_command.
+/// tasksel installs the XFCE desktop task. `tasksel/first` names `xfce-desktop`
+/// directly, so the GNOME default behind `desktop` is never read.
+/// <https://www.debian.org/releases/stable/amd64/apbs05.en.html>
+pub fn debian_cfg() -> &'static str {
+    include_str!("../debian.cfg")
 }
 
 /// OpenSSH public key line. The matching private key stays on the host.
@@ -121,6 +88,7 @@ pub fn authorized_keys(public_key: &str) -> String {
 }
 
 /// Boot parameters from the guide's auto mode. They belong before `---`.
+/// Only auto and critical. Keyboard and desktop are answered in debian.cfg.
 pub fn boot_args() -> String {
     "auto=true priority=critical".to_string()
 }
@@ -134,9 +102,10 @@ pub struct Prepared {
 /// Those files are not downloads, so they stay out of the cache, in installer/.
 pub fn write_preseed(support: &Path) -> Result<()> {
     let key = read_key(&support.join("ssh").join(AUTHORIZED))?;
+    let example = read_example(support)?;
     let _ = write_image(
         &installer_dir(support)?.join(FILE),
-        &image(&key, &read_example(support)?)?,
+        &image(&key, &example)?,
     )?;
     Ok(())
 }
@@ -535,7 +504,7 @@ struct Hit {
     is_dir: bool,
 }
 
-/// The official example does not fit in the sector slack, so the initrd is copied to the
+/// The preseed may not fit in the sector slack, so the initrd is copied to the
 /// end of the image and both directory records are pointed at that copy.
 fn append_preseed(file: &mut File, install: &str, public_key: &str, example: &str) -> Result<()> {
     let hits = walk_install(file, install)?;
@@ -649,6 +618,7 @@ fn preseed_gzip(public_key: &str, example: &str) -> Result<Vec<u8>> {
 fn cpio_preseed(public_key: &str, example: &str) -> Result<Vec<u8>> {
     let body = preseed_cfg(example)?;
     let mut archive = newc("preseed.cfg", body.as_bytes());
+    archive.extend(newc("debian.cfg", debian_cfg().as_bytes()));
     archive.extend(newc(AUTHORIZED, authorized_keys(public_key).as_bytes()));
     archive.extend(newc("TRAILER!!!", b""));
     Ok(archive)
@@ -829,14 +799,19 @@ fn sparse(dest: &Path, bytes: u64) -> Result<()> {
 fn image(public_key: &str, example: &str) -> Result<Vec<u8>> {
     let _ = public_key;
     let text = preseed_cfg(example)?;
-    let clusters = text.len().div_ceil(512).max(1);
+    let local = debian_cfg();
+    let files = [("preseed.cfg", text.as_bytes()), ("debian.cfg", local.as_bytes())];
+    let clusters: usize = files
+        .iter()
+        .map(|(_, body)| body.len().div_ceil(512).max(1))
+        .sum();
     let mut disk = vec![0u8; 512 * (3 + clusters)];
-    write_fat12(&mut disk, LABEL, "preseed.cfg", text.as_bytes())?;
+    write_fat12(&mut disk, LABEL, &files)?;
     Ok(disk)
 }
 
 /// One-sector FAT12. Directory entries are 8.3 names, so nested paths are short directories.
-fn write_fat12(disk: &mut [u8], label: &str, path: &str, body: &[u8]) -> Result<()> {
+fn write_fat12(disk: &mut [u8], label: &str, files: &[(&str, &[u8])]) -> Result<()> {
     let bps = 512usize;
     disk[0] = 0xeb;
     disk[1] = 0x3c;
@@ -872,55 +847,58 @@ fn write_fat12(disk: &mut [u8], label: &str, path: &str, body: &[u8]) -> Result<
     let root = fat + bps;
     let data = root + 512;
 
-    let mut parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
-    let file = parts
-        .pop()
-        .ok_or_else(|| anyhow!("preseed path is empty"))?;
-    let mut dir = root;
     let mut cluster = 2u16;
-    for name in parts {
-        let slot = free_slot(disk, dir)?;
-        write_name(&mut disk[slot..slot + 11], name, true)?;
-        disk[slot + 11] = 0x10;
-        put_u16(&mut disk[slot + 26..], cluster);
-        chain(disk, fat, cluster, 0x0fff)?;
-        dir = data + (cluster as usize - 2) * bps;
-        disk[dir] = b'.';
-        disk[dir + 11] = 0x10;
-        put_u16(&mut disk[dir + 26..], cluster);
-        disk[dir + 32] = b'.';
-        disk[dir + 33] = b'.';
-        disk[dir + 32 + 11] = 0x10;
-        put_u16(
-            &mut disk[dir + 32 + 26..],
-            if cluster == 2 { 0 } else { cluster },
-        );
-        cluster += 1;
-    }
-    let slot = free_slot(disk, dir)?;
-    write_name(&mut disk[slot..slot + 11], file, false)?;
-    disk[slot + 11] = 0x20;
-    put_u16(&mut disk[slot + 26..], cluster);
-    put_u32(&mut disk[slot + 28..], body.len() as u32);
-    let mut left = body;
-    if left.is_empty() {
-        chain(disk, fat, cluster, 0x0fff)?;
-        return Ok(());
-    }
-    while !left.is_empty() {
-        let file_at = data + (cluster as usize - 2) * bps;
-        if file_at >= disk.len() {
-            bail!("preseed does not fit");
+    for (path, body) in files {
+        let mut parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
+        let file = parts
+            .pop()
+            .ok_or_else(|| anyhow!("preseed path is empty"))?;
+        let mut dir = root;
+        for name in parts {
+            let slot = free_slot(disk, dir)?;
+            write_name(&mut disk[slot..slot + 11], name, true)?;
+            disk[slot + 11] = 0x10;
+            put_u16(&mut disk[slot + 26..], cluster);
+            chain(disk, fat, cluster, 0x0fff)?;
+            dir = data + (cluster as usize - 2) * bps;
+            disk[dir] = b'.';
+            disk[dir + 11] = 0x10;
+            put_u16(&mut disk[dir + 26..], cluster);
+            disk[dir + 32] = b'.';
+            disk[dir + 33] = b'.';
+            disk[dir + 32 + 11] = 0x10;
+            put_u16(
+                &mut disk[dir + 32 + 26..],
+                if cluster == 2 { 0 } else { cluster },
+            );
+            cluster += 1;
         }
-        let n = left.len().min(bps).min(disk.len() - file_at);
-        disk[file_at..file_at + n].copy_from_slice(&left[..n]);
-        left = &left[n..];
-        let current = cluster;
-        cluster += 1;
+        let slot = free_slot(disk, dir)?;
+        write_name(&mut disk[slot..slot + 11], file, false)?;
+        disk[slot + 11] = 0x20;
+        put_u16(&mut disk[slot + 26..], cluster);
+        put_u32(&mut disk[slot + 28..], body.len() as u32);
+        let mut left = *body;
         if left.is_empty() {
-            chain(disk, fat, current, 0x0fff)?;
-        } else {
-            chain(disk, fat, current, cluster)?;
+            chain(disk, fat, cluster, 0x0fff)?;
+            cluster += 1;
+            continue;
+        }
+        while !left.is_empty() {
+            let file_at = data + (cluster as usize - 2) * bps;
+            if file_at >= disk.len() {
+                bail!("preseed does not fit");
+            }
+            let n = left.len().min(bps).min(disk.len() - file_at);
+            disk[file_at..file_at + n].copy_from_slice(&left[..n]);
+            left = &left[n..];
+            let current = cluster;
+            cluster += 1;
+            if left.is_empty() {
+                chain(disk, fat, current, 0x0fff)?;
+            } else {
+                chain(disk, fat, current, cluster)?;
+            }
         }
     }
     Ok(())
@@ -980,36 +958,42 @@ mod tests {
     use flate2::read::GzDecoder;
     use std::io::Read;
 
-    fn example() -> String {
-        let mut text = String::from("#_preseed_V1\nd-i debian-installer/locale string en_US.UTF-8\n# ");
-        let mut n = 0x12345678u32;
-        for _ in 0..4000 {
-            n = n.wrapping_mul(1664525).wrapping_add(1013904223);
-            text.push(char::from(b'a' + (n % 26) as u8));
-        }
-        text.push('\n');
-        text
-    }
-
     #[test]
     fn preseed_disk_contains_the_installer_answers() {
         let disk = image(PUB, &example()).unwrap();
         let text = String::from_utf8_lossy(&disk);
-        let answers = answers();
+        let answers = debian_cfg();
         let preseed = preseed_cfg(&example()).unwrap();
         assert!(text.contains("PRESEED"));
         assert!(disk.windows(preseed.len()).any(|w| w == preseed.as_bytes()));
-        assert!(preseed.contains("#_preseed_V1"));
+        assert!(disk.windows(answers.len()).any(|w| w == answers.as_bytes()));
+        assert!(preseed.starts_with("#_preseed_V1\n"));
+        assert!(preseed.ends_with(INCLUDE));
+        assert_eq!(preseed.matches("d-i preseed/include").count(), 1);
         assert!(preseed_cfg("not a preseed").is_err());
         assert_eq!(
             EXAMPLE_URL,
             "https://www.debian.org/releases/trixie/example-preseed.txt"
         );
-        assert!(boot_args().contains("auto=true"));
+        assert!(answers.contains("partman-auto/method string regular"));
+        assert!(answers.contains(&format!("/home/{USER}/")));
+        assert!(answers.contains("passwd/user-password password debian"));
+        assert!(answers.contains("passwd/user-password-again password debian"));
+        assert!(!answers.contains("user-password-crypted"));
+        assert!(!answers.contains("preseed/early_command"));
+        assert!(answers.contains("d-i keyboard-configuration/xkb-keymap select us"));
+        assert!(!answers.contains('#'));
+        assert_eq!(boot_args(), "auto=true priority=critical");
         assert!(answers.contains("partman-auto/disk string /dev/vda"));
-        assert!(answers.contains("debian-installer/exit/poweroff boolean false"));
-        assert!(answers.contains("debian-installer/exit/halt boolean false"));
+        assert!(answers.contains("grub-installer/bootdev string /dev/vda"));
+        assert!(answers.contains("deb.debian.org"));
+        assert!(answers.contains("time/zone string UTC"));
         assert!(answers.contains("openssh-server"));
+        assert!(answers.contains("tasksel tasksel/first multiselect xfce-desktop"));
+        assert!(!answers.contains("tasksel/desktop"));
+        assert!(!answers.contains("task-xfce-desktop"));
+        assert!(!answers.contains("debian-installer/locale"));
+        assert!(answers.contains("d-i keyboard-configuration/xkb-keymap select us"));
         assert!(answers.contains("cp /authorized_keys"));
         assert!(answers.contains("systemctl enable ssh && sync && poweroff"));
         assert!(!answers.contains('#'));
@@ -1048,7 +1032,9 @@ mod tests {
         let text = String::from_utf8_lossy(menu);
         assert!(text.contains("set default=1\n"), "{text}");
         assert!(text.contains("set timeout=0\n"), "{text}");
-        assert!(text.contains("linux /install.a64/vmlinuz auto=true priority=critical --- quiet"));
+        assert!(text.contains(
+            "linux /install.a64/vmlinuz auto=true priority=critical --- quiet"
+        ));
         assert!(text.contains("linux /install.a64/vmlinuz --- quiet"));
         let gtk = text.find("gtk/initrd.gz").unwrap();
         assert!(!text[..gtk].contains("auto=true"));
@@ -1056,14 +1042,17 @@ mod tests {
         let size = initrd_size(&boot);
         let at = u32_at(&boot, 22 * 2048 + 34 + 2) as usize * 2048;
         assert!(size > 100);
-        assert!(at >= 48 * 2048, "the example does not fit in the initrd slack");
         let extra = &boot[at + 100..at + size as usize];
         let mut dec = GzDecoder::new(extra);
         let mut cpio = Vec::new();
         dec.read_to_end(&mut cpio).unwrap();
+        let preseed = preseed_cfg(&example()).unwrap();
         assert!(cpio
-            .windows(preseed_cfg(&example()).unwrap().len())
-            .any(|w| w == preseed_cfg(&example()).unwrap().as_bytes()));
+            .windows(preseed.len())
+            .any(|w| w == preseed.as_bytes()));
+        assert!(cpio
+            .windows(debian_cfg().len())
+            .any(|w| w == debian_cfg().as_bytes()));
         assert!(cpio.windows(PUB.len()).any(|w| w == PUB.as_bytes()));
         let (_, again) = prepare(&iso, &dir).unwrap();
         assert!(!again);
@@ -1093,7 +1082,9 @@ submenu 'Advanced options' {
         assert!(patched.starts_with(b"set default=1\nset timeout=0\n"));
         assert!(patched
             .windows(b"vmlinuz vga=788 auto=true priority=critical --- quiet".len())
-            .any(|line| line == b"vmlinuz vga=788 auto=true priority=critical --- quiet"));
+            .any(|line| {
+                line == b"vmlinuz vga=788 auto=true priority=critical --- quiet"
+            }));
         let arm64 = b"\
 menuentry 'Install' {
     linux /install.a64/vmlinuz --- quiet
@@ -1141,6 +1132,17 @@ menuentry 'Graphical install' {
     }
 
     const PUB: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestKeyForTheInstaller debian@host";
+
+    fn example() -> String {
+        "\
+#_preseed_V1
+d-i debian-installer/locale string en_US.UTF-8
+d-i keyboard-configuration/xkb-keymap select us
+d-i mirror/http/hostname string http.us.debian.org
+d-i partman-auto/method string lvm
+"
+        .to_string()
+    }
 
     fn initrd_size(iso: &[u8]) -> u32 {
         u32_at(iso, 22 * 2048 + 34 + 10)

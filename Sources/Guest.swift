@@ -8,13 +8,16 @@ enum Guest {
     static let user = "debian"
     /// sshd in the guest listens here. The NAT attachment cannot map it to a host port.
     static let sshPort: UInt16 = 22
+    /// The guest framebuffer in pixels. Virtio wants Int. The preview uses the same numbers as CGFloat.
+    static let scanout = (width: 1280, height: 800)
+    static let scanoutSize = CGSize(width: 1280, height: 800)
 
     static func boot(iso: URL, preseed: URL, disk: URL) throws -> VZVirtualMachine {
         return try machine(disk: disk, extra: [iso, preseed], pointer: false)
     }
 
     static func boot(disk: URL, pointer: Bool = false) throws -> VZVirtualMachine {
-        return try machine(disk: disk, extra: [], pointer: pointer)
+        return try machine(disk: disk, extra: [], pointer: pointer, keyboard: true)
     }
 
     /// Locally administered MAC, stable for this disk, so the DHCP lease can be found again.
@@ -26,7 +29,8 @@ enum Guest {
         return String(format: "02:56:4d:4d:%02x:%02x", UInt8(sum >> 8), UInt8(truncatingIfNeeded: sum))
     }
 
-    private static func machine(disk: URL, extra: [URL], pointer: Bool) throws -> VZVirtualMachine {
+    /// A HID boot keyboard makes Keyboard configuration a critical question, so the installer does not get one.
+    private static func machine(disk: URL, extra: [URL], pointer: Bool, keyboard: Bool = false) throws -> VZVirtualMachine {
         let config = VZVirtualMachineConfiguration()
         config.cpuCount = 2
         config.memorySize = 2 * 1024 * 1024 * 1024
@@ -44,9 +48,9 @@ enum Guest {
         devices.append(try guestDisk(disk))
         config.storageDevices = devices
         let graphics = VZVirtioGraphicsDeviceConfiguration()
-        graphics.scanouts = [VZVirtioGraphicsScanoutConfiguration(widthInPixels: 1280, heightInPixels: 800)]
+        graphics.scanouts = [VZVirtioGraphicsScanoutConfiguration(widthInPixels: scanout.width, heightInPixels: scanout.height)]
         config.graphicsDevices = [graphics]
-        config.keyboards = [VZUSBKeyboardConfiguration()]
+        config.keyboards = extra.isEmpty && keyboard ? [VZUSBKeyboardConfiguration()] : []
         // Attaching a pointer makes the guest view capture the host cursor.
         // Quick start never does that. Only a clone the user is running gets one.
         config.pointingDevices = pointer ? [VZUSBScreenCoordinatePointingDeviceConfiguration()] : []

@@ -378,7 +378,8 @@ fn cache_step(
     Ok(bytes)
 }
 
-/// Official example, cached like the key. A file already there is not fetched again.
+/// Official example, cached as `preseed.cfg`. A file already there is not fetched again.
+/// The include line is appended when the installer loads it, not stored in the cache.
 fn fetch_example(agent: &ureq::Agent, cache: &Path) -> Result<()> {
     let dest = cache.join(preseed::EXAMPLE);
     if dest.is_file() {
@@ -402,7 +403,7 @@ fn run(dir: &Path, order: &mut Order) -> Result<()> {
     let cache = dir.join("cache");
     fs::create_dir_all(&cache).map_err(|err| anyhow!("cannot create {}: {err}", cache.display()))?;
     let _lock = hold_lock(&cache)?;
-    // Every run starts at the first step. A file already in the cache is not fetched again.
+    // A file already in the cache is not fetched again.
     let agent = verify::agent();
     let base = verify::current_dir(arch)?;
 

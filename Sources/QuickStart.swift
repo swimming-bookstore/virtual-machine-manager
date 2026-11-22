@@ -127,6 +127,9 @@ final class Wizard: ObservableObject {
         error = nil
         readyPath = nil
         diskPath = nil
+        // Reset already set this. A later open calls start() with it false and reuses the disk.
+        let rebuilding = rebuild
+        rebuild = false
         guard let worker = WorkerPath.url() else {
             error = "The worker is not built. Run cargo build --release, then try again."
             failCurrent()
@@ -137,7 +140,7 @@ final class Wizard: ObservableObject {
         process.executableURL = worker
         var arguments = ["download", "--dir", CacheFolder.url.deletingLastPathComponent().path]
         // Reset rebuilds the image. Opening the window again still reuses a disk that is already there.
-        if rebuild {
+        if rebuilding {
             arguments.append("--rebuild")
         }
         process.arguments = arguments
@@ -185,6 +188,7 @@ final class Wizard: ObservableObject {
         session?.stop()
         process?.terminate()
         reap(process)
+        // reset() clears the screen, including rebuild. Set it after that, or start() reuses the stuck disk.
         reset()
         rebuild = true
         runID += 1
@@ -207,7 +211,7 @@ final class Wizard: ObservableObject {
         cancelled = false
         headline = nil
         started = false
-        rebuild = false
+        // The caller sets rebuild after this. Clearing it here made Reset reuse the stuck disk.
     }
 
     private func reap(_ done: Process?) {
@@ -602,6 +606,7 @@ struct QuickStart: View {
                         .accessibilityHidden(true)
                 }
             }
+            .background { installerPreview }
             .background { FitWindowHeight() }
         .onAppear { wizard.start() }
     }
@@ -740,12 +745,33 @@ struct QuickStart: View {
         return session.needsInstallGuest && !session.showWindow
     }
 
-    /// A small 16:10 thumbnail, not a full-width preview.
+    /// A small 16:10 thumbnail. One click opens a preview at the original 1280 by 800 scanout.
+    /// The preview window can be resized. The guest view fills it.
+    /// The guest view does not take hits. A button does, including inside the scrolling step list.
     private var installerView: some View {
         InstallGuest(session: installSlot.session!)
             .frame(width: 160, height: 100)
+            .allowsHitTesting(false)
             .accessibilityLabel("Installer")
-            .accessibilityHint("The installer")
+            .overlay {
+                Button {
+                    installSlot.session?.showWindow = true
+                } label: {
+                    Rectangle().fill(Color.white.opacity(0.001)).contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .accessibilityLabel("Installer")
+                .accessibilityHint("Opens a resizable preview at the original size")
+            }
+    }
+
+    /// The embedded install is invisible, so it cannot open this panel. The thumbnail click sets showWindow.
+    @ViewBuilder private var installerPreview: some View {
+        if wizard.error == nil, let session = installSlot.session, session.needsInstallGuest {
+            InstallerPreview(session: session)
+                .id(ObjectIdentifier(session))
+        }
     }
 
     private func icon(_ state: String) -> String {
@@ -764,5 +790,19 @@ struct QuickStart: View {
         case "fail": return .red
         default: return Color.secondary.opacity(0.45)
         }
+    }
+}
+
+/// Watches the running installer. Quick start's slot does not publish showWindow, so this view does.
+private struct InstallerPreview: View {
+    @ObservedObject var session: GuestSession
+
+    var body: some View {
+        InstallerWindow(guest: session, presented: $session.showWindow) {
+            GuestMirror(session: session)
+                .frame(minWidth: 640, maxWidth: .infinity, minHeight: 400, maxHeight: .infinity)
+                .background(.black)
+        }
+        .accessibilityHidden(true)
     }
 }
