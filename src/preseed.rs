@@ -77,7 +77,7 @@ pub fn preseed_cfg(example: &str) -> Result<String> {
 /// `partman-auto/method`, because an older copy forced regular and that overrode it.
 /// Trixie puts /tmp on a tmpfs, capped at 50% of RAM. This guest has 2 GiB, so
 /// that cap is 1 GiB. late_command writes the release-notes drop-in and raises
-/// the cap to 4 GiB. The partition layout is unchanged.
+/// the cap to 8 GiB. The partition layout is unchanged.
 /// <https://www.debian.org/releases/trixie/release-notes/issues.en.html#the-temporary-files-directory-tmp-is-now-stored-in-a-tmpfs>
 /// The account is debian / debian. The host key is still copied in late_command.
 /// tasksel installs only the XFCE desktop task.
@@ -991,7 +991,7 @@ mod tests {
         assert!(!answers.contains("partman-auto/method string regular"));
         assert!(!answers.contains("expert_recipe"));
         assert!(answers.contains("tmp.mount.d/override.conf"));
-        assert!(answers.contains("size=4G"));
+        assert!(answers.contains("size=8G"));
         assert!(answers.contains(&format!("/home/{USER}/")));
         assert!(answers.contains("passwd/user-password password debian"));
         assert!(answers.contains("passwd/user-password-again password debian"));
