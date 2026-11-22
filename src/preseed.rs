@@ -57,46 +57,23 @@ pub fn preseed_cfg(example: &str) -> Result<String> {
     Ok(text)
 }
 
-/// Overrides loaded after the official example. The example already sets the mirror
-/// layout, partitioning confirms, and GRUB, but its method is LVM and it does not
-/// name a disk. On a USB install that LVM step fails and the installer stops at
-/// "Choose the next step in the install process". The working answers used a
-/// regular layout on `/dev/vda`. Locale and keymap are also kernel parameters,
-/// because the installer asks them before this file is read.
-///
-/// `priority=critical` does not hide this question. The guide's `keymap=skip-config`
-/// is not one of the choices in trixie, so the installer still asks. xfce-desktop
-/// then installs keyboard-configuration in the target, and that package asks
-/// "Please select the layout matching the keyboard for this machine" at critical
-/// priority. It skips the question when the variant is already seen, or when
-/// `/etc/default/keyboard` names a layout it does not know. The installer's own
-/// keyboard setup overwrites that file, so the hook writes it again in the target
-/// and marks the question seen before the package configures.
-/// The guest disk is virtio, and the installer is a USB disk, so the disk has to be
-/// named or partman may pick the USB stick.
+/// Answers the installer loads after the official example.
 pub fn answers() -> String {
     format!(
-        r#"d-i debian-installer/locale string en_US.UTF-8
+        "\
+d-i debian-installer/locale string en_US.UTF-8
 d-i keyboard-configuration/xkb-keymap select us
-d-i debian-installer/keymap string us
-keyboard-configuration keyboard-configuration/layout select English (US)
-keyboard-configuration keyboard-configuration/variant select English (US)
-keyboard-configuration keyboard-configuration/model select Generic 105-key PC
-keyboard-configuration keyboard-configuration/layoutcode string us
-keyboard-configuration keyboard-configuration/variantcode string
-keyboard-configuration keyboard-configuration/modelcode string pc105
-keyboard-configuration keyboard-configuration/optionscode string
-keyboard-configuration keyboard-configuration/layout seen true
-keyboard-configuration keyboard-configuration/variant seen true
-keyboard-configuration keyboard-configuration/model seen true
-d-i console-setup/ask_detect boolean false
-d-i preseed/early_command string {early}
+d-i netcfg/choose_interface select auto
+d-i netcfg/get_hostname string debian
+d-i netcfg/get_domain string local
+d-i mirror/country string manual
 d-i mirror/http/hostname string deb.debian.org
+d-i mirror/http/directory string /debian
+d-i mirror/http/proxy string
 d-i passwd/root-login boolean false
-d-i passwd/user-fullname string debian
-d-i passwd/user-password password debian
-d-i passwd/user-password-again password debian
+d-i passwd/user-fullname string Debian
 d-i passwd/username string debian
+d-i passwd/user-password-crypted password !
 d-i clock-setup/utc boolean true
 d-i time/zone string UTC
 d-i partman-auto/method string regular
@@ -106,37 +83,20 @@ d-i partman-partitioning/confirm_write_new_label boolean true
 d-i partman/choose_partition select finish
 d-i partman/confirm boolean true
 d-i partman/confirm_nooverwrite boolean true
-d-i grub-installer/only_debian boolean true
+d-i apt-setup/cdrom/set-first boolean false
+d-i pkgsel/run_tasksel boolean false
+d-i pkgsel/include string openssh-server
 d-i grub-installer/bootdev string /dev/vda
-d-i preseed/late_command string {late}
-
-tasksel tasksel/first multiselect \
-  ssh-server, \
-  standard, \
-  xfce-desktop, \
-  ,
-
+d-i grub-installer/only_debian boolean true
 d-i finish-install/reboot_in_progress note
-d-i debian-installer/exit/poweroff boolean true
+d-i cdrom-checker/start boolean false
 d-i cdrom-detect/eject boolean false
-popularity-contest popularity-contest/participate boolean false
-"#,
-        early = early_command(),
+d-i debian-installer/exit/halt boolean false
+d-i debian-installer/exit/poweroff boolean false
+d-i preseed/late_command string {late}
+",
         late = late_command(),
     )
-}
-
-/// Writes the target keyboard file and marks the layout question seen.
-/// `base-installer.d` runs before `/target` exists, so the hook only acts once
-/// the base system is there. The installer's keyboard setup replaces
-/// `/etc/default/keyboard` after early_command, so the hook writes the target
-/// file itself. `skip` is not a real variant: the package treats that layout as
-/// unsupported and does not ask. The seen flags cover the case where that file
-/// is replaced by a normal US layout before the package configures. The hook is
-/// one shell line. A `#` in this line is a debconf comment, so the script has
-/// no shebang.
-fn early_command() -> String {
-    "mkdir -p /etc/default /usr/lib/pre-pkgsel.d /usr/lib/post-base-installer.d && printf '%s\\n' XKBMODEL=pc105 XKBLAYOUT=us XKBVARIANT=skip XKBOPTIONS= BACKSPACE=guess > /etc/default/keyboard && printf '%s\\n' '[ -d /target/usr/bin ] || exit 0' 'mkdir -p /target/etc/default' 'printf '\\''%s\\n'\\'' XKBMODEL=pc105 XKBLAYOUT=us XKBVARIANT=skip XKBOPTIONS= BACKSPACE=guess > /target/etc/default/keyboard' 'printf '\\''%s\\n'\\'' '\\''keyboard-configuration keyboard-configuration/layout select English (US)'\\'' '\\''keyboard-configuration keyboard-configuration/variant select English (US)'\\'' '\\''keyboard-configuration keyboard-configuration/model select Generic 105-key PC'\\'' '\\''keyboard-configuration keyboard-configuration/layoutcode string us'\\'' '\\''keyboard-configuration keyboard-configuration/variantcode string '\\'' '\\''keyboard-configuration keyboard-configuration/modelcode string pc105'\\'' '\\''keyboard-configuration keyboard-configuration/optionscode string '\\'' '\\''keyboard-configuration keyboard-configuration/layout seen true'\\'' '\\''keyboard-configuration keyboard-configuration/variant seen true'\\'' '\\''keyboard-configuration keyboard-configuration/model seen true'\\'' | chroot /target debconf-set-selections' > /usr/lib/pre-pkgsel.d/10keyboard && cp /usr/lib/pre-pkgsel.d/10keyboard /usr/lib/post-base-installer.d/15keyboard && chmod 755 /usr/lib/pre-pkgsel.d/10keyboard /usr/lib/post-base-installer.d/15keyboard".to_string()
 }
 
 /// Runs in the installer, with `/target` still mounted. A non-zero exit does not
@@ -146,7 +106,7 @@ fn early_command() -> String {
 fn late_command() -> String {
     let home = format!("/target/home/{USER}");
     format!(
-        "mkdir -p /target/etc/default && printf '%s\\n' XKBMODEL=pc105 XKBLAYOUT=us XKBVARIANT= XKBOPTIONS= BACKSPACE=guess > /target/etc/default/keyboard && test -s /target/etc/debian_version && test -e /target/boot/grub/grub.cfg && mkdir -p {home}/.ssh && cp /authorized_keys {home}/.ssh/authorized_keys && chmod 700 {home}/.ssh && chmod 600 {home}/.ssh/authorized_keys && chroot /target chown -R {USER}:{USER} /home/{USER}/.ssh && chroot /target systemctl enable ssh && sync && poweroff"
+        "test -s /target/etc/debian_version && test -e /target/boot/grub/grub.cfg && mkdir -p {home}/.ssh && cp /authorized_keys {home}/.ssh/authorized_keys && chmod 700 {home}/.ssh && chmod 600 {home}/.ssh/authorized_keys && chroot /target chown -R {USER}:{USER} /home/{USER}/.ssh && chroot /target systemctl enable ssh && sync && poweroff"
     )
 }
 
@@ -161,10 +121,8 @@ pub fn authorized_keys(public_key: &str) -> String {
 }
 
 /// Boot parameters from the guide's auto mode. They belong before `---`.
-/// Locale and keymap are kernel parameters. The final install note is critical,
-/// so it is marked seen in the preseed file rather than here.
 pub fn boot_args() -> String {
-    "auto=true priority=critical locale=en_US.UTF-8 keymap=us".to_string()
+    "auto=true priority=critical".to_string()
 }
 
 pub struct Prepared {
@@ -1048,32 +1006,30 @@ mod tests {
             "https://www.debian.org/releases/trixie/example-preseed.txt"
         );
         assert!(boot_args().contains("auto=true"));
-        assert!(boot_args().contains("locale=en_US.UTF-8"));
-        assert!(boot_args().contains("keymap=us"));
+        assert!(boot_args().contains("priority=critical"));
         assert!(answers.contains("keyboard-configuration/xkb-keymap select us"));
-        assert!(answers.contains("keyboard-configuration/variant select English (US)"));
-        assert!(answers.contains("keyboard-configuration/variant seen true"));
-        assert!(answers.contains("XKBVARIANT=skip"));
-        assert!(answers.contains("debconf-set-selections"));
-        assert!(answers.contains("preseed/early_command"));
-        assert!(answers.contains("pre-pkgsel.d/10keyboard"));
-        assert!(answers.contains("post-base-installer.d/15keyboard"));
-        assert!(answers.contains("[ -d /target/usr/bin ] || exit 0"));
-        assert!(answers.contains("popularity-contest/participate boolean false"));
+        assert!(answers.contains("netcfg/choose_interface select auto"));
+        assert!(answers.contains("netcfg/get_hostname string debian"));
+        assert!(answers.contains("mirror/country string manual"));
+        assert!(answers.contains("mirror/http/directory string /debian"));
+        assert!(answers.contains("mirror/http/proxy string"));
+        assert!(answers.contains("passwd/user-password-crypted password !"));
+        assert!(answers.contains("passwd/user-fullname string Debian"));
         assert!(!answers.contains('#'));
         assert!(answers.contains("debian-installer/locale string en_US.UTF-8"));
         assert!(answers.contains("deb.debian.org"));
         assert!(answers.contains("partman-auto/method string regular"));
         assert!(answers.contains("partman-auto/disk string /dev/vda"));
         assert!(answers.contains("partman-auto/choose_recipe select atomic"));
+        assert!(answers.contains("apt-setup/cdrom/set-first boolean false"));
+        assert!(answers.contains("pkgsel/run_tasksel boolean false"));
+        assert!(answers.contains("pkgsel/include string openssh-server"));
         assert!(answers.contains("grub-installer/only_debian boolean true"));
         assert!(answers.contains("grub-installer/bootdev string /dev/vda"));
-        assert!(answers.contains("ssh-server"));
-        assert!(answers.contains("xfce-desktop"));
-        assert!(answers.contains("user-password password debian"));
-        assert!(answers.contains("user-password-again password debian"));
         assert!(answers.contains("finish-install/reboot_in_progress note"));
-        assert!(answers.contains("debian-installer/exit/poweroff boolean true"));
+        assert!(answers.contains("cdrom-checker/start boolean false"));
+        assert!(answers.contains("debian-installer/exit/halt boolean false"));
+        assert!(answers.contains("debian-installer/exit/poweroff boolean false"));
         assert!(answers.contains("cdrom-detect/eject boolean false"));
         assert!(answers.contains("cp /authorized_keys"));
         assert!(answers.contains("systemctl enable ssh && sync && poweroff"));
@@ -1113,7 +1069,7 @@ mod tests {
         let text = String::from_utf8_lossy(menu);
         assert!(text.contains("set default=1\n"), "{text}");
         assert!(text.contains("set timeout=0\n"), "{text}");
-        assert!(text.contains("linux /install.a64/vmlinuz auto=true priority=critical locale=en_US.UTF-8 keymap=us --- quiet"));
+        assert!(text.contains("linux /install.a64/vmlinuz auto=true priority=critical --- quiet"));
         assert!(text.contains("linux /install.a64/vmlinuz --- quiet"));
         let gtk = text.find("gtk/initrd.gz").unwrap();
         assert!(!text[..gtk].contains("auto=true"));
@@ -1157,8 +1113,8 @@ submenu 'Advanced options' {
         let patched = menu_body(amd64, "install.amd").unwrap();
         assert!(patched.starts_with(b"set default=1\nset timeout=0\n"));
         assert!(patched
-            .windows(b"vmlinuz vga=788 auto=true priority=critical locale=en_US.UTF-8 keymap=us --- quiet".len())
-            .any(|line| line == b"vmlinuz vga=788 auto=true priority=critical locale=en_US.UTF-8 keymap=us --- quiet"));
+            .windows(b"vmlinuz vga=788 auto=true priority=critical --- quiet".len())
+            .any(|line| line == b"vmlinuz vga=788 auto=true priority=critical --- quiet"));
         let arm64 = b"\
 menuentry 'Install' {
     linux /install.a64/vmlinuz --- quiet
