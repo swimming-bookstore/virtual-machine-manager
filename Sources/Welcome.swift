@@ -170,7 +170,7 @@ struct Welcome: View {
             Spacer(minLength: 28)
         }
         .padding(.horizontal, 36)
-        .frame(width: 380)
+        .frame(width: WindowMetrics.splashWidth)
     }
 
     private var librarySplit: some View {
@@ -213,7 +213,7 @@ struct Welcome: View {
             }
             .navigationTitle("Virtual Machine Manager")
         }
-        .frame(minWidth: 900, idealWidth: 1100, maxWidth: .infinity, minHeight: 560, idealHeight: 720, maxHeight: .infinity)
+        .frame(minWidth: WindowMetrics.libraryMin.width, idealWidth: WindowMetrics.library.width, maxWidth: .infinity, minHeight: WindowMetrics.libraryMin.height, idealHeight: WindowMetrics.library.height, maxHeight: .infinity)
     }
 
     private func openQuickStart() {
@@ -262,7 +262,7 @@ private final class ChromeView: NSView {
             window.titleVisibility = .visible
             window.styleMask.remove(.resizable)
             let height = max(window.contentView?.fittingSize.height ?? 0, 248)
-            let size = NSSize(width: 380, height: height)
+            let size = NSSize(width: WindowMetrics.splashWidth, height: height)
             if window.contentView?.frame.size != size {
                 window.setContentSize(size)
             }
@@ -271,11 +271,11 @@ private final class ChromeView: NSView {
             // Keep the title up. Hiding it left the bar empty until a later layout, which is the jump.
             window.titleVisibility = .visible
             window.styleMask.insert(.resizable)
-            guard window.frame.width < 900 || window.frame.height < 560 else { return }
-            let screen = window.screen?.visibleFrame ?? NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1100, height: 720)
+            guard window.frame.width < WindowMetrics.libraryMin.width || window.frame.height < WindowMetrics.libraryMin.height else { return }
+            let screen = window.screen?.visibleFrame ?? NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: WindowMetrics.library.width, height: WindowMetrics.library.height)
             var frame = window.frame
-            frame.size.width = min(1100, screen.width)
-            frame.size.height = min(720, screen.height)
+            frame.size.width = min(WindowMetrics.library.width, screen.width)
+            frame.size.height = min(WindowMetrics.library.height, screen.height)
             if frame.maxY > screen.maxY { frame.origin.y = screen.maxY - frame.height }
             if frame.minY < screen.minY { frame.origin.y = screen.minY }
             if frame.maxX > screen.maxX { frame.origin.x = screen.maxX - frame.width }

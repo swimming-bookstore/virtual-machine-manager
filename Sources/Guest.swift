@@ -8,9 +8,20 @@ enum Guest {
     static let user = "debian"
     /// sshd in the guest listens here. The NAT attachment cannot map it to a host port.
     static let sshPort: UInt16 = 22
-    /// The guest framebuffer in pixels. Virtio wants Int. The preview uses the same numbers as CGFloat.
+    /// The guest framebuffer in pixels. Virtio wants Int. AppKit uses the same numbers as CGFloat.
     static let scanout = (width: 1280, height: 800)
-    static let scanoutSize = CGSize(width: 1280, height: 800)
+    static let scanoutSize = CGSize(width: CGFloat(scanout.width), height: CGFloat(scanout.height))
+    /// Width over height. A missing proposal follows the scanout, not a second ratio.
+    static let aspect = CGFloat(scanout.width) / CGFloat(scanout.height)
+    /// Half the scanout. The installer panel cannot shrink below this.
+    static let installerMin = CGSize(width: CGFloat(scanout.width) / 2, height: CGFloat(scanout.height) / 2)
+    /// An eighth of the scanout. The step-list thumbnail.
+    static let thumbnail = CGSize(width: CGFloat(scanout.width) / 8, height: CGFloat(scanout.height) / 8)
+    /// Clone page guest. Height follows the scanout aspect.
+    static let cloneGuest: CGSize = {
+        let width: CGFloat = 800
+        return CGSize(width: width, height: width / aspect)
+    }()
 
     static func boot(iso: URL, preseed: URL, disk: URL) throws -> VZVirtualMachine {
         return try machine(disk: disk, extra: [iso, preseed], pointer: false)

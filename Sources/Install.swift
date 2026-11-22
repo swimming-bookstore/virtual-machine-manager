@@ -75,7 +75,7 @@ struct Install: View {
             if setup && !embedded {
                 InstallerWindow(guest: guest, presented: $guest.showWindow) {
                     GuestMirror(session: guest)
-                        .frame(minWidth: 640, maxWidth: .infinity, minHeight: 400, maxHeight: .infinity)
+                        .installerFloor()
                         .background(.black)
                 }
             }
@@ -149,7 +149,7 @@ struct Install: View {
             header
             if !setup {
                 guestScreen
-                    .frame(width: 800, height: 500)
+                    .frame(width: Guest.cloneGuest.width, height: Guest.cloneGuest.height)
             }
             if setup { stepList }
             WrappingPath(text: disk)
@@ -158,8 +158,8 @@ struct Install: View {
             }
             actions
         }
-        .padding(24)
-        .frame(width: setup ? 440 : 848, alignment: .topLeading)
+        .padding(WindowMetrics.pagePad)
+        .frame(width: setup ? WindowMetrics.quickStartWidth : Guest.cloneGuest.width + WindowMetrics.pagePad * 2, alignment: .topLeading)
         .toolbar {
             if fromSnapshot {
                 ToolbarItemGroup(placement: .primaryAction) {
@@ -184,7 +184,7 @@ struct Install: View {
         }
     }
 
-    /// The guest screen. A clone window shows this at 800 by 500. Quick start uses a thumbnail on the step instead.
+    /// The guest screen. A clone window shows Guest.cloneGuest. Quick start uses a thumbnail on the step instead.
     /// A pause keeps the last frame, the way UTM caches the view before the machine is stopped.
     /// GuestView stays mounted under that frame. Replacing it unhooks the virtual machine view, and the next pause has nothing to snapshot.
     /// The still is an AppKit sibling on top of the Metal guest. A SwiftUI Image in the ZStack does not cover it.
@@ -1253,7 +1253,7 @@ struct InstallerWindow<Content: View>: NSViewRepresentable {
             panel.isReleasedWhenClosed = false
             panel.hidesOnDeactivate = false
             panel.contentView = host
-            panel.contentMinSize = NSSize(width: 640, height: 400)
+            panel.contentMinSize = Guest.installerMin
             // A non-activating panel does not become key, so it cannot take the keyboard.
             // The guest view also ignores the pointer. Quick start never attaches one.
             panel.styleMask.insert(.nonactivatingPanel)
@@ -1291,6 +1291,24 @@ struct InstallerWindow<Content: View>: NSViewRepresentable {
 }
 
 private var panelCloseKey = 0
+
+private func guestProposal(_ proposal: ProposedViewSize) -> CGSize {
+    let width = proposal.width.flatMap { $0.isFinite && $0 > 1 ? $0 : nil } ?? Guest.cloneGuest.width
+    let height = proposal.height.flatMap { $0.isFinite && $0 > 1 ? $0 : nil } ?? width / Guest.aspect
+    return CGSize(width: width, height: height)
+}
+
+extension View {
+    /// The installer panel cannot shrink below half the scanout. The guest still fills whatever is larger.
+    func installerFloor() -> some View {
+        frame(
+            minWidth: Guest.installerMin.width,
+            maxWidth: .infinity,
+            minHeight: Guest.installerMin.height,
+            maxHeight: .infinity
+        )
+    }
+}
 
 private final class PanelClose: NSObject, NSWindowDelegate {
     let guest: GuestSession
@@ -1339,9 +1357,7 @@ struct GuestView: NSViewRepresentable {
 
     /// Take the size SwiftUI proposes. A missing width is not zero, so closing the wizard does not blank the guest.
     func sizeThatFits(_ proposal: ProposedViewSize, nsView: GuestPane, context: Context) -> CGSize? {
-        let width = proposal.width.flatMap { $0.isFinite && $0 > 1 ? $0 : nil } ?? 800
-        let height = proposal.height.flatMap { $0.isFinite && $0 > 1 ? $0 : nil } ?? width * 10.0 / 16.0
-        return CGSize(width: width, height: height)
+        guestProposal(proposal)
     }
 }
 
@@ -1437,9 +1453,7 @@ struct GuestMirror: NSViewRepresentable {
 
     /// Same fallback as the thumbnail. A closed wizard proposes no size, and a nil answer blanks the guest.
     func sizeThatFits(_ proposal: ProposedViewSize, nsView: InstallScreen, context: Context) -> CGSize? {
-        let width = proposal.width.flatMap { $0.isFinite && $0 > 1 ? $0 : nil } ?? 800
-        let height = proposal.height.flatMap { $0.isFinite && $0 > 1 ? $0 : nil } ?? width * 10.0 / 16.0
-        return CGSize(width: width, height: height)
+        guestProposal(proposal)
     }
 }
 
@@ -1448,7 +1462,7 @@ struct GuestMirror: NSViewRepresentable {
 final class InstallScreen: VZVirtualMachineView {
     /// Closing the wizard mid-install proposes a zero size. That guess is a blank screen, so keep the last real one.
     /// The virtual machine stays running. The window is not the guest.
-    private var drawn = CGSize(width: 800, height: 500)
+    private var drawn = Guest.cloneGuest
 
     var capture = false {
         didSet { applyCapture() }

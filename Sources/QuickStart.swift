@@ -314,7 +314,7 @@ enum CacheFolder {
     }
 }
 
-/// The guest is as wide as the window. Height follows 16:10 from that width, so a short window does not shrink it.
+/// The guest is as wide as the window. Height follows the scanout, so a short window does not shrink it.
 /// A closed wizard proposes nothing. That is not a zero-size guest, which is a blank screen.
 /// A clone window names the guest disk. The path wraps instead of truncating to cache/….
 struct WrappingPath: NSViewRepresentable {
@@ -568,9 +568,9 @@ private struct FitWindowHeight: NSViewRepresentable {
             guard let window, let visible = (window.screen ?? NSScreen.main)?.visibleFrame else { return }
             let contentRect = window.contentRect(forFrameRect: window.frame)
             let chrome = window.frame.height - contentRect.height
-            let maxContent = max(360, visible.height - chrome)
-            let minSize = NSSize(width: 440, height: 360)
-            let maxSize = NSSize(width: max(440, visible.width), height: maxContent)
+            let maxContent = max(WindowMetrics.quickStartMinHeight, visible.height - chrome)
+            let minSize = NSSize(width: WindowMetrics.quickStartWidth, height: WindowMetrics.quickStartMinHeight)
+            let maxSize = NSSize(width: max(WindowMetrics.quickStartWidth, visible.width), height: maxContent)
             if window.contentMinSize != minSize { window.contentMinSize = minSize }
             if window.contentMaxSize != maxSize { window.contentMaxSize = maxSize }
             var frame = window.frame
@@ -649,8 +649,8 @@ struct QuickStart: View {
                 }
             }
         }
-        .padding(24)
-        .frame(minWidth: 440, idealWidth: 440, maxWidth: .infinity, minHeight: 360, idealHeight: 640, maxHeight: .infinity, alignment: .topLeading)
+        .padding(WindowMetrics.pagePad)
+        .frame(minWidth: WindowMetrics.quickStartWidth, idealWidth: WindowMetrics.quickStartWidth, maxWidth: .infinity, minHeight: WindowMetrics.quickStartMinHeight, idealHeight: WindowMetrics.quickStart.height, maxHeight: .infinity, alignment: .topLeading)
     }
 
     /// The running row, or the failed one. A hidden step scrolls to the row it belongs to.
@@ -745,12 +745,12 @@ struct QuickStart: View {
         return session.needsInstallGuest && !session.showWindow
     }
 
-    /// A small 16:10 thumbnail. One click opens a preview at the original 1280 by 800 scanout.
+    /// A small thumbnail, an eighth of the scanout. One click opens a preview at that scanout.
     /// The preview window can be resized. The guest view fills it.
     /// The guest view does not take hits. A button does, including inside the scrolling step list.
     private var installerView: some View {
         InstallGuest(session: installSlot.session!)
-            .frame(width: 160, height: 100)
+            .frame(width: Guest.thumbnail.width, height: Guest.thumbnail.height)
             .allowsHitTesting(false)
             .accessibilityLabel("Installer")
             .overlay {
@@ -800,7 +800,7 @@ private struct InstallerPreview: View {
     var body: some View {
         InstallerWindow(guest: session, presented: $session.showWindow) {
             GuestMirror(session: session)
-                .frame(minWidth: 640, maxWidth: .infinity, minHeight: 400, maxHeight: .infinity)
+                .installerFloor()
                 .background(.black)
         }
         .accessibilityHidden(true)

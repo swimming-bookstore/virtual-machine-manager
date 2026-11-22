@@ -3501,7 +3501,7 @@ fn quick_start_swift_gates_the_bar_on_a_real_download() {
     assert!(src.contains("Text(WizardStep.status(step.id, state: step.state))"));
     assert!(include_str!("../Sources/Install.swift").contains("Text(WizardStep.status(step.id, state: step.state))"));
     assert!(!include_str!("../Sources/Install.swift").contains("WrappingPath(text: rowLabel"));
-    assert!(src.contains("frame(minWidth: 440, idealWidth: 440, maxWidth: .infinity, minHeight: 360, idealHeight: 640, maxHeight: .infinity, alignment: .topLeading)"));
+    assert!(src.contains("frame(minWidth: WindowMetrics.quickStartWidth, idealWidth: WindowMetrics.quickStartWidth, maxWidth: .infinity, minHeight: WindowMetrics.quickStartMinHeight, idealHeight: WindowMetrics.quickStart.height, maxHeight: .infinity, alignment: .topLeading)"));
     assert!(!src.contains("minHeight: 420"));
     assert!(include_str!("../Sources/App.swift").contains("Window(\"Quick start\", id: \"quick-start\")"));
     assert!(include_str!("../Sources/App.swift").contains("final class QuickStartModel"));
@@ -3510,7 +3510,7 @@ fn quick_start_swift_gates_the_bar_on_a_real_download() {
     assert!(include_str!("../Sources/Install.swift").contains("func resumeHostKey"));
     assert!(include_str!("../Sources/Install.swift").contains("Checking SSH again."));
     assert!(include_str!("../Sources/App.swift").contains(".windowResizability(.automatic)"));
-    assert!(include_str!("../Sources/App.swift").contains(".defaultSize(width: 440, height: 640)"));
+    assert!(include_str!("../Sources/App.swift").contains(".defaultSize(width: WindowMetrics.quickStart.width, height: WindowMetrics.quickStart.height)"));
     assert!(!src.contains(".frame(width: 440, alignment: .topLeading)"));
     assert!(!src.contains(".frame(width: 440, alignment: .topLeading)\n        .fixedSize(horizontal: false, vertical: true)"));
     assert!(src.contains(".fixedSize(horizontal: false, vertical: true)"));
@@ -3524,7 +3524,7 @@ fn quick_start_swift_gates_the_bar_on_a_real_download() {
     assert!(src.contains("InstallGuest(session: installSlot.session!)"));
     assert!(!src.contains("Button(\"Show installer\")"));
     assert!(!src.contains("Button(\"Open"));
-    assert!(src.contains(".frame(width: 160, height: 100)"));
+    assert!(src.contains(".frame(width: Guest.thumbnail.width, height: Guest.thumbnail.height)"));
     assert!(src.contains("installSlot.session?.showWindow = true"));
     assert!(src.contains("Button {"));
     assert!(!src.contains(".onTapGesture { installSlot.session?.showWindow = true }"));
@@ -3539,7 +3539,7 @@ fn quick_start_swift_gates_the_bar_on_a_real_download() {
     assert!(src.contains("struct FitWindowHeight"));
     assert!(src.contains("A closed wizard proposes nothing"));
     assert!(include_str!("../Sources/Install.swift").contains("func sizeThatFits(_ proposal: ProposedViewSize, nsView: InstallScreen, context: Context) -> CGSize?"));
-    assert!(include_str!("../Sources/Install.swift").contains("?? 800"));
+    assert!(include_str!("../Sources/Install.swift").contains("?? Guest.cloneGuest.width"));
     assert!(include_str!("../Sources/Install.swift").contains("override var intrinsicContentSize"));
     assert!(include_str!("../Sources/Install.swift").contains("Closing the wizard mid-install"));
     assert!(!src.contains("WrappingPath(text: rowLabel(step))"));
@@ -3593,7 +3593,7 @@ fn quick_start_swift_gates_the_bar_on_a_real_download() {
     assert!(include_str!("../Sources/Install.swift").contains("becomesKeyOnlyIfNeeded = true"));
     assert!(include_str!("../Sources/Install.swift").contains("struct InstallerWindow"));
     assert!(!include_str!("../Sources/Install.swift").contains(".popover(isPresented:"));
-    assert!(include_str!("../Sources/Install.swift").contains("frame(width: setup ? 440 : 848"));
+    assert!(include_str!("../Sources/Install.swift").contains("frame(width: setup ? WindowMetrics.quickStartWidth : Guest.cloneGuest.width + WindowMetrics.pagePad * 2"));
     assert!(include_str!("../Sources/Install.swift").contains("let guestSize = Guest.scanoutSize"));
     assert!(!include_str!("../Sources/Install.swift").contains("titlebarAppearsTransparent = true"));
     assert!(!include_str!("../Sources/Install.swift").contains("titleVisibility = .hidden"));
@@ -3602,12 +3602,15 @@ fn quick_start_swift_gates_the_bar_on_a_real_download() {
     assert!(!include_str!("../Sources/Install.swift").contains("guestSize.width + 32"));
     assert!(include_str!("../Sources/Install.swift").contains(".resizable"));
     assert!(include_str!("../Sources/Install.swift").contains("panel.contentMinSize"));
-    assert!(include_str!("../Sources/Install.swift").contains("minWidth: 640, maxWidth: .infinity, minHeight: 400"));
+    assert!(include_str!("../Sources/Install.swift").contains("minWidth: Guest.installerMin.width"));
     assert!(!include_str!("../Sources/Install.swift").contains("frame(width: Guest.scanoutSize.width, height: Guest.scanoutSize.height)"));
     assert!(!include_str!("../Sources/QuickStart.swift").contains("frame(width: Guest.scanoutSize.width, height: Guest.scanoutSize.height)"));
     assert!(!include_str!("../Sources/Install.swift").contains("min(1280, max(640, screen.width - 32))"));
     assert!(include_str!("../Sources/Guest.swift").contains("static let scanout = (width: 1280, height: 800)"));
-    assert!(include_str!("../Sources/Guest.swift").contains("static let scanoutSize = CGSize(width: 1280, height: 800)"));
+    assert!(include_str!("../Sources/Guest.swift").contains("static let scanoutSize = CGSize(width: CGFloat(scanout.width), height: CGFloat(scanout.height))"));
+    assert!(include_str!("../Sources/Guest.swift").contains("static let thumbnail = CGSize(width: CGFloat(scanout.width) / 8, height: CGFloat(scanout.height) / 8)"));
+    assert!(include_str!("../Sources/Guest.swift").contains("static let installerMin = CGSize(width: CGFloat(scanout.width) / 2, height: CGFloat(scanout.height) / 2)"));
+    assert!(!include_str!("../Sources/Guest.swift").contains("static let scanoutSize = CGSize(width: 1280, height: 800)"));
     assert!(!include_str!("../Sources/Install.swift").contains("frame(height: 96)"));
     assert!(include_str!("../Sources/Install.swift")
         .contains("private var capturePointer: Bool { fromSnapshot && !guest.stopped }"));
@@ -3617,6 +3620,10 @@ fn quick_start_swift_gates_the_bar_on_a_real_download() {
     assert!(include_str!("../Sources/Guest.swift").contains("pointer: Bool = false"));
     assert!(include_str!("../debian.cfg").contains("d-i keyboard-configuration/xkb-keymap select us"));
     assert!(include_str!("../debian.cfg").contains("tasksel tasksel/first multiselect xfce-desktop"));
+    assert!(include_str!("../debian.cfg").contains("d-i partman-auto/method string lvm"));
+    assert!(!include_str!("../debian.cfg").contains("partman-auto/method string regular"));
+    assert!(include_str!("../debian.cfg").contains("size=4G"));
+    assert!(!include_str!("../debian.cfg").contains("expert_recipe"));
     assert!(!include_str!("../debian.cfg").contains("preseed/early_command"));
     assert!(include_str!("../Sources/Guest.swift").contains("config.keyboards = extra.isEmpty && keyboard"));
     assert!(!include_str!("../Sources/Install.swift").contains("InstalledDisk.looksInstalled"));
