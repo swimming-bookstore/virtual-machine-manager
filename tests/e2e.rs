@@ -3619,7 +3619,7 @@ fn quick_start_swift_gates_the_bar_on_a_real_download() {
     assert!(include_str!("../Sources/Install.swift").contains("pointer: false"));
     assert!(include_str!("../Sources/Guest.swift").contains("pointer: Bool = false"));
     assert!(!include_str!("../debian.cfg").contains("keyboard-configuration"));
-    assert!(include_str!("../debian.cfg").contains("tasksel tasksel/first multiselect standard, ssh-server, xfce-desktop"));
+    assert!(include_str!("../debian.cfg").contains("tasksel tasksel/first multiselect xfce-desktop"));
     assert!(!include_str!("../debian.cfg").contains("partman-auto/method"));
     assert!(!include_str!("../debian.cfg").contains("partman-auto/method string regular"));
     assert!(include_str!("../debian.cfg").contains("size=4G"));

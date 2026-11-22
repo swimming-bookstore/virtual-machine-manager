@@ -18,8 +18,9 @@
 //! priority=critical`. The example answers the keymap, so debian.cfg does not
 //! repeat it.
 //! When the target has a Debian version and a GRUB config, late_command copies
-//! `/authorized_keys` from the text initrd into the debian account. The ssh-server
-//! task enables sshd. The host treats the install as finished only after it can log in.
+//! `/authorized_keys` from the text initrd into the debian account. pkgsel
+//! installs openssh-server, which enables sshd. The host treats the install as
+//! finished only after it can log in.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -79,7 +80,7 @@ pub fn preseed_cfg(example: &str) -> Result<String> {
 /// the cap to 4 GiB. The partition layout is unchanged.
 /// <https://www.debian.org/releases/trixie/release-notes/issues.en.html#the-temporary-files-directory-tmp-is-now-stored-in-a-tmpfs>
 /// The account is debian / debian. The host key is still copied in late_command.
-/// tasksel installs standard, the SSH server, and the XFCE desktop task.
+/// tasksel installs only the XFCE desktop task.
 /// `tasksel/first` names `xfce-desktop` directly, so the GNOME default behind
 /// `desktop` is never read. pkgsel/include installs openssh-server and spice-vdagent.
 /// <https://www.debian.org/releases/trixie/example-preseed.txt>
@@ -1004,8 +1005,9 @@ mod tests {
         assert!(answers.contains("deb.debian.org"));
         assert!(!answers.contains("time/zone"));
         assert!(!answers.contains("netcfg/get_hostname"));
-        assert!(answers.contains("ssh-server"));
-        assert!(answers.contains("tasksel tasksel/first multiselect standard, ssh-server, xfce-desktop"));
+        assert!(answers.contains("tasksel tasksel/first multiselect xfce-desktop"));
+        assert!(!answers.contains("standard"));
+        assert!(!answers.contains(", ssh-server"));
         assert!(!answers.contains("tasksel/desktop"));
         assert!(!answers.contains("task-xfce-desktop"));
         assert!(!answers.contains("debian-installer/locale"));
