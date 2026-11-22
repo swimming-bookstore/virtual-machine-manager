@@ -14,7 +14,7 @@ open virtual-machine-manager.app
 
 ## Log in
 
-There is no password. The install writes your host key into the `debian` account.
+The `debian` account password is `debian`. The install also writes your host key into that account.
 
 The private key is:
 

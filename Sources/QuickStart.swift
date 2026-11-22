@@ -127,6 +127,9 @@ final class Wizard: ObservableObject {
         error = nil
         readyPath = nil
         diskPath = nil
+        // Reset already set this. A later open calls start() with it false and reuses the disk.
+        let rebuilding = rebuild
+        rebuild = false
         guard let worker = WorkerPath.url() else {
             error = "The worker is not built. Run cargo build --release, then try again."
             failCurrent()
@@ -137,7 +140,7 @@ final class Wizard: ObservableObject {
         process.executableURL = worker
         var arguments = ["download", "--dir", CacheFolder.url.deletingLastPathComponent().path]
         // Reset rebuilds the image. Opening the window again still reuses a disk that is already there.
-        if rebuild {
+        if rebuilding {
             arguments.append("--rebuild")
         }
         process.arguments = arguments
@@ -185,6 +188,7 @@ final class Wizard: ObservableObject {
         session?.stop()
         process?.terminate()
         reap(process)
+        // reset() clears the screen, including rebuild. Set it after that, or start() reuses the stuck disk.
         reset()
         rebuild = true
         runID += 1
@@ -207,7 +211,7 @@ final class Wizard: ObservableObject {
         cancelled = false
         headline = nil
         started = false
-        rebuild = false
+        // The caller sets rebuild after this. Clearing it here made Reset reuse the stuck disk.
     }
 
     private func reap(_ done: Process?) {
@@ -310,7 +314,7 @@ enum CacheFolder {
     }
 }
 
-/// The guest is as wide as the window. Height follows 16:10 from that width, so a short window does not shrink it.
+/// The guest is as wide as the window. Height follows the scanout, so a short window does not shrink it.
 /// A closed wizard proposes nothing. That is not a zero-size guest, which is a blank screen.
 /// A clone window names the guest disk. The path wraps instead of truncating to cache/….
 struct WrappingPath: NSViewRepresentable {
@@ -564,9 +568,9 @@ private struct FitWindowHeight: NSViewRepresentable {
             guard let window, let visible = (window.screen ?? NSScreen.main)?.visibleFrame else { return }
             let contentRect = window.contentRect(forFrameRect: window.frame)
             let chrome = window.frame.height - contentRect.height
-            let maxContent = max(360, visible.height - chrome)
-            let minSize = NSSize(width: 440, height: 360)
-            let maxSize = NSSize(width: max(440, visible.width), height: maxContent)
+            let maxContent = max(WindowMetrics.quickStartMinHeight, visible.height - chrome)
+            let minSize = NSSize(width: WindowMetrics.quickStartWidth, height: WindowMetrics.quickStartMinHeight)
+            let maxSize = NSSize(width: max(WindowMetrics.quickStartWidth, visible.width), height: maxContent)
             if window.contentMinSize != minSize { window.contentMinSize = minSize }
             if window.contentMaxSize != maxSize { window.contentMaxSize = maxSize }
             var frame = window.frame
@@ -602,6 +606,7 @@ struct QuickStart: View {
                         .accessibilityHidden(true)
                 }
             }
+            .background { installerPreview }
             .background { FitWindowHeight() }
         .onAppear { wizard.start() }
     }
@@ -644,8 +649,8 @@ struct QuickStart: View {
                 }
             }
         }
-        .padding(24)
-        .frame(minWidth: 440, idealWidth: 440, maxWidth: .infinity, minHeight: 360, idealHeight: 640, maxHeight: .infinity, alignment: .topLeading)
+        .padding(WindowMetrics.pagePad)
+        .frame(minWidth: WindowMetrics.quickStartWidth, idealWidth: WindowMetrics.quickStartWidth, maxWidth: .infinity, minHeight: WindowMetrics.quickStartMinHeight, idealHeight: WindowMetrics.quickStart.height, maxHeight: .infinity, alignment: .topLeading)
     }
 
     /// The running row, or the failed one. A hidden step scrolls to the row it belongs to.
@@ -740,12 +745,33 @@ struct QuickStart: View {
         return session.needsInstallGuest && !session.showWindow
     }
 
-    /// A small 16:10 thumbnail, not a full-width preview.
+    /// A small thumbnail, an eighth of the scanout. One click opens a preview at that scanout.
+    /// The preview window can be resized. The guest view fills it.
+    /// The guest view does not take hits. A button does, including inside the scrolling step list.
     private var installerView: some View {
         InstallGuest(session: installSlot.session!)
-            .frame(width: 160, height: 100)
+            .frame(width: Guest.thumbnail.width, height: Guest.thumbnail.height)
+            .allowsHitTesting(false)
             .accessibilityLabel("Installer")
-            .accessibilityHint("The installer")
+            .overlay {
+                Button {
+                    installSlot.session?.showWindow = true
+                } label: {
+                    Rectangle().fill(Color.white.opacity(0.001)).contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .accessibilityLabel("Installer")
+                .accessibilityHint("Opens a resizable preview at the original size")
+            }
+    }
+
+    /// The embedded install is invisible, so it cannot open this panel. The thumbnail click sets showWindow.
+    @ViewBuilder private var installerPreview: some View {
+        if wizard.error == nil, let session = installSlot.session, session.needsInstallGuest {
+            InstallerPreview(session: session)
+                .id(ObjectIdentifier(session))
+        }
     }
 
     private func icon(_ state: String) -> String {
@@ -764,5 +790,19 @@ struct QuickStart: View {
         case "fail": return .red
         default: return Color.secondary.opacity(0.45)
         }
+    }
+}
+
+/// Watches the running installer. Quick start's slot does not publish showWindow, so this view does.
+private struct InstallerPreview: View {
+    @ObservedObject var session: GuestSession
+
+    var body: some View {
+        InstallerWindow(guest: session, presented: $session.showWindow) {
+            GuestMirror(session: session)
+                .installerFloor()
+                .background(.black)
+        }
+        .accessibilityHidden(true)
     }
 }

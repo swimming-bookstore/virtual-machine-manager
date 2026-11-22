@@ -19,6 +19,18 @@ final class QuickStartModel: ObservableObject {
     }
 }
 
+/// Shared window sizes. The scene default and the view that fills it must not each keep a copy.
+enum WindowMetrics {
+    static let pagePad: CGFloat = 24
+    static let quickStartWidth: CGFloat = 440
+    static let quickStartMinHeight: CGFloat = 360
+    /// Scene default and the page's ideal height.
+    static let quickStart = CGSize(width: quickStartWidth, height: 640)
+    static let splashWidth: CGFloat = 380
+    static let library = CGSize(width: 1100, height: 720)
+    static let libraryMin = CGSize(width: 900, height: 560)
+}
+
 @main
 struct VirtualMachinesApp: App {
     @StateObject private var quickStart = QuickStartModel()
@@ -26,12 +38,12 @@ struct VirtualMachinesApp: App {
     var body: some Scene {
         WindowGroup("Virtual Machine Manager", id: "main") { Welcome() }
             .windowResizability(.automatic)
-            .defaultSize(width: 1100, height: 720)
+            .defaultSize(width: WindowMetrics.library.width, height: WindowMetrics.library.height)
         Window("Quick start", id: "quick-start") {
             QuickStart(wizard: quickStart.wizard, installSlot: quickStart.installSlot)
         }
             // The list scrolls inside the window. Do not size the window to the full list.
             .windowResizability(.automatic)
-            .defaultSize(width: 440, height: 640)
+            .defaultSize(width: WindowMetrics.quickStart.width, height: WindowMetrics.quickStart.height)
     }
 }
