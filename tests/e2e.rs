@@ -3622,7 +3622,8 @@ fn quick_start_swift_gates_the_bar_on_a_real_download() {
     assert!(include_str!("../debian.cfg").contains("tasksel tasksel/first multiselect xfce-desktop"));
     assert!(!include_str!("../debian.cfg").contains("partman-auto/method"));
     assert!(!include_str!("../debian.cfg").contains("partman-auto/method string regular"));
-    assert!(include_str!("../debian.cfg").contains("size=8G"));
+    assert!(!include_str!("../debian.cfg").contains("tmp.mount"));
+    assert!(!include_str!("../debian.cfg").contains("size=8G"));
     assert!(include_str!("../debian.cfg").contains("d-i pkgsel/include string openssh-server spice-vdagent"));
     assert!(!include_str!("../debian.cfg").contains("apt-install"));
     assert!(!include_str!("../debian.cfg").contains("expert_recipe"));
