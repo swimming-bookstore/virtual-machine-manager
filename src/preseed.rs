@@ -15,10 +15,11 @@
 //!
 //! The installer has no USB keyboard. A HID boot keyboard makes Keyboard
 //! configuration a critical question. The boot line is only `auto=true
-//! priority=critical`. debian.cfg answers the keymap.
+//! priority=critical`. The example answers the keymap, so debian.cfg does not
+//! repeat it.
 //! When the target has a Debian version and a GRUB config, late_command copies
-//! `/authorized_keys` from the text initrd into the debian account and enables
-//! sshd. The host treats the install as finished only after it can log in.
+//! `/authorized_keys` from the text initrd into the debian account. The ssh-server
+//! task enables sshd. The host treats the install as finished only after it can log in.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -67,17 +68,20 @@ pub fn preseed_cfg(example: &str) -> Result<String> {
 }
 
 /// Local overrides. Loaded by `preseed/include`, so they replace the example.
-/// The example already sets locale, keyboard, partitioning confirms, and GRUB.
-/// The guest disk is virtio and the installer is a USB disk, so both have to be named.
-/// The example already uses LVM and the atomic recipe. debian.cfg only repeats the
-/// method, because this file used to force regular and that overrides the example.
+/// The example already sets locale, keyboard, hostname, timezone, LVM, and GRUB.
+/// Those lines are not repeated here. A repeated line would override the example.
+/// The guest disk is virtio and the installer is a USB disk. The example only
+/// shows `/dev/sda` as a comment, so the disk and the boot device are named here.
+/// The example already uses LVM and the atomic recipe. This file does not set
+/// `partman-auto/method`, because an older copy forced regular and that overrode it.
 /// Trixie puts /tmp on a tmpfs, capped at 50% of RAM. This guest has 2 GiB, so
 /// that cap is 1 GiB. late_command writes the release-notes drop-in and raises
 /// the cap to 4 GiB. The partition layout is unchanged.
 /// <https://www.debian.org/releases/trixie/release-notes/issues.en.html#the-temporary-files-directory-tmp-is-now-stored-in-a-tmpfs>
 /// The account is debian / debian. The host key is still copied in late_command.
-/// tasksel installs the XFCE desktop task. `tasksel/first` names `xfce-desktop`
-/// directly, so the GNOME default behind `desktop` is never read.
+/// tasksel installs standard, the SSH server, and the XFCE desktop task.
+/// `tasksel/first` names `xfce-desktop` directly, so the GNOME default behind
+/// `desktop` is never read. late_command installs spice-vdagent with apt-install.
 /// <https://www.debian.org/releases/trixie/example-preseed.txt>
 /// <https://www.debian.org/releases/stable/amd64/apbs05.en.html>
 pub fn debian_cfg() -> &'static str {
@@ -95,7 +99,7 @@ pub fn authorized_keys(public_key: &str) -> String {
 }
 
 /// Boot parameters from the guide's auto mode. They belong before `---`.
-/// Only auto and critical. Keyboard and desktop are answered in debian.cfg.
+/// Only auto and critical. The example answers the keymap. The desktop is in debian.cfg.
 pub fn boot_args() -> String {
     "auto=true priority=critical".to_string()
 }
@@ -982,7 +986,7 @@ mod tests {
             EXAMPLE_URL,
             "https://www.debian.org/releases/trixie/example-preseed.txt"
         );
-        assert!(answers.contains("partman-auto/method string lvm"));
+        assert!(!answers.contains("partman-auto/method"));
         assert!(!answers.contains("partman-auto/method string regular"));
         assert!(!answers.contains("expert_recipe"));
         assert!(answers.contains("tmp.mount.d/override.conf"));
@@ -992,21 +996,22 @@ mod tests {
         assert!(answers.contains("passwd/user-password-again password debian"));
         assert!(!answers.contains("user-password-crypted"));
         assert!(!answers.contains("preseed/early_command"));
-        assert!(answers.contains("d-i keyboard-configuration/xkb-keymap select us"));
+        assert!(!answers.contains("keyboard-configuration"));
         assert!(!answers.contains('#'));
         assert_eq!(boot_args(), "auto=true priority=critical");
         assert!(answers.contains("partman-auto/disk string /dev/vda"));
         assert!(answers.contains("grub-installer/bootdev string /dev/vda"));
         assert!(answers.contains("deb.debian.org"));
-        assert!(answers.contains("time/zone string UTC"));
-        assert!(answers.contains("openssh-server"));
-        assert!(answers.contains("tasksel tasksel/first multiselect xfce-desktop"));
+        assert!(!answers.contains("time/zone"));
+        assert!(!answers.contains("netcfg/get_hostname"));
+        assert!(answers.contains("ssh-server"));
+        assert!(answers.contains("tasksel tasksel/first multiselect standard, ssh-server, xfce-desktop"));
         assert!(!answers.contains("tasksel/desktop"));
         assert!(!answers.contains("task-xfce-desktop"));
         assert!(!answers.contains("debian-installer/locale"));
-        assert!(answers.contains("d-i keyboard-configuration/xkb-keymap select us"));
+        assert!(answers.contains("apt-install spice-vdagent"));
         assert!(answers.contains("cp /authorized_keys"));
-        assert!(answers.contains("systemctl enable ssh && mkdir -p /target/etc/systemd/system/tmp.mount.d"));
+        assert!(!answers.contains("systemctl enable ssh"));
         assert!(answers.contains("sync && poweroff"));
         assert!(!answers.contains('#'));
         assert_eq!(

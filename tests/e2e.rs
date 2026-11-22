@@ -3618,11 +3618,12 @@ fn quick_start_swift_gates_the_bar_on_a_real_download() {
     assert!(include_str!("../Sources/Install.swift").contains("keyboard: captureKeyboard"));
     assert!(include_str!("../Sources/Install.swift").contains("pointer: false"));
     assert!(include_str!("../Sources/Guest.swift").contains("pointer: Bool = false"));
-    assert!(include_str!("../debian.cfg").contains("d-i keyboard-configuration/xkb-keymap select us"));
-    assert!(include_str!("../debian.cfg").contains("tasksel tasksel/first multiselect xfce-desktop"));
-    assert!(include_str!("../debian.cfg").contains("d-i partman-auto/method string lvm"));
+    assert!(!include_str!("../debian.cfg").contains("keyboard-configuration"));
+    assert!(include_str!("../debian.cfg").contains("tasksel tasksel/first multiselect standard, ssh-server, xfce-desktop"));
+    assert!(!include_str!("../debian.cfg").contains("partman-auto/method"));
     assert!(!include_str!("../debian.cfg").contains("partman-auto/method string regular"));
     assert!(include_str!("../debian.cfg").contains("size=4G"));
+    assert!(include_str!("../debian.cfg").contains("apt-install spice-vdagent"));
     assert!(!include_str!("../debian.cfg").contains("expert_recipe"));
     assert!(!include_str!("../debian.cfg").contains("preseed/early_command"));
     assert!(include_str!("../Sources/Guest.swift").contains("config.keyboards = extra.isEmpty && keyboard"));
