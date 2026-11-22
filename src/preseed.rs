@@ -58,8 +58,11 @@ pub fn preseed_cfg(example: &str) -> Result<String> {
 }
 
 /// Overrides loaded after the official example. The example already sets the mirror
-/// layout, partitioning confirms, and GRUB. Locale and keymap are also kernel
-/// parameters, because the installer asks them before this file is read.
+/// layout, partitioning confirms, and GRUB, but its method is LVM and it does not
+/// name a disk. On a USB install that LVM step fails and the installer stops at
+/// "Choose the next step in the install process". The working answers used a
+/// regular layout on `/dev/vda`. Locale and keymap are also kernel parameters,
+/// because the installer asks them before this file is read.
 ///
 /// `priority=critical` does not hide this question. The guide's `keymap=skip-config`
 /// is not one of the choices in trixie, so the installer still asks. xfce-desktop
@@ -94,7 +97,16 @@ d-i passwd/user-fullname string debian
 d-i passwd/user-password password debian
 d-i passwd/user-password-again password debian
 d-i passwd/username string debian
+d-i clock-setup/utc boolean true
+d-i time/zone string UTC
+d-i partman-auto/method string regular
 d-i partman-auto/disk string /dev/vda
+d-i partman-auto/choose_recipe select atomic
+d-i partman-partitioning/confirm_write_new_label boolean true
+d-i partman/choose_partition select finish
+d-i partman/confirm boolean true
+d-i partman/confirm_nooverwrite boolean true
+d-i grub-installer/only_debian boolean true
 d-i grub-installer/bootdev string /dev/vda
 d-i preseed/late_command string {late}
 
@@ -1051,7 +1063,10 @@ mod tests {
         assert!(!answers.contains('#'));
         assert!(answers.contains("debian-installer/locale string en_US.UTF-8"));
         assert!(answers.contains("deb.debian.org"));
+        assert!(answers.contains("partman-auto/method string regular"));
         assert!(answers.contains("partman-auto/disk string /dev/vda"));
+        assert!(answers.contains("partman-auto/choose_recipe select atomic"));
+        assert!(answers.contains("grub-installer/only_debian boolean true"));
         assert!(answers.contains("grub-installer/bootdev string /dev/vda"));
         assert!(answers.contains("ssh-server"));
         assert!(answers.contains("xfce-desktop"));
