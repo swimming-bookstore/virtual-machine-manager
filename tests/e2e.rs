@@ -3623,7 +3623,8 @@ fn quick_start_swift_gates_the_bar_on_a_real_download() {
     assert!(!include_str!("../debian.cfg").contains("partman-auto/method"));
     assert!(!include_str!("../debian.cfg").contains("partman-auto/method string regular"));
     assert!(include_str!("../debian.cfg").contains("size=4G"));
-    assert!(include_str!("../debian.cfg").contains("apt-install spice-vdagent"));
+    assert!(include_str!("../debian.cfg").contains("d-i pkgsel/include string openssh-server spice-vdagent"));
+    assert!(!include_str!("../debian.cfg").contains("apt-install"));
     assert!(!include_str!("../debian.cfg").contains("expert_recipe"));
     assert!(!include_str!("../debian.cfg").contains("preseed/early_command"));
     assert!(include_str!("../Sources/Guest.swift").contains("config.keyboards = extra.isEmpty && keyboard"));
