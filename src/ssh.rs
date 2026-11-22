@@ -87,8 +87,9 @@ pub fn own_group() {
 }
 
 /// One attempt. A closed port or a refused key is not a finished install.
-/// ARP first, then the next slice of 192.168.64.2–254. 192.168.64.1 is the host gateway, not the guest.
-/// DHCP is not limited to .2–.8, so one probe must not stop there, and it must not walk the whole subnet.
+/// The virtual machine object does not report the guest address.
+/// The DHCP lease for this disk's MAC is tried first, then ARP, then one address.
+/// 192.168.64.1 is the host gateway, not the guest. A miss must not walk the subnet.
 pub fn probe_disk(disk: &Path) -> Result<bool> {
     if logged_in_beside(disk)? {
         return Ok(true);
@@ -105,7 +106,7 @@ pub fn probe_disk(disk: &Path) -> Result<bool> {
         return Ok(false);
     }
     let mac = mac_string(disk);
-    for host in next_hosts(&dir, &mac, &arp_guests()) {
+    for host in next_hosts(&dir, &mac, &arp_guests(), &dhcp_guests()) {
         if login(&private, &host)? {
             write_new(&guest.join(PROOF), format!("{USER} ok\n").as_bytes())?;
             write_new(&dir.join(PROOF), format!("{USER} ok\n").as_bytes())?;
@@ -125,27 +126,37 @@ pub fn mac_string(disk: &Path) -> String {
     format!("02:56:4d:4d:{:02x}:{:02x}", (sum >> 8) as u8, sum as u8)
 }
 
-fn next_hosts(dir: &Path, mac: &str, arp: &[(String, String)]) -> Vec<String> {
+fn next_hosts(
+    dir: &Path,
+    mac: &str,
+    arp: &[(String, String)],
+    leases: &[(String, String)],
+) -> Vec<String> {
     let want = normalize_mac(mac);
-    let mut batch = Vec::new();
-    for (host, seen) in arp {
-        if seen == &want {
-            batch.push(host.clone());
-        }
+    let leased = hosts_for(&want, leases);
+    if !leased.is_empty() {
+        return leased;
+    }
+    let seen = hosts_for(&want, arp);
+    if !seen.is_empty() {
+        return seen;
     }
     let start = read_octet(dir);
-    let next = 2 + (start - 2 + 12) % 253;
+    let next = if start >= 254 { 2 } else { start + 1 };
     let _ = fs::create_dir_all(dir);
     let _ = fs::write(dir.join(SCAN), format!("{next}\n"));
-    for offset in 0..12 {
-        let n = 2 + (start - 2 + offset) % 253;
-        batch.push(format!("192.168.64.{n}"));
-    }
+    vec![format!("192.168.64.{start}")]
+}
+
+fn hosts_for(mac: &str, rows: &[(String, String)]) -> Vec<String> {
+    let mut found = Vec::new();
     let mut seen = HashSet::new();
-    batch
-        .into_iter()
-        .filter(|host| seen.insert(host.clone()))
-        .collect()
+    for (host, row) in rows {
+        if row == mac && seen.insert(host.clone()) {
+            found.push(host.clone());
+        }
+    }
+    found
 }
 
 fn read_octet(dir: &Path) -> u32 {
@@ -158,6 +169,56 @@ fn read_octet(dir: &Path) -> u32 {
 
 fn arp_guests() -> Vec<(String, String)> {
     parse_arp(&arp_output())
+}
+
+/// InternetSharing writes one lease per guest. The MAC is the one this disk's attachment uses.
+fn dhcp_guests() -> Vec<(String, String)> {
+    parse_leases(&lease_text())
+}
+
+fn lease_text() -> String {
+    for path in ["/var/db/dhcpd_leases", "/private/var/db/dhcpd_leases"] {
+        if let Ok(text) = fs::read_to_string(path) {
+            return text;
+        }
+    }
+    String::new()
+}
+
+fn parse_leases(text: &str) -> Vec<(String, String)> {
+    let mut found = Vec::new();
+    let mut ip = String::new();
+    let mut mac = String::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('{') {
+            ip.clear();
+            mac.clear();
+            continue;
+        }
+        if line.starts_with('}') {
+            if ip.starts_with("192.168.64.") && ip != "192.168.64.1" && !mac.is_empty() {
+                found.push((ip.clone(), mac.clone()));
+            }
+            continue;
+        }
+        let mut parts = line.splitn(2, '=');
+        let key = parts.next().unwrap_or("").trim();
+        let value = parts.next().unwrap_or("").trim();
+        match key {
+            "ip_address" => ip = value.to_string(),
+            "hw_address" => {
+                mac = value
+                    .split(',')
+                    .next_back()
+                    .map(str::trim)
+                    .map(normalize_mac)
+                    .unwrap_or_default();
+            }
+            _ => {}
+        }
+    }
+    found
 }
 
 fn arp_output() -> String {
@@ -231,6 +292,8 @@ fn login(private: &Path, host: &str) -> Result<bool> {
         "UserKnownHostsFile=/dev/null",
         "-o",
         "ConnectTimeout=1",
+        "-o",
+        "ConnectionAttempts=1",
         "-p",
         &port,
         "-i",
@@ -288,25 +351,51 @@ mod tests {
     }
 
     #[test]
-    fn a_probe_walks_twelve_addresses_and_continues() {
+    fn a_probe_tries_the_lease_then_one_address() {
         let dir = PathBuf::from(format!("/tmp/vmm-ssh-{}-{}", std::process::id(), "scan"));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let mac = "02:56:4d:4d:09:35";
         let arp = vec![("192.168.64.7".into(), mac.into())];
-        let first = next_hosts(&dir, mac, &arp);
-        assert_eq!(first[0], "192.168.64.7");
-        let mut want = vec!["192.168.64.7".into()];
-        want.extend(
-            (2..14)
-                .filter(|n| *n != 7)
-                .map(|n| format!("192.168.64.{n}")),
-        );
-        assert_eq!(first, want);
-        let second = next_hosts(&dir, mac, &[]);
-        assert_eq!(second[0], "192.168.64.14");
-        assert_eq!(second.len(), 12);
+        let leases = vec![("192.168.64.4".into(), mac.into())];
+        let first = next_hosts(&dir, mac, &arp, &leases);
+        assert_eq!(first, vec!["192.168.64.4".to_string()]);
+        let from_arp = next_hosts(&dir, mac, &arp, &[]);
+        assert_eq!(from_arp, vec!["192.168.64.7".to_string()]);
+        let second = next_hosts(&dir, mac, &[], &[]);
+        assert_eq!(second, vec!["192.168.64.2".to_string()]);
+        let third = next_hosts(&dir, mac, &[], &[]);
+        assert_eq!(third, vec!["192.168.64.3".to_string()]);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dhcp_leases_keep_this_guest() {
+        let text = "\
+{
+	name=debian
+	ip_address=192.168.64.4
+	hw_address=1,2:56:4d:4d:9:35
+	identifier=1,2:56:4d:4d:9:35
+}
+{
+	name=name
+	ip_address=192.168.64.1
+	hw_address=1,aa:bb:cc:dd:ee:ff
+}
+{
+	name=other
+	ip_address=192.168.64.9
+	hw_address=1,02:00:00:00:00:01
+}
+";
+        assert_eq!(
+            parse_leases(text),
+            vec![
+                ("192.168.64.4".into(), "02:56:4d:4d:09:35".into()),
+                ("192.168.64.9".into(), "02:00:00:00:00:01".into()),
+            ]
+        );
     }
 
     #[test]

@@ -3642,8 +3642,11 @@ fn quick_start_swift_gates_the_bar_on_a_real_download() {
     assert!(include_str!("../Sources/Guest.swift").contains("VZNATNetworkDeviceAttachment()"));
     assert!(!include_str!("../Sources/Guest.swift").contains("VZNATNetworkDeviceForwardingRules"));
     assert!(include_str!("../src/ssh.rs").contains("192.168.64."));
-    assert!(include_str!("../src/ssh.rs").contains("% 253"));
+    assert!(include_str!("../src/ssh.rs").contains("dhcpd_leases"));
+    assert!(!include_str!("../src/ssh.rs").contains("for offset in 0..12"));
     assert!(include_str!("../src/ssh.rs").contains("ConnectTimeout=1"));
+    assert!(include_str!("../src/ssh.rs").contains("ConnectionAttempts=1"));
+    assert!(include_str!("../Sources/Install.swift").contains("withTimeInterval: 0.5"));
     assert!(include_str!("../Sources/QuickStart.swift").contains("terminationHandler"));
     assert!(include_str!("../Sources/QuickStart.swift").contains("[\"ssh\", \"--disk\", disk.path]"));
     assert!(include_str!("../Sources/Install.swift").contains("watchSSH()"));

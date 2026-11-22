@@ -947,7 +947,8 @@ final class GuestSession: ObservableObject {
         // The first probe must not wait for VZVirtualMachine.state == .running.
         // start() reports success before that state changes, and a stopped guest never reaches it.
         checkSSH()
-        watch = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
+        // A miss is one short login. Waiting two seconds between those made Verify with host key look stuck.
+        watch = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
             self?.checkSSH()
         }
     }

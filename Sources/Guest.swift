@@ -113,7 +113,7 @@ enum Guest {
 
 /// The host key. The install is finished only after this key logs in.
 /// The proof sits beside the disk it reached. One app-wide file would still say "ok" after that disk was deleted.
-/// The worker walks ARP and a short run of 192.168.64.2–254. Swift only starts that process and can kill it.
+/// The worker reads the DHCP lease, then ARP, then one guest address. Swift only starts that process and can kill it.
 enum GuestSSH {
     static func dir(beside disk: URL) -> URL {
         disk.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
