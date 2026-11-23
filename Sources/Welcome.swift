@@ -8,7 +8,9 @@ extension Notification.Name {
 struct Machine: Identifiable, Hashable {
     let name: String
     let disk: String
-    var id: String { disk }
+    /// Kept across a rename so the open guest is not created again.
+    var key: String
+    var id: String { key }
 }
 
 final class LibraryModel: ObservableObject {
@@ -17,7 +19,12 @@ final class LibraryModel: ObservableObject {
     @Published var error: String?
     @Published var cloning = false
     @Published var naming = false
+    @Published var renaming = false
     @Published var draftName = "My Debian"
+    /// Disk being renamed. The folder under machines/ moves with the name.
+    private var renamingDisk: String?
+    /// Row identity for each disk. Rename moves the entry so the open guest stays mounted.
+    private var keys: [String: String] = [:]
     @Published var snapshotReady = SupportDir.snapshotReady
     /// Running clones. The detail view is one machine; this keeps the others alive.
     private var sessions: [String: GuestSession] = [:]
@@ -29,13 +36,13 @@ final class LibraryModel: ObservableObject {
     /// Opening the library with no machines asks for the first name. Becoming active does not ask again.
     func offerFirstName() {
         appear()
-        guard machines.isEmpty, !cloning, !naming, error == nil, snapshotReady else { return }
+        guard machines.isEmpty, !cloning, !naming, !renaming, error == nil, snapshotReady else { return }
         askName()
     }
 
     /// A machine is not created until the name is chosen. The + button uses this same popup.
     func askName() {
-        guard !cloning, !naming, snapshotReady else { return }
+        guard !cloning, !naming, !renaming, snapshotReady else { return }
         naming = true
         draftName = "My Debian"
         error = nil
@@ -50,15 +57,60 @@ final class LibraryModel: ObservableObject {
 
     /// The + button asks for a name, the same popup as the first machine.
     func cloneNew() {
-        guard !cloning, snapshotReady else { return }
+        guard !cloning, !renaming, snapshotReady else { return }
         askName()
+    }
+
+    func cancelName() {
+        naming = false
+        renaming = false
+        renamingDisk = nil
+        error = nil
+    }
+
+    /// Rename uses the create popup. The typed name becomes the folder.
+    func askRename(_ disk: String) {
+        guard !cloning, !naming, !renaming else { return }
+        guard let machine = machines.first(where: { $0.disk == disk }) else { return }
+        renamingDisk = disk
+        renaming = true
+        draftName = machine.name
+        error = nil
     }
 
     /// Rust trims the name, keeps spaces, and refuses a folder that is already there.
     func createNamed() {
         let typed = draftName.trimmingCharacters(in: .whitespacesAndNewlines)
         if typed.isEmpty { return }
-        create(name: typed)
+        if renaming {
+            rename(to: typed)
+        } else {
+            create(name: typed)
+        }
+    }
+
+    /// The folder is the name. A running guest keeps its session under the new disk path.
+    private func rename(to name: String) {
+        guard let disk = renamingDisk, !cloning else { return }
+        cloning = true
+        error = nil
+        let dir = SupportDir.url
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result = Worker.renameMachine(dir: dir, disk: disk, name: name)
+            DispatchQueue.main.async {
+                self.cloning = false
+                switch result {
+                case .success(let next):
+                    self.adopt(disk, as: next)
+                    self.renaming = false
+                    self.renamingDisk = nil
+                    self.refresh()
+                    self.selected = next
+                case .failure(let message):
+                    self.error = message
+                }
+            }
+        }
     }
 
     private func create(name: String?) {
@@ -97,16 +149,22 @@ final class LibraryModel: ObservableObject {
             for name in names.sorted() where !name.hasPrefix(".") {
                 let disk = root.appendingPathComponent(name).appendingPathComponent("disk.img")
                 if fm.fileExists(atPath: disk.path) {
-                    found.append(Machine(name: name, disk: disk.path))
+                    found.append(Machine(name: name, disk: disk.path, key: disk.path))
                 }
             }
         }
+        let live = Set(found.map(\.disk))
+        keys = keys.filter { live.contains($0.key) }
+        for machine in found.indices {
+            let disk = found[machine].disk
+            if keys[disk] == nil { keys[disk] = disk }
+            found[machine].key = keys[disk] ?? disk
+        }
         let next = found
-        let same = machines.map(\.disk) == next.map(\.disk) && machines.map(\.name) == next.map(\.name)
+        let same = machines.map(\.disk) == next.map(\.disk) && machines.map(\.name) == next.map(\.name) && machines.map(\.key) == next.map(\.key)
         if !same {
             machines = next
         }
-        let live = Set(next.map(\.disk))
         for disk in sessions.keys.filter({ !live.contains($0) }) {
             sessions[disk]?.stop()
             sessions.removeValue(forKey: disk)
@@ -114,6 +172,15 @@ final class LibraryModel: ObservableObject {
         if selected == nil || !next.contains(where: { $0.disk == selected }) {
             selected = next.first?.disk
         }
+    }
+
+    /// Point the running guest at the new disk before refresh drops the old path.
+    private func adopt(_ disk: String, as next: String) {
+        guard next != disk else { return }
+        keys[next] = keys.removeValue(forKey: disk) ?? disk
+        guard let session = sessions.removeValue(forKey: disk) else { return }
+        session.retarget(next)
+        sessions[next] = session
     }
 
     /// Same guest after the sidebar selects another row. Creating a clone must not stop this one.
@@ -223,6 +290,9 @@ struct Welcome: View {
             List(library.machines, selection: $library.selected) { machine in
                 Text(machine.name)
                     .lineLimit(1)
+                    .contextMenu {
+                        Button("Rename") { library.askRename(machine.disk) }
+                    }
             }
             .listStyle(.sidebar)
             .navigationSplitViewColumnWidth(min: 200, ideal: 240, max: 300)
@@ -236,14 +306,14 @@ struct Welcome: View {
                         Label("New virtual machine", systemImage: "plus")
                     }
                     .help("New virtual machine")
-                    .disabled(library.cloning || library.naming || !library.snapshotReady)
+                    .disabled(library.cloning || library.naming || library.renaming || !library.snapshotReady)
                 }
             }
         } detail: {
             Group {
                 if let disk = library.selected {
                     Install(iso: "", disk: disk, fromSnapshot: true, fill: true, session: library.session(for: disk))
-                        .id(disk)
+                        .id(library.machines.first { $0.disk == disk }?.key ?? disk)
                 } else if library.machines.isEmpty || library.cloning {
                     ProgressView()
                 } else {
@@ -253,7 +323,9 @@ struct Welcome: View {
             .navigationTitle("Virtual Machine Manager")
         }
         .frame(minWidth: WindowMetrics.libraryMin.width, idealWidth: WindowMetrics.library.width, maxWidth: .infinity, minHeight: WindowMetrics.libraryMin.height, idealHeight: WindowMetrics.library.height, maxHeight: .infinity)
-        .sheet(isPresented: $library.naming) {
+        .sheet(isPresented: Binding(get: { library.naming || library.renaming }, set: { shown in
+            if !shown { library.cancelName() }
+        })) {
             NameMachine(library: library)
         }
     }
@@ -273,7 +345,7 @@ private struct NameMachine: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("Name this virtual machine")
+            Text(library.renaming ? "Rename this virtual machine" : "Name this virtual machine")
                 .font(.headline)
             TextField("Name", text: $library.draftName)
                 .textFieldStyle(.roundedBorder)
@@ -284,10 +356,9 @@ private struct NameMachine: View {
             HStack {
                 Spacer()
                 Button("Cancel") {
-                    library.naming = false
-                    library.error = nil
+                    library.cancelName()
                 }
-                Button("Create") { library.createNamed() }
+                Button(library.renaming ? "Rename" : "Create") { library.createNamed() }
                     .buttonStyle(.borderedProminent)
                     .disabled(library.draftName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || library.cloning)
                     .keyboardShortcut(.defaultAction)

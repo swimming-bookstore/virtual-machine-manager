@@ -492,6 +492,11 @@ final class GuestSession: ObservableObject {
         }
     }
 
+    /// Rename moved the folder. The running guest keeps this session and reads the new disk path.
+    func retarget(_ path: String) {
+        diskURL = URL(fileURLWithPath: path)
+    }
+
     /// A clone stays off until Start. A pause save is restored then, not on open.
     func holdClone(_ path: String) {
         if started && !stopped { return }

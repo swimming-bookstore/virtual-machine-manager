@@ -76,6 +76,55 @@ pub fn clone_machine(support: &Path, name: Option<&str>) -> Result<Saved> {
     Ok(saved(&dest))
 }
 
+/// Rename a clone. The folder under machines/ is the name, so the directory moves with it.
+pub fn rename_machine(support: &Path, disk: &Path, name: &str) -> Result<Saved> {
+    let name = folder_name(name)?;
+    let machines = support.join("machines");
+    let src = machine_dir(support, disk)?;
+    let dest = machines.join(&name);
+    if src == dest {
+        return Ok(saved(&src));
+    }
+    if dest.exists() {
+        bail!("{name} already exists");
+    }
+    fs::rename(&src, &dest).map_err(|err| {
+        anyhow!(
+            "cannot rename {} to {}: {err}",
+            src.display(),
+            dest.display()
+        )
+    })?;
+    Ok(saved(&dest))
+}
+
+/// The clone directory that owns this disk. Only machines/<name>/disk.img can move.
+fn machine_dir(support: &Path, disk: &Path) -> Result<PathBuf> {
+    let file = disk
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("that disk is not a virtual machine"))?;
+    let parent = disk
+        .parent()
+        .ok_or_else(|| anyhow!("that disk is not a virtual machine"))?;
+    let name = parent
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("that disk is not a virtual machine"))?;
+    let machines = parent
+        .parent()
+        .ok_or_else(|| anyhow!("that disk is not a virtual machine"))?;
+    // Compare the path the app stored. canonicalize follows the support-dir symlink and would miss it.
+    if file != DISK || machines != support.join("machines") {
+        bail!("that disk is not a virtual machine");
+    }
+    machine_name(name)?;
+    if !disk.is_file() {
+        bail!("that virtual machine is missing");
+    }
+    Ok(parent.to_path_buf())
+}
+
 fn copy_beside(src: &Path, dest: &Path, names: &[&str]) -> Result<()> {
     for name in names {
         let from = src.join(name);
@@ -476,6 +525,18 @@ mod tests {
             .contains("already exists"));
         assert!(clone_machine(&dir, Some("a/b")).is_err());
         assert!(clone_machine(&dir, Some(".hidden")).is_err());
+
+        let renamed = rename_machine(&dir, &pretty.disk, "Other Debian").unwrap();
+        assert_eq!(renamed.dir, dir.join("machines/Other Debian"));
+        assert_eq!(renamed.disk, dir.join("machines/Other Debian").join(DISK));
+        assert!(!pretty.dir.exists());
+        assert_eq!(fs::read(renamed.dir.join(NVRAM)).unwrap(), b"efi-vars");
+        let same = rename_machine(&dir, &renamed.disk, "Other Debian").unwrap();
+        assert_eq!(same.dir, renamed.dir);
+        assert!(rename_machine(&dir, &renamed.disk, "lab").is_err());
+        assert!(rename_machine(&dir, &renamed.disk, "debian").is_err());
+        assert!(rename_machine(&dir, &renamed.disk, "../x").is_err());
+        assert!(rename_machine(&dir, &dir.join("snapshots/debian").join(DISK), "nope").is_err());
 
         // Deleting the snapshot removes the disk the installer wrote. There is no second copy to restore.
         fs::remove_dir_all(dir.join(SNAPSHOT)).unwrap();
