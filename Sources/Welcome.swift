@@ -33,9 +33,9 @@ final class LibraryModel: ObservableObject {
         askName()
     }
 
-    /// The first machine is not created until the name is chosen.
+    /// A machine is not created until the name is chosen. The + button uses this same popup.
     func askName() {
-        guard !cloning, !naming, snapshotReady, machines.isEmpty else { return }
+        guard !cloning, !naming, snapshotReady else { return }
         naming = true
         draftName = "My Debian"
         error = nil
@@ -48,14 +48,10 @@ final class LibraryModel: ObservableObject {
         }
     }
 
-    /// The first machine is named in the popup. Later ones keep the next debian-N.
+    /// The + button asks for a name, the same popup as the first machine.
     func cloneNew() {
         guard !cloning, snapshotReady else { return }
-        if machines.isEmpty {
-            askName()
-        } else {
-            create(name: nil)
-        }
+        askName()
     }
 
     /// Rust trims the name, keeps spaces, and refuses a folder that is already there.
@@ -181,7 +177,7 @@ struct Welcome: View {
             guard let disk = note.object as? String else { return }
             library.refresh()
             if disk == "name" {
-                library.askName()
+                if library.machines.isEmpty { library.askName() }
             } else {
                 library.selected = disk
             }
@@ -271,7 +267,7 @@ struct Welcome: View {
     }
 }
 
-/// The first machine is named here. Create is what copies the snapshot.
+/// Create copies the snapshot under this name. The + button uses this same popup.
 private struct NameMachine: View {
     @ObservedObject var library: LibraryModel
 

@@ -3701,6 +3701,8 @@ fn quick_start_swift_gates_the_bar_on_a_real_download() {
     assert!(!include_str!("../Sources/App.swift").contains("id: \"debian\""));
     assert!(include_str!("../Sources/Welcome.swift").contains("func offerFirstName()"));
     assert!(include_str!("../Sources/Welcome.swift").contains("func cloneNew()"));
+    assert!(include_str!("../Sources/Welcome.swift").contains("askName()"));
+    assert!(!include_str!("../Sources/Welcome.swift").contains("create(name: nil)"));
     assert!(include_str!("../Sources/Welcome.swift").contains("Name this virtual machine"));
     assert!(include_str!("../Sources/Welcome.swift").contains("draftName = \"My Debian\""));
     assert!(include_str!("../Sources/Welcome.swift").contains("Worker.suggestName()"));
