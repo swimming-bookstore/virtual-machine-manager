@@ -90,6 +90,7 @@ struct WorkerEvent: Decodable {
     var path: String?
     var disk: String?
     var key: String?
+    var name: String?
 }
 
 final class Wizard: ObservableObject {
@@ -389,6 +390,18 @@ enum Worker {
         return code == 0 ? nil : (message(text) ?? "Could not clear the pause.")
     }
 
+    /// Folder for the popup name. Spaces are kept. An existing folder is an error.
+    static func machineName(dir: URL, name: String) -> ClonedDisk {
+        let (code, text) = run(["name", "--dir", dir.path, "--name", name])
+        if code != 0 {
+            return .failure(message(text) ?? "That name cannot be used.")
+        }
+        guard let folder = folderName(text) else {
+            return .failure("The name check did not return a folder.")
+        }
+        return .success(folder)
+    }
+
     static func cloneMachine(dir: URL, name: String? = nil) -> ClonedDisk {
         var args = ["clone", "--dir", dir.path]
         if let name, !name.isEmpty {
@@ -467,6 +480,17 @@ enum Worker {
         }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private static func folderName(_ text: String) -> String? {
+        for line in text.split(separator: "\n") {
+            if let data = line.data(using: .utf8),
+               let event = try? JSONDecoder().decode(WorkerEvent.self, from: data),
+               let name = event.name, !name.isEmpty {
+                return name
+            }
+        }
+        return nil
     }
 
     private static func diskPath(_ text: String) -> String? {

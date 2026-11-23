@@ -17,10 +17,13 @@ final class LibraryModel: ObservableObject {
     @Published var error: String?
     @Published var cloning = false
     @Published var naming = false
-    @Published var draftName = "debian-2"
+    @Published var draftName = "My Debian"
+    /// Folder the worker will create. Empty until the typed name checks out.
+    @Published var folderName = ""
     @Published var snapshotReady = SupportDir.snapshotReady
     /// Running clones. The detail view is one machine; this keeps the others alive.
     private var sessions: [String: GuestSession] = [:]
+    private var nameCheck = 0
 
     func appear() {
         refresh()
@@ -37,8 +40,37 @@ final class LibraryModel: ObservableObject {
     func askName() {
         guard !cloning, !naming, snapshotReady, machines.isEmpty else { return }
         naming = true
-        draftName = "debian-2"
+        draftName = "My Debian"
+        folderName = ""
         error = nil
+        checkDraft()
+    }
+
+    /// The popup asks the worker as the name changes. Create uses the folder that check returned.
+    func checkDraft() {
+        let typed = draftName.trimmingCharacters(in: .whitespacesAndNewlines)
+        nameCheck += 1
+        let token = nameCheck
+        folderName = ""
+        if typed.isEmpty {
+            error = nil
+            return
+        }
+        let dir = SupportDir.url
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result = Worker.machineName(dir: dir, name: typed)
+            DispatchQueue.main.async {
+                guard self.naming, token == self.nameCheck, !self.cloning else { return }
+                switch result {
+                case .success(let folder):
+                    self.folderName = folder
+                    self.error = nil
+                case .failure(let message):
+                    self.folderName = ""
+                    self.error = message
+                }
+            }
+        }
     }
 
     /// The first machine is named in the popup. Later ones keep the next debian-N.
@@ -52,7 +84,26 @@ final class LibraryModel: ObservableObject {
     }
 
     func createNamed() {
-        create(name: draftName.trimmingCharacters(in: .whitespacesAndNewlines))
+        let typed = draftName.trimmingCharacters(in: .whitespacesAndNewlines)
+        if typed.isEmpty || folderName.isEmpty { return }
+        guard !cloning, snapshotReady, naming else { return }
+        let dir = SupportDir.url
+        cloning = true
+        error = nil
+        nameCheck += 1
+        DispatchQueue.global(qos: .userInitiated).async {
+            switch Worker.machineName(dir: dir, name: typed) {
+            case .failure(let message):
+                DispatchQueue.main.async {
+                    self.cloning = false
+                    self.naming = true
+                    self.folderName = ""
+                    self.error = message
+                }
+            case .success(let folder):
+                self.create(name: folder, dir: dir)
+            }
+        }
     }
 
     private func create(name: String?) {
@@ -62,18 +113,22 @@ final class LibraryModel: ObservableObject {
         error = nil
         let dir = SupportDir.url
         DispatchQueue.global(qos: .userInitiated).async {
-            let result = Worker.cloneMachine(dir: dir, name: name)
-            DispatchQueue.main.async {
-                self.cloning = false
-                switch result {
-                case .success(let disk):
-                    self.naming = false
-                    self.refresh()
-                    self.selected = disk
-                case .failure(let message):
-                    self.naming = name != nil
-                    self.error = message
-                }
+            self.create(name: name, dir: dir)
+        }
+    }
+
+    private func create(name: String?, dir: URL) {
+        let result = Worker.cloneMachine(dir: dir, name: name)
+        DispatchQueue.main.async {
+            self.cloning = false
+            switch result {
+            case .success(let disk):
+                self.naming = false
+                self.refresh()
+                self.selected = disk
+            case .failure(let message):
+                self.naming = name != nil
+                self.error = message
             }
         }
     }
@@ -273,6 +328,7 @@ private struct NameMachine: View {
                 .font(.headline)
             TextField("Name", text: $library.draftName)
                 .textFieldStyle(.roundedBorder)
+                .onChange(of: library.draftName) { _, _ in library.checkDraft() }
                 .onSubmit { library.createNamed() }
             if let error = library.error {
                 Text(error).font(.callout).foregroundStyle(.red)
@@ -282,7 +338,8 @@ private struct NameMachine: View {
                 Button("Cancel") { library.naming = false }
                 Button("Create") { library.createNamed() }
                     .buttonStyle(.borderedProminent)
-                    .disabled(library.draftName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || library.cloning)
+                    .disabled(library.folderName.isEmpty || library.cloning)
+                    .keyboardShortcut(.defaultAction)
             }
         }
         .padding(20)

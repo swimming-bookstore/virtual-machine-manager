@@ -60,10 +60,7 @@ pub fn clone_machine(support: &Path, name: Option<&str>) -> Result<Saved> {
     fs::create_dir_all(&machines)
         .map_err(|err| anyhow!("cannot create {}: {err}", machines.display()))?;
     let name = match name {
-        Some(name) => {
-            machine_name(name)?;
-            name.to_string()
-        }
+        Some(name) => machine_folder(support, name)?,
         None => next_name(&machines)?,
     };
     let dest = machines.join(&name);
@@ -160,13 +157,35 @@ fn place(src: &Path, dest: &Path) -> Result<()> {
     })
 }
 
+/// Folder under machines/. The typed name is kept, including spaces. Fails if that folder is already there.
+pub fn machine_folder(support: &Path, name: &str) -> Result<String> {
+    let name = folder_name(name)?;
+    if support.join("machines").join(&name).exists() {
+        bail!("{name} already exists");
+    }
+    Ok(name)
+}
+
+/// "My Debian" is the folder My Debian. The popup asks Rust; it does not invent the folder itself.
+fn folder_name(name: &str) -> Result<String> {
+    let name = name.trim();
+    if name.is_empty() {
+        bail!("machine name is empty");
+    }
+    machine_name(name)?;
+    Ok(name.to_string())
+}
+
 fn machine_name(name: &str) -> Result<()> {
+    // The folder is the typed name. The only reserved folder is the snapshot name, debian.
     let ok = !name.is_empty()
+        && name != "."
+        && name != ".."
         && name.len() <= 64
-        && !name.starts_with('-')
-        && name
+        && !name.starts_with('.')
+        && !name
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+            .any(|c| c.is_control() || matches!(c, '/' | '\\' | ':'));
     if !ok {
         bail!("machine name {name} is not usable");
     }
@@ -430,6 +449,14 @@ mod tests {
         assert!(clone_machine(&dir, Some("../x")).is_err());
         assert!(clone_machine(&dir, Some("")).is_err());
         assert!(clone_machine(&dir, Some("debian")).is_err());
+        let pretty = clone_machine(&dir, Some("My Debian")).unwrap();
+        assert_eq!(pretty.dir, dir.join("machines/My Debian"));
+        assert!(clone_machine(&dir, Some("My Debian"))
+            .unwrap_err()
+            .to_string()
+            .contains("already exists"));
+        assert!(clone_machine(&dir, Some("a/b")).is_err());
+        assert!(clone_machine(&dir, Some(".hidden")).is_err());
 
         // Deleting the snapshot removes the disk the installer wrote. There is no second copy to restore.
         fs::remove_dir_all(dir.join(SNAPSHOT)).unwrap();
@@ -437,6 +464,43 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("guest disk is missing"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_display_name_keeps_its_spaces() {
+        let dir = std::env::temp_dir().join(format!(
+            "vmm-name-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("machines/My Debian")).unwrap();
+        assert_eq!(
+            machine_folder(&dir, "  Other   Debian ").unwrap(),
+            "Other   Debian"
+        );
+        assert_eq!(machine_folder(&dir, "My-Debian").unwrap(), "My-Debian");
+        assert!(machine_folder(&dir, "My Debian")
+            .unwrap_err()
+            .to_string()
+            .contains("already exists"));
+        assert!(machine_folder(&dir, "debian")
+            .unwrap_err()
+            .to_string()
+            .contains("snapshot name"));
+        assert_eq!(machine_folder(&dir, "Debian").unwrap(), "Debian");
+        assert!(machine_folder(&dir, "a/b").is_err());
+        assert!(machine_folder(&dir, " ")
+            .unwrap_err()
+            .to_string()
+            .contains("empty"));
+        assert!(machine_folder(&dir, ".hidden").is_err());
+        assert!(machine_folder(&dir, &"n".repeat(65)).is_err());
+        assert_eq!(machine_folder(&dir, &"n".repeat(64)).unwrap().len(), 64);
         let _ = fs::remove_dir_all(&dir);
     }
 
