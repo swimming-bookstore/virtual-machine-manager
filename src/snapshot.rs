@@ -187,7 +187,7 @@ fn machine_name(name: &str) -> Result<()> {
             .chars()
             .any(|c| c.is_control() || matches!(c, '/' | '\\' | ':'));
     if !ok {
-        bail!("machine name {name} is not usable");
+        bail!("that name cannot be used");
     }
     if name == MACHINE {
         bail!("{name} is the snapshot name, not a clone");

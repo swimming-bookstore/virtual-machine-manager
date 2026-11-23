@@ -1593,7 +1593,7 @@ fn snapshot_waits_for_ssh_then_clones() {
 
     let bad = cli(&["clone", "--dir", dir.to_str().unwrap(), "--name", "../x"]);
     assert!(!bad.status.success());
-    assert!(String::from_utf8_lossy(&bad.stdout).contains("machine name"));
+    assert!(String::from_utf8_lossy(&bad.stdout).contains("cannot be used"));
     let named = cli(&["clone", "--dir", dir.to_str().unwrap(), "--name", "lab"]);
     assert!(
         named.status.success(),
@@ -3691,6 +3691,8 @@ fn quick_start_swift_gates_the_bar_on_a_real_download() {
     );
     assert!(!include_str!("../Sources/Welcome.swift").contains("New Debian"));
     assert!(include_str!("../Sources/Welcome.swift").contains("Quick start"));
+    assert!(!include_str!("../Sources/Welcome.swift").contains("Button(\"Quick start\")"));
+    assert!(!include_str!("../Sources/Welcome.swift").contains("not usable"));
     assert!(include_str!("../Sources/Welcome.swift").contains("Text(\"Welcome\")"));
     assert!(include_str!("../Sources/Welcome.swift").contains("Download Debian 13 for this Mac."));
     assert!(include_str!("../Sources/Welcome.swift").contains("desktopcomputer"));

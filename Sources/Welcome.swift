@@ -289,16 +289,10 @@ struct Welcome: View {
                 if let disk = library.selected {
                     Install(iso: "", disk: disk, fromSnapshot: true, fill: true, session: library.session(for: disk))
                         .id(disk)
-                } else if library.cloning || (library.machines.isEmpty && library.error == nil && library.snapshotReady && !library.naming) {
+                } else if library.machines.isEmpty || library.cloning {
                     ProgressView()
                 } else {
-                    VStack(spacing: 12) {
-                        if let error = library.error {
-                            Text(error).font(.callout).foregroundStyle(.red)
-                        }
-                        Button("Quick start") { openWindow(id: "quick-start") }
-                            .buttonStyle(.borderedProminent)
-                    }
+                    Color.clear
                 }
             }
             .navigationTitle("Virtual Machine Manager")
@@ -330,12 +324,15 @@ private struct NameMachine: View {
                 .textFieldStyle(.roundedBorder)
                 .onChange(of: library.draftName) { _, _ in library.checkDraft() }
                 .onSubmit { library.createNamed() }
-            if let error = library.error {
+            if let error = library.error, error.contains("already exists") {
                 Text(error).font(.callout).foregroundStyle(.red)
             }
             HStack {
                 Spacer()
-                Button("Cancel") { library.naming = false }
+                Button("Cancel") {
+                    library.naming = false
+                    library.error = nil
+                }
                 Button("Create") { library.createNamed() }
                     .buttonStyle(.borderedProminent)
                     .disabled(library.folderName.isEmpty || library.cloning)
