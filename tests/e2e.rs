@@ -374,6 +374,8 @@ fn clap_parses_download_and_rejects_unknown_args() {
         String::from_utf8_lossy(&clone.stderr)
     );
     assert!(String::from_utf8_lossy(&clone.stdout).contains("--name"));
+    let name = cli(&["name", "--help"]);
+    assert!(name.status.success(), "{}", String::from_utf8_lossy(&name.stderr));
     let pause = cli(&["pause", "--help"]);
     assert!(
         pause.status.success(),
@@ -1586,7 +1588,7 @@ fn snapshot_waits_for_ssh_then_clones() {
 
     let bad = cli(&["clone", "--dir", dir.to_str().unwrap(), "--name", "../x"]);
     assert!(!bad.status.success());
-    assert!(String::from_utf8_lossy(&bad.stdout).contains("machine name"));
+    assert!(String::from_utf8_lossy(&bad.stdout).contains("cannot be used"));
     let named = cli(&["clone", "--dir", dir.to_str().unwrap(), "--name", "lab"]);
     assert!(
         named.status.success(),
@@ -1605,6 +1607,24 @@ fn snapshot_waits_for_ssh_then_clones() {
     let installer = cli(&["clone", "--dir", dir.to_str().unwrap(), "--name", "debian"]);
     assert!(!installer.status.success());
     assert!(String::from_utf8_lossy(&installer.stdout).contains("snapshot name"));
+    let pretty = cli(&["clone", "--dir", dir.to_str().unwrap(), "--name", "My Debian"]);
+    assert!(
+        pretty.status.success(),
+        "{}",
+        String::from_utf8_lossy(&pretty.stdout)
+    );
+    assert_eq!(
+        one_event(&pretty.stdout)["disk"],
+        dir.join("machines/My Debian/disk.img").display().to_string()
+    );
+    let suggested = cli(&["name"]);
+    assert!(suggested.status.success(), "{}", String::from_utf8_lossy(&suggested.stdout));
+    let offered = one_event(&suggested.stdout)["detail"].as_str().unwrap().to_string();
+    assert!(offered.starts_with("My Debian "));
+    assert_eq!(offered.trim_start_matches("My Debian ").len(), 4);
+    let taken = cli(&["clone", "--dir", dir.to_str().unwrap(), "--name", "My Debian"]);
+    assert!(!taken.status.success());
+    assert!(String::from_utf8_lossy(&taken.stdout).contains("already exists"));
 
     let cloned = cli(&["clone", "--dir", dir.to_str().unwrap()]);
     assert!(
@@ -3664,6 +3684,8 @@ fn quick_start_swift_gates_the_bar_on_a_real_download() {
     );
     assert!(!include_str!("../Sources/Welcome.swift").contains("New Debian"));
     assert!(include_str!("../Sources/Welcome.swift").contains("Quick start"));
+    assert!(!include_str!("../Sources/Welcome.swift").contains("Button(\"Quick start\")"));
+    assert!(!include_str!("../Sources/Welcome.swift").contains("not usable"));
     assert!(include_str!("../Sources/Welcome.swift").contains("Text(\"Welcome\")"));
     assert!(include_str!("../Sources/Welcome.swift").contains("Download Debian 13 for this Mac."));
     assert!(include_str!("../Sources/Welcome.swift").contains("desktopcomputer"));
@@ -3677,7 +3699,19 @@ fn quick_start_swift_gates_the_bar_on_a_real_download() {
     assert!(!include_str!("../Sources/Welcome.swift").contains("Text(\"Paused\")"));
     assert!(include_str!("../Sources/Welcome.swift").contains("libraryDidChange"));
     assert!(!include_str!("../Sources/App.swift").contains("id: \"debian\""));
+    assert!(include_str!("../Sources/Welcome.swift").contains("func offerFirstName()"));
     assert!(include_str!("../Sources/Welcome.swift").contains("func cloneNew()"));
+    assert!(include_str!("../Sources/Welcome.swift").contains("askName()"));
+    assert!(!include_str!("../Sources/Welcome.swift").contains("create(name: nil)"));
+    assert!(include_str!("../Sources/Welcome.swift").contains("Name this virtual machine"));
+    assert!(include_str!("../Sources/Welcome.swift").contains("draftName = \"My Debian\""));
+    assert!(include_str!("../Sources/Welcome.swift").contains("Worker.suggestName()"));
+    assert!(include_str!("../Sources/QuickStart.swift").contains("[\"name\"]"));
+    assert!(include_str!("../Sources/Welcome.swift").contains("func createNamed()"));
+    assert!(!include_str!("../Sources/Welcome.swift").contains("func checkDraft()"));
+    assert!(!include_str!("../Sources/QuickStart.swift").contains("[\"name\", \"--dir\", dir.path, \"--name\", name]"));
+    assert!(include_str!("../Sources/Install.swift").contains("showLibrary(select: \"name\")"));
+    assert!(include_str!("../Sources/QuickStart.swift").contains("[\"--name\", name]"));
     assert!(include_str!("../Sources/Welcome.swift").contains("New virtual machine"));
     assert!(include_str!("../Sources/Welcome.swift").contains("func session(for"));
     assert!(include_str!("../Sources/Welcome.swift").contains("session: library.session(for: disk)"));

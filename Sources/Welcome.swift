@@ -16,33 +16,74 @@ final class LibraryModel: ObservableObject {
     @Published var selected: String?
     @Published var error: String?
     @Published var cloning = false
+    @Published var naming = false
+    @Published var draftName = "My Debian"
     @Published var snapshotReady = SupportDir.snapshotReady
     /// Running clones. The detail view is one machine; this keeps the others alive.
     private var sessions: [String: GuestSession] = [:]
 
     func appear() {
         refresh()
-        guard machines.isEmpty, !cloning, error == nil, snapshotReady else { return }
-        cloneNew()
     }
 
-    /// Copy the snapshot into machines/. The library is the machine window.
+    /// Opening the library with no machines asks for the first name. Becoming active does not ask again.
+    func offerFirstName() {
+        appear()
+        guard machines.isEmpty, !cloning, !naming, error == nil, snapshotReady else { return }
+        askName()
+    }
+
+    /// A machine is not created until the name is chosen. The + button uses this same popup.
+    func askName() {
+        guard !cloning, !naming, snapshotReady else { return }
+        naming = true
+        draftName = "My Debian"
+        error = nil
+        DispatchQueue.global(qos: .userInitiated).async {
+            let suggested = Worker.suggestName()
+            DispatchQueue.main.async {
+                guard self.naming, !self.cloning, self.draftName == "My Debian" else { return }
+                self.draftName = suggested
+            }
+        }
+    }
+
+    /// The + button asks for a name, the same popup as the first machine.
     func cloneNew() {
+        guard !cloning, snapshotReady else { return }
+        askName()
+    }
+
+    /// Rust trims the name, keeps spaces, and refuses a folder that is already there.
+    func createNamed() {
+        let typed = draftName.trimmingCharacters(in: .whitespacesAndNewlines)
+        if typed.isEmpty { return }
+        create(name: typed)
+    }
+
+    private func create(name: String?) {
+        if let name, name.isEmpty { return }
         guard !cloning, snapshotReady else { return }
         cloning = true
         error = nil
         let dir = SupportDir.url
         DispatchQueue.global(qos: .userInitiated).async {
-            let result = Worker.cloneMachine(dir: dir)
-            DispatchQueue.main.async {
-                self.cloning = false
-                switch result {
-                case .success(let disk):
-                    self.refresh()
-                    self.selected = disk
-                case .failure(let message):
-                    self.error = message
-                }
+            self.create(name: name, dir: dir)
+        }
+    }
+
+    private func create(name: String?, dir: URL) {
+        let result = Worker.cloneMachine(dir: dir, name: name)
+        DispatchQueue.main.async {
+            self.cloning = false
+            switch result {
+            case .success(let disk):
+                self.naming = false
+                self.refresh()
+                self.selected = disk
+            case .failure(let message):
+                self.naming = name != nil
+                self.error = message
             }
         }
     }
@@ -122,7 +163,7 @@ struct Welcome: View {
         }
         .background(MainWindowChrome(splash: !showsLibrary))
         .onAppear {
-            library.appear()
+            library.offerFirstName()
             AppWindow.closeQuickStart()
         }
         .onChange(of: showsLibrary) { _, shown in
@@ -134,8 +175,12 @@ struct Welcome: View {
         .onReceive(NotificationCenter.default.publisher(for: .libraryDidChange)) { note in
             // Pause, stop, and start post this with no disk. Do not rebuild the left list for those.
             guard let disk = note.object as? String else { return }
-            library.appear()
-            library.selected = disk
+            library.refresh()
+            if disk == "name" {
+                if library.machines.isEmpty { library.askName() }
+            } else {
+                library.selected = disk
+            }
             if library.snapshotReady || !library.machines.isEmpty {
                 AppWindow.closeQuickStart()
             }
@@ -191,7 +236,7 @@ struct Welcome: View {
                         Label("New virtual machine", systemImage: "plus")
                     }
                     .help("New virtual machine")
-                    .disabled(library.cloning || !library.snapshotReady)
+                    .disabled(library.cloning || library.naming || !library.snapshotReady)
                 }
             }
         } detail: {
@@ -199,21 +244,18 @@ struct Welcome: View {
                 if let disk = library.selected {
                     Install(iso: "", disk: disk, fromSnapshot: true, fill: true, session: library.session(for: disk))
                         .id(disk)
-                } else if library.cloning || (library.machines.isEmpty && library.error == nil && library.snapshotReady) {
+                } else if library.machines.isEmpty || library.cloning {
                     ProgressView()
                 } else {
-                    VStack(spacing: 12) {
-                        if let error = library.error {
-                            Text(error).font(.callout).foregroundStyle(.red)
-                        }
-                        Button("Quick start") { openWindow(id: "quick-start") }
-                            .buttonStyle(.borderedProminent)
-                    }
+                    Color.clear
                 }
             }
             .navigationTitle("Virtual Machine Manager")
         }
         .frame(minWidth: WindowMetrics.libraryMin.width, idealWidth: WindowMetrics.library.width, maxWidth: .infinity, minHeight: WindowMetrics.libraryMin.height, idealHeight: WindowMetrics.library.height, maxHeight: .infinity)
+        .sheet(isPresented: $library.naming) {
+            NameMachine(library: library)
+        }
     }
 
     private func openQuickStart() {
@@ -222,6 +264,37 @@ struct Welcome: View {
             dismissWindow(id: "main")
             AppWindow.closeMain()
         }
+    }
+}
+
+/// Create copies the snapshot under this name. The + button uses this same popup.
+private struct NameMachine: View {
+    @ObservedObject var library: LibraryModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Name this virtual machine")
+                .font(.headline)
+            TextField("Name", text: $library.draftName)
+                .textFieldStyle(.roundedBorder)
+                .onSubmit { library.createNamed() }
+            if let error = library.error {
+                Text(error).font(.callout).foregroundStyle(.red)
+            }
+            HStack {
+                Spacer()
+                Button("Cancel") {
+                    library.naming = false
+                    library.error = nil
+                }
+                Button("Create") { library.createNamed() }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(library.draftName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || library.cloning)
+                    .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(20)
+        .frame(width: 320)
     }
 }
 

@@ -60,10 +60,7 @@ pub fn clone_machine(support: &Path, name: Option<&str>) -> Result<Saved> {
     fs::create_dir_all(&machines)
         .map_err(|err| anyhow!("cannot create {}: {err}", machines.display()))?;
     let name = match name {
-        Some(name) => {
-            machine_name(name)?;
-            name.to_string()
-        }
+        Some(name) => folder_name(name)?,
         None => next_name(&machines)?,
     };
     let dest = machines.join(&name);
@@ -160,15 +157,56 @@ fn place(src: &Path, dest: &Path) -> Result<()> {
     })
 }
 
+const FIRST: &str = "My Debian";
+
+/// The popup's starting text. The typed name is still what Create uses.
+pub fn suggest_name() -> String {
+    format!("{FIRST} {}", random_code(4))
+}
+
+fn random_code(len: usize) -> String {
+    let mut bytes = vec![0u8; len];
+    let got = File::open("/dev/urandom")
+        .and_then(|mut file| file.read_exact(&mut bytes))
+        .is_ok();
+    if !got {
+        let tick = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        for (i, byte) in bytes.iter_mut().enumerate() {
+            *byte = (tick >> (i * 8)) as u8;
+        }
+    }
+    const ABC: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+    bytes
+        .into_iter()
+        .map(|byte| ABC[byte as usize % ABC.len()] as char)
+        .collect()
+}
+
+/// "My Debian" is the folder My Debian. The popup sends the typed text; it does not invent the folder.
+fn folder_name(name: &str) -> Result<String> {
+    let name = name.trim();
+    if name.is_empty() {
+        bail!("machine name is empty");
+    }
+    machine_name(name)?;
+    Ok(name.to_string())
+}
+
 fn machine_name(name: &str) -> Result<()> {
+    // The folder is the typed name. The only reserved folder is the snapshot name, debian.
     let ok = !name.is_empty()
+        && name != "."
+        && name != ".."
         && name.len() <= 64
-        && !name.starts_with('-')
-        && name
+        && !name.starts_with('.')
+        && !name
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+            .any(|c| c.is_control() || matches!(c, '/' | '\\' | ':'));
     if !ok {
-        bail!("machine name {name} is not usable");
+        bail!("that name cannot be used");
     }
     if name == MACHINE {
         bail!("{name} is the snapshot name, not a clone");
@@ -430,6 +468,14 @@ mod tests {
         assert!(clone_machine(&dir, Some("../x")).is_err());
         assert!(clone_machine(&dir, Some("")).is_err());
         assert!(clone_machine(&dir, Some("debian")).is_err());
+        let pretty = clone_machine(&dir, Some("My Debian")).unwrap();
+        assert_eq!(pretty.dir, dir.join("machines/My Debian"));
+        assert!(clone_machine(&dir, Some("My Debian"))
+            .unwrap_err()
+            .to_string()
+            .contains("already exists"));
+        assert!(clone_machine(&dir, Some("a/b")).is_err());
+        assert!(clone_machine(&dir, Some(".hidden")).is_err());
 
         // Deleting the snapshot removes the disk the installer wrote. There is no second copy to restore.
         fs::remove_dir_all(dir.join(SNAPSHOT)).unwrap();
@@ -438,6 +484,31 @@ mod tests {
             .to_string()
             .contains("guest disk is missing"));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_display_name_keeps_its_spaces() {
+        assert_eq!(folder_name("  Other   Debian ").unwrap(), "Other   Debian");
+        assert_eq!(folder_name("My-Debian").unwrap(), "My-Debian");
+        assert_eq!(folder_name("My Debian").unwrap(), "My Debian");
+        assert!(folder_name("debian")
+            .unwrap_err()
+            .to_string()
+            .contains("snapshot name"));
+        assert_eq!(folder_name("Debian").unwrap(), "Debian");
+        assert!(folder_name("a/b").is_err());
+        assert!(folder_name(" ")
+            .unwrap_err()
+            .to_string()
+            .contains("empty"));
+        assert!(folder_name(".hidden").is_err());
+        assert!(folder_name(&"n".repeat(65)).is_err());
+        assert_eq!(folder_name(&"n".repeat(64)).unwrap().len(), 64);
+        let suggested = suggest_name();
+        let code = suggested.strip_prefix("My Debian ").unwrap();
+        assert_eq!(code.len(), 4);
+        assert!(code.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()));
+        assert!(folder_name(&suggested).is_ok());
     }
 
     fn mark_installed(disk: &Path) {

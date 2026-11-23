@@ -525,10 +525,12 @@ enum Command {
         /// Support directory. Defaults to the app support directory.
         #[arg(long, value_name = "PATH")]
         dir: Option<PathBuf>,
-        /// Directory name under machines/. Defaults to the next debian-N.
+        /// Directory name under machines/. Spaces are kept. Defaults to the next debian-N.
         #[arg(long, value_name = "NAME")]
         name: Option<String>,
     },
+    /// A first-machine name: "My Debian" plus a short random code.
+    Name,
     /// One SSH attempt. A closed port is not a finished install.
     Ssh {
         /// Guest disk whose host key should log in.
@@ -567,6 +569,11 @@ fn main() {
         Command::Snapshot { dir } => finish("snapshot", snapshot::save(&dir.unwrap_or_else(support_dir))),
         Command::Clone { dir, name } => {
             finish("clone", snapshot::clone_machine(&dir.unwrap_or_else(support_dir), name.as_deref()))
+        }
+        Command::Name => {
+            let mut event = ev("name", None, Some("done"));
+            event.detail = Some(snapshot::suggest_name());
+            emit(event);
         }
         Command::Ssh { disk } => {
             ssh::own_group();
