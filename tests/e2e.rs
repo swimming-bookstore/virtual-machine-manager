@@ -3677,7 +3677,12 @@ fn quick_start_swift_gates_the_bar_on_a_real_download() {
     assert!(!include_str!("../Sources/Welcome.swift").contains("Text(\"Paused\")"));
     assert!(include_str!("../Sources/Welcome.swift").contains("libraryDidChange"));
     assert!(!include_str!("../Sources/App.swift").contains("id: \"debian\""));
+    assert!(include_str!("../Sources/Welcome.swift").contains("func offerFirstName()"));
     assert!(include_str!("../Sources/Welcome.swift").contains("func cloneNew()"));
+    assert!(include_str!("../Sources/Welcome.swift").contains("Name this virtual machine"));
+    assert!(include_str!("../Sources/Welcome.swift").contains("draftName = \"debian-2\""));
+    assert!(include_str!("../Sources/Install.swift").contains("showLibrary(select: \"name\")"));
+    assert!(include_str!("../Sources/QuickStart.swift").contains("[\"--name\", name]"));
     assert!(include_str!("../Sources/Welcome.swift").contains("New virtual machine"));
     assert!(include_str!("../Sources/Welcome.swift").contains("func session(for"));
     assert!(include_str!("../Sources/Welcome.swift").contains("session: library.session(for: disk)"));

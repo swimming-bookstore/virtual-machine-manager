@@ -389,8 +389,12 @@ enum Worker {
         return code == 0 ? nil : (message(text) ?? "Could not clear the pause.")
     }
 
-    static func cloneMachine(dir: URL) -> ClonedDisk {
-        let (code, text) = run(["clone", "--dir", dir.path])
+    static func cloneMachine(dir: URL, name: String? = nil) -> ClonedDisk {
+        var args = ["clone", "--dir", dir.path]
+        if let name, !name.isEmpty {
+            args.append(contentsOf: ["--name", name])
+        }
+        let (code, text) = run(args)
         if code != 0 {
             return .failure(message(text) ?? "Could not create a virtual machine.")
         }

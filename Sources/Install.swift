@@ -118,7 +118,7 @@ struct Install: View {
         }
         .onChange(of: guest.snapshotReady) { _, ready in
             // The library is the machine window. Do not open a second guest page.
-            if ready, !fromSnapshot { showLibrary() }
+            if ready, !fromSnapshot { showLibrary(select: "name") }
         }
     }
 
