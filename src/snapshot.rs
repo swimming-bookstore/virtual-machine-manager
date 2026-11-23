@@ -60,7 +60,7 @@ pub fn clone_machine(support: &Path, name: Option<&str>) -> Result<Saved> {
     fs::create_dir_all(&machines)
         .map_err(|err| anyhow!("cannot create {}: {err}", machines.display()))?;
     let name = match name {
-        Some(name) => machine_folder(support, name)?,
+        Some(name) => folder_name(name)?,
         None => next_name(&machines)?,
     };
     let dest = machines.join(&name);
@@ -157,16 +157,35 @@ fn place(src: &Path, dest: &Path) -> Result<()> {
     })
 }
 
-/// Folder under machines/. The typed name is kept, including spaces. Fails if that folder is already there.
-pub fn machine_folder(support: &Path, name: &str) -> Result<String> {
-    let name = folder_name(name)?;
-    if support.join("machines").join(&name).exists() {
-        bail!("{name} already exists");
-    }
-    Ok(name)
+const FIRST: &str = "My Debian";
+
+/// The popup's starting text. The typed name is still what Create uses.
+pub fn suggest_name() -> String {
+    format!("{FIRST} {}", random_code(4))
 }
 
-/// "My Debian" is the folder My Debian. The popup asks Rust; it does not invent the folder itself.
+fn random_code(len: usize) -> String {
+    let mut bytes = vec![0u8; len];
+    let got = File::open("/dev/urandom")
+        .and_then(|mut file| file.read_exact(&mut bytes))
+        .is_ok();
+    if !got {
+        let tick = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        for (i, byte) in bytes.iter_mut().enumerate() {
+            *byte = (tick >> (i * 8)) as u8;
+        }
+    }
+    const ABC: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+    bytes
+        .into_iter()
+        .map(|byte| ABC[byte as usize % ABC.len()] as char)
+        .collect()
+}
+
+/// "My Debian" is the folder My Debian. The popup sends the typed text; it does not invent the folder.
 fn folder_name(name: &str) -> Result<String> {
     let name = name.trim();
     if name.is_empty() {
@@ -469,39 +488,27 @@ mod tests {
 
     #[test]
     fn a_display_name_keeps_its_spaces() {
-        let dir = std::env::temp_dir().join(format!(
-            "vmm-name-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(dir.join("machines/My Debian")).unwrap();
-        assert_eq!(
-            machine_folder(&dir, "  Other   Debian ").unwrap(),
-            "Other   Debian"
-        );
-        assert_eq!(machine_folder(&dir, "My-Debian").unwrap(), "My-Debian");
-        assert!(machine_folder(&dir, "My Debian")
-            .unwrap_err()
-            .to_string()
-            .contains("already exists"));
-        assert!(machine_folder(&dir, "debian")
+        assert_eq!(folder_name("  Other   Debian ").unwrap(), "Other   Debian");
+        assert_eq!(folder_name("My-Debian").unwrap(), "My-Debian");
+        assert_eq!(folder_name("My Debian").unwrap(), "My Debian");
+        assert!(folder_name("debian")
             .unwrap_err()
             .to_string()
             .contains("snapshot name"));
-        assert_eq!(machine_folder(&dir, "Debian").unwrap(), "Debian");
-        assert!(machine_folder(&dir, "a/b").is_err());
-        assert!(machine_folder(&dir, " ")
+        assert_eq!(folder_name("Debian").unwrap(), "Debian");
+        assert!(folder_name("a/b").is_err());
+        assert!(folder_name(" ")
             .unwrap_err()
             .to_string()
             .contains("empty"));
-        assert!(machine_folder(&dir, ".hidden").is_err());
-        assert!(machine_folder(&dir, &"n".repeat(65)).is_err());
-        assert_eq!(machine_folder(&dir, &"n".repeat(64)).unwrap().len(), 64);
-        let _ = fs::remove_dir_all(&dir);
+        assert!(folder_name(".hidden").is_err());
+        assert!(folder_name(&"n".repeat(65)).is_err());
+        assert_eq!(folder_name(&"n".repeat(64)).unwrap().len(), 64);
+        let suggested = suggest_name();
+        let code = suggested.strip_prefix("My Debian ").unwrap();
+        assert_eq!(code.len(), 4);
+        assert!(code.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()));
+        assert!(folder_name(&suggested).is_ok());
     }
 
     fn mark_installed(disk: &Path) {

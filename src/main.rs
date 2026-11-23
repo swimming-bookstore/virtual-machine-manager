@@ -40,8 +40,6 @@ struct Event<'a> {
     disk: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     key: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    name: Option<String>,
 }
 
 fn emit(event: Event) {
@@ -63,7 +61,6 @@ fn ev<'a>(event: &'a str, step: Option<&'a str>, state: Option<&'a str>) -> Even
         path: None,
         disk: None,
         key: None,
-        name: None,
     }
 }
 
@@ -532,15 +529,8 @@ enum Command {
         #[arg(long, value_name = "NAME")]
         name: Option<String>,
     },
-    /// Check a machine name. Spaces are kept. Fails if that folder already exists.
-    Name {
-        /// Support directory. Defaults to the app support directory.
-        #[arg(long, value_name = "PATH")]
-        dir: Option<PathBuf>,
-        /// Name from the popup. Spaces are kept.
-        #[arg(long, value_name = "NAME")]
-        name: String,
-    },
+    /// A first-machine name: "My Debian" plus a short random code.
+    Name,
     /// One SSH attempt. A closed port is not a finished install.
     Ssh {
         /// Guest disk whose host key should log in.
@@ -580,16 +570,10 @@ fn main() {
         Command::Clone { dir, name } => {
             finish("clone", snapshot::clone_machine(&dir.unwrap_or_else(support_dir), name.as_deref()))
         }
-        Command::Name { dir, name } => {
-            let support = dir.unwrap_or_else(support_dir);
-            match snapshot::machine_folder(&support, &name) {
-                Ok(folder) => {
-                    let mut event = ev("name", None, Some("done"));
-                    event.name = Some(folder);
-                    emit(event);
-                }
-                Err(err) => die(err),
-            }
+        Command::Name => {
+            let mut event = ev("name", None, Some("done"));
+            event.detail = Some(snapshot::suggest_name());
+            emit(event);
         }
         Command::Ssh { disk } => {
             ssh::own_group();

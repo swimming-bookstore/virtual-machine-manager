@@ -375,12 +375,7 @@ fn clap_parses_download_and_rejects_unknown_args() {
     );
     assert!(String::from_utf8_lossy(&clone.stdout).contains("--name"));
     let name = cli(&["name", "--help"]);
-    assert!(
-        name.status.success(),
-        "{}",
-        String::from_utf8_lossy(&name.stderr)
-    );
-    assert!(String::from_utf8_lossy(&name.stdout).contains("--name"));
+    assert!(name.status.success(), "{}", String::from_utf8_lossy(&name.stderr));
     let pause = cli(&["pause", "--help"]);
     assert!(
         pause.status.success(),
@@ -1612,13 +1607,6 @@ fn snapshot_waits_for_ssh_then_clones() {
     let installer = cli(&["clone", "--dir", dir.to_str().unwrap(), "--name", "debian"]);
     assert!(!installer.status.success());
     assert!(String::from_utf8_lossy(&installer.stdout).contains("snapshot name"));
-    let checked = cli(&["name", "--dir", dir.to_str().unwrap(), "--name", "My Debian"]);
-    assert!(
-        checked.status.success(),
-        "{}",
-        String::from_utf8_lossy(&checked.stdout)
-    );
-    assert_eq!(one_event(&checked.stdout)["name"], "My Debian");
     let pretty = cli(&["clone", "--dir", dir.to_str().unwrap(), "--name", "My Debian"]);
     assert!(
         pretty.status.success(),
@@ -1629,7 +1617,12 @@ fn snapshot_waits_for_ssh_then_clones() {
         one_event(&pretty.stdout)["disk"],
         dir.join("machines/My Debian/disk.img").display().to_string()
     );
-    let taken = cli(&["name", "--dir", dir.to_str().unwrap(), "--name", "My Debian"]);
+    let suggested = cli(&["name"]);
+    assert!(suggested.status.success(), "{}", String::from_utf8_lossy(&suggested.stdout));
+    let offered = one_event(&suggested.stdout)["detail"].as_str().unwrap().to_string();
+    assert!(offered.starts_with("My Debian "));
+    assert_eq!(offered.trim_start_matches("My Debian ").len(), 4);
+    let taken = cli(&["clone", "--dir", dir.to_str().unwrap(), "--name", "My Debian"]);
     assert!(!taken.status.success());
     assert!(String::from_utf8_lossy(&taken.stdout).contains("already exists"));
 
@@ -3710,9 +3703,11 @@ fn quick_start_swift_gates_the_bar_on_a_real_download() {
     assert!(include_str!("../Sources/Welcome.swift").contains("func cloneNew()"));
     assert!(include_str!("../Sources/Welcome.swift").contains("Name this virtual machine"));
     assert!(include_str!("../Sources/Welcome.swift").contains("draftName = \"My Debian\""));
-    assert!(include_str!("../Sources/Welcome.swift").contains("Worker.machineName"));
-    assert!(include_str!("../Sources/Welcome.swift").contains("func checkDraft()"));
-    assert!(include_str!("../Sources/QuickStart.swift").contains("[\"name\", \"--dir\", dir.path, \"--name\", name]"));
+    assert!(include_str!("../Sources/Welcome.swift").contains("Worker.suggestName()"));
+    assert!(include_str!("../Sources/QuickStart.swift").contains("[\"name\"]"));
+    assert!(include_str!("../Sources/Welcome.swift").contains("func createNamed()"));
+    assert!(!include_str!("../Sources/Welcome.swift").contains("func checkDraft()"));
+    assert!(!include_str!("../Sources/QuickStart.swift").contains("[\"name\", \"--dir\", dir.path, \"--name\", name]"));
     assert!(include_str!("../Sources/Install.swift").contains("showLibrary(select: \"name\")"));
     assert!(include_str!("../Sources/QuickStart.swift").contains("[\"--name\", name]"));
     assert!(include_str!("../Sources/Welcome.swift").contains("New virtual machine"));
