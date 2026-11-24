@@ -98,6 +98,14 @@ pub fn rename_machine(support: &Path, disk: &Path, name: &str) -> Result<Saved> 
     Ok(saved(&dest))
 }
 
+/// Delete a clone. The folder under machines/ goes away. The snapshot is not a clone.
+pub fn delete_machine(support: &Path, disk: &Path) -> Result<Saved> {
+    let src = machine_dir(support, disk)?;
+    let saved = saved(&src);
+    fs::remove_dir_all(&src).map_err(|err| anyhow!("cannot delete {}: {err}", src.display()))?;
+    Ok(saved)
+}
+
 /// The clone directory that owns this disk. Only machines/<name>/disk.img can move.
 fn machine_dir(support: &Path, disk: &Path) -> Result<PathBuf> {
     let file = disk
@@ -537,6 +545,13 @@ mod tests {
         assert!(rename_machine(&dir, &renamed.disk, "debian").is_err());
         assert!(rename_machine(&dir, &renamed.disk, "../x").is_err());
         assert!(rename_machine(&dir, &dir.join("snapshots/debian").join(DISK), "nope").is_err());
+
+        let removed = delete_machine(&dir, &renamed.disk).unwrap();
+        assert_eq!(removed.dir, renamed.dir);
+        assert!(!renamed.dir.exists());
+        assert!(delete_machine(&dir, &renamed.disk).is_err());
+        assert!(delete_machine(&dir, &dir.join("snapshots/debian").join(DISK)).is_err());
+        assert!(dir.join("machines/lab").exists());
 
         // Deleting the snapshot removes the disk the installer wrote. There is no second copy to restore.
         fs::remove_dir_all(dir.join(SNAPSHOT)).unwrap();
