@@ -411,6 +411,18 @@ enum Worker {
         return .success(disk)
     }
 
+    /// The folder under machines/ is the name. Rename moves that folder.
+    static func renameMachine(dir: URL, disk: String, name: String) -> ClonedDisk {
+        let (code, text) = run(["rename", "--dir", dir.path, "--disk", disk, "--name", name])
+        if code != 0 {
+            return .failure(message(text) ?? "Could not rename the virtual machine.")
+        }
+        guard let disk = diskPath(text) else {
+            return .failure("The rename did not name a disk.")
+        }
+        return .success(disk)
+    }
+
     /// One SSH attempt in the worker. A closed port is not a finished install.
     /// `cancel` is set when the app closes so a scan cannot keep the next open on "Checking SSH".
     static func probe(disk: URL, cancel: @escaping () -> Bool) -> Bool {

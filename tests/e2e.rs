@@ -376,6 +376,11 @@ fn clap_parses_download_and_rejects_unknown_args() {
     assert!(String::from_utf8_lossy(&clone.stdout).contains("--name"));
     let name = cli(&["name", "--help"]);
     assert!(name.status.success(), "{}", String::from_utf8_lossy(&name.stderr));
+    let rename = cli(&["rename", "--help"]);
+    assert!(rename.status.success(), "{}", String::from_utf8_lossy(&rename.stderr));
+    let rename_help = String::from_utf8_lossy(&rename.stdout);
+    assert!(rename_help.contains("--disk"));
+    assert!(rename_help.contains("--name"));
     let pause = cli(&["pause", "--help"]);
     assert!(
         pause.status.success(),
@@ -1625,6 +1630,51 @@ fn snapshot_waits_for_ssh_then_clones() {
     let taken = cli(&["clone", "--dir", dir.to_str().unwrap(), "--name", "My Debian"]);
     assert!(!taken.status.success());
     assert!(String::from_utf8_lossy(&taken.stdout).contains("already exists"));
+    let renamed = cli(&[
+        "rename",
+        "--dir",
+        dir.to_str().unwrap(),
+        "--disk",
+        dir.join("machines/My Debian/disk.img").to_str().unwrap(),
+        "--name",
+        "Other Debian",
+    ]);
+    assert!(
+        renamed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&renamed.stdout)
+    );
+    assert_eq!(
+        one_event(&renamed.stdout)["disk"],
+        dir.join("machines/Other Debian/disk.img").display().to_string()
+    );
+    assert!(!dir.join("machines/My Debian").exists());
+    assert_eq!(
+        std::fs::read(dir.join("machines/Other Debian/nvram.bin")).unwrap(),
+        b"mutated"
+    );
+    let collision = cli(&[
+        "rename",
+        "--dir",
+        dir.to_str().unwrap(),
+        "--disk",
+        dir.join("machines/Other Debian/disk.img").to_str().unwrap(),
+        "--name",
+        "lab",
+    ]);
+    assert!(!collision.status.success());
+    assert!(String::from_utf8_lossy(&collision.stdout).contains("already exists"));
+    let snapshot = cli(&[
+        "rename",
+        "--dir",
+        dir.to_str().unwrap(),
+        "--disk",
+        dir.join("snapshots/debian/disk.img").to_str().unwrap(),
+        "--name",
+        "nope",
+    ]);
+    assert!(!snapshot.status.success());
+    assert!(String::from_utf8_lossy(&snapshot.stdout).contains("not a virtual machine"));
 
     let cloned = cli(&["clone", "--dir", dir.to_str().unwrap()]);
     assert!(
@@ -3708,6 +3758,11 @@ fn quick_start_swift_gates_the_bar_on_a_real_download() {
     assert!(include_str!("../Sources/Welcome.swift").contains("Worker.suggestName()"));
     assert!(include_str!("../Sources/QuickStart.swift").contains("[\"name\"]"));
     assert!(include_str!("../Sources/Welcome.swift").contains("func createNamed()"));
+    assert!(include_str!("../Sources/Welcome.swift").contains("func askRename"));
+    assert!(include_str!("../Sources/Welcome.swift").contains("Button(\"Rename\")"));
+    assert!(include_str!("../Sources/Welcome.swift").contains("Rename this virtual machine"));
+    assert!(include_str!("../Sources/QuickStart.swift").contains("[\"rename\", \"--dir\", dir.path, \"--disk\", disk, \"--name\", name]"));
+    assert!(include_str!("../Sources/Install.swift").contains("func retarget"));
     assert!(!include_str!("../Sources/Welcome.swift").contains("func checkDraft()"));
     assert!(!include_str!("../Sources/QuickStart.swift").contains("[\"name\", \"--dir\", dir.path, \"--name\", name]"));
     assert!(include_str!("../Sources/Install.swift").contains("showLibrary(select: \"name\")"));

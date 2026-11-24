@@ -531,6 +531,18 @@ enum Command {
     },
     /// A first-machine name: "My Debian" plus a short random code.
     Name,
+    /// Rename a clone. The folder under machines/ moves with the name.
+    Rename {
+        /// Support directory. Defaults to the app support directory.
+        #[arg(long, value_name = "PATH")]
+        dir: Option<PathBuf>,
+        /// Guest disk of the machine to rename.
+        #[arg(long, value_name = "PATH")]
+        disk: PathBuf,
+        /// New directory name under machines/. Spaces are kept.
+        #[arg(long, value_name = "NAME")]
+        name: String,
+    },
     /// One SSH attempt. A closed port is not a finished install.
     Ssh {
         /// Guest disk whose host key should log in.
@@ -574,6 +586,9 @@ fn main() {
             let mut event = ev("name", None, Some("done"));
             event.detail = Some(snapshot::suggest_name());
             emit(event);
+        }
+        Command::Rename { dir, disk, name } => {
+            finish("rename", snapshot::rename_machine(&dir.unwrap_or_else(support_dir), &disk, &name))
         }
         Command::Ssh { disk } => {
             ssh::own_group();
