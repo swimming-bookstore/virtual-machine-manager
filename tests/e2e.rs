@@ -3802,6 +3802,8 @@ fn quick_start_swift_gates_the_bar_on_a_real_download() {
     assert!(include_str!("../Sources/Welcome.swift").contains("Rename this virtual machine"));
     assert!(include_str!("../Sources/QuickStart.swift").contains("[\"rename\", \"--dir\", dir.path, \"--disk\", disk, \"--name\", name]"));
     assert!(include_str!("../Sources/Welcome.swift").contains("Button(\"Delete\")"));
+    assert!(include_str!("../Sources/Install.swift").contains("Text(\"Delete\").foregroundStyle(.red)"));
+    assert!(include_str!("../Sources/Install.swift").contains("placement: .confirmationAction"));
     assert!(include_str!("../Sources/Welcome.swift").contains("Delete this virtual machine?"));
     assert!(include_str!("../Sources/Welcome.swift").contains("func confirmDelete()"));
     assert!(include_str!("../Sources/QuickStart.swift").contains("[\"delete\", \"--dir\", dir.path, \"--disk\", disk]"));

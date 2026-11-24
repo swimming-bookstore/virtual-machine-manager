@@ -359,15 +359,16 @@ struct Welcome: View {
         } detail: {
             Group {
                 if let disk = library.selected {
-                    Install(iso: "", disk: disk, fromSnapshot: true, fill: true, session: library.session(for: disk))
+                    Install(
+                        iso: "",
+                        disk: disk,
+                        fromSnapshot: true,
+                        fill: true,
+                        session: library.session(for: disk),
+                        onDelete: { library.askDelete(disk) },
+                        deleteDisabled: library.cloning || library.naming || library.renaming || library.deleting
+                    )
                         .id(library.machines.first { $0.disk == disk }?.key ?? disk)
-                        .toolbar {
-                            ToolbarItem(placement: .primaryAction) {
-                                Button("Delete") { library.askDelete(disk) }
-                                    .disabled(library.cloning || library.naming || library.renaming || library.deleting)
-                                    .help("Delete this virtual machine")
-                            }
-                        }
                 } else if library.machines.isEmpty || library.cloning {
                     ProgressView()
                 } else {

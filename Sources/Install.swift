@@ -26,16 +26,21 @@ struct Install: View {
     var freshInstall = false
     /// The library window fills with the guest. A clone window keeps the fixed page.
     var fill = false
+    /// Library delete. Nil on the installer, so Quick start has no Delete button.
+    var onDelete: (() -> Void)? = nil
+    var deleteDisabled = false
     @StateObject private var guest: GuestSession
     @Environment(\.openWindow) private var openWindow
 
-    init(iso: String, disk: String, fromSnapshot: Bool = false, embedded: Bool = false, freshInstall: Bool = false, fill: Bool = false, session: GuestSession? = nil, steps: Binding<[WizardStep]>? = nil, slot: InstallSlotModel? = nil) {
+    init(iso: String, disk: String, fromSnapshot: Bool = false, embedded: Bool = false, freshInstall: Bool = false, fill: Bool = false, session: GuestSession? = nil, onDelete: (() -> Void)? = nil, deleteDisabled: Bool = false, steps: Binding<[WizardStep]>? = nil, slot: InstallSlotModel? = nil) {
         self.iso = iso
         self.disk = disk
         self.fromSnapshot = fromSnapshot
         self.embedded = embedded
         self.freshInstall = freshInstall
         self.fill = fill
+        self.onDelete = onDelete
+        self.deleteDisabled = deleteDisabled
         self.steps = steps
         self.slot = slot
         let loggedIn = fromSnapshot || GuestSSH.loggedIn(beside: URL(fileURLWithPath: disk))
@@ -132,16 +137,7 @@ struct Install: View {
                 Text(error).font(.callout).foregroundStyle(.red).padding()
             }
         }
-        .toolbar {
-            ToolbarItemGroup(placement: .primaryAction) {
-                Button("Start") { guest.bootDisk(disk, pointer: true) }
-                    .disabled(!guest.stopped)
-                Button("Pause") { guest.pauseGuest() }
-                    .disabled(guest.stopped)
-                Button("Stop") { guest.halt() }
-                    .disabled(guest.stopped && !guest.paused)
-            }
-        }
+        .toolbar { machineToolbar }
     }
 
     private var page: some View {
@@ -161,15 +157,30 @@ struct Install: View {
         .padding(WindowMetrics.pagePad)
         .frame(width: setup ? WindowMetrics.quickStartWidth : Guest.cloneGuest.width + WindowMetrics.pagePad * 2, alignment: .topLeading)
         .toolbar {
-            if fromSnapshot {
-                ToolbarItemGroup(placement: .primaryAction) {
-                    Button("Start") { guest.bootDisk(disk, pointer: true) }
-                        .disabled(!guest.stopped)
-                    Button("Pause") { guest.pauseGuest() }
-                        .disabled(guest.stopped)
-                    Button("Stop") { guest.halt() }
-                        .disabled(guest.stopped && !guest.paused)
+            if fromSnapshot { machineToolbar }
+        }
+    }
+
+    /// Start, Pause, and Stop, then Delete at the far right. Delete is red because it removes the machine.
+    /// primaryAction stops before the centered title. confirmationAction is the trailing edge.
+    @ToolbarContentBuilder
+    private var machineToolbar: some ToolbarContent {
+        ToolbarItemGroup(placement: .primaryAction) {
+            Button("Start") { guest.bootDisk(disk, pointer: true) }
+                .disabled(!guest.stopped)
+            Button("Pause") { guest.pauseGuest() }
+                .disabled(guest.stopped)
+            Button("Stop") { guest.halt() }
+                .disabled(guest.stopped && !guest.paused)
+        }
+        if let onDelete {
+            ToolbarItem(placement: .confirmationAction) {
+                Button(action: onDelete) {
+                    Text("Delete").foregroundStyle(.red)
                 }
+                .tint(.red)
+                .disabled(deleteDisabled)
+                .help("Delete this virtual machine")
             }
         }
     }
