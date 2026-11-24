@@ -20,6 +20,7 @@ final class LibraryModel: ObservableObject {
     @Published var cloning = false
     @Published var naming = false
     @Published var renaming = false
+    @Published var deleting = false
     @Published var draftName = "My Debian"
     /// Disk being renamed. The folder under machines/ moves with the name.
     private var renamingDisk: String?
@@ -36,13 +37,13 @@ final class LibraryModel: ObservableObject {
     /// Opening the library with no machines asks for the first name. Becoming active does not ask again.
     func offerFirstName() {
         appear()
-        guard machines.isEmpty, !cloning, !naming, !renaming, error == nil, snapshotReady else { return }
+        guard machines.isEmpty, !cloning, !naming, !renaming, !deleting, error == nil, snapshotReady else { return }
         askName()
     }
 
     /// A machine is not created until the name is chosen. The + button uses this same popup.
     func askName() {
-        guard !cloning, !naming, !renaming, snapshotReady else { return }
+        guard !cloning, !naming, !renaming, !deleting, snapshotReady else { return }
         naming = true
         draftName = "My Debian"
         error = nil
@@ -57,7 +58,7 @@ final class LibraryModel: ObservableObject {
 
     /// The + button asks for a name, the same popup as the first machine.
     func cloneNew() {
-        guard !cloning, !renaming, snapshotReady else { return }
+        guard !cloning, !renaming, !deleting, snapshotReady else { return }
         askName()
     }
 
@@ -68,9 +69,22 @@ final class LibraryModel: ObservableObject {
         error = nil
     }
 
+    func cancelDelete() {
+        deleting = false
+        error = nil
+    }
+
+    /// Delete uses a confirm popup. The guest is stopped, then the folder under machines/ is removed.
+    func askDelete(_ disk: String) {
+        guard !cloning, !naming, !renaming, !deleting else { return }
+        guard machines.contains(where: { $0.disk == disk }) else { return }
+        deleting = true
+        error = nil
+    }
+
     /// Rename uses the create popup. The typed name becomes the folder.
     func askRename(_ disk: String) {
-        guard !cloning, !naming, !renaming else { return }
+        guard !cloning, !naming, !renaming, !deleting else { return }
         guard let machine = machines.first(where: { $0.disk == disk }) else { return }
         renamingDisk = disk
         renaming = true
@@ -111,6 +125,39 @@ final class LibraryModel: ObservableObject {
                 }
             }
         }
+    }
+
+    /// Stop the guest first. A running disk cannot be removed out from under Virtualization.
+    func confirmDelete() {
+        guard let disk = selected, !cloning, deleting else { return }
+        guard machines.contains(where: { $0.disk == disk }) else {
+            deleting = false
+            return
+        }
+        cloning = true
+        error = nil
+        release(disk)
+        let dir = SupportDir.url
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result = Worker.deleteMachine(dir: dir, disk: disk)
+            DispatchQueue.main.async {
+                self.cloning = false
+                switch result {
+                case .success:
+                    self.deleting = false
+                    self.refresh()
+                case .failure(let message):
+                    self.error = message
+                }
+            }
+        }
+    }
+
+    /// Drop the session before the folder goes. refresh also stops a guest whose disk is already gone.
+    private func release(_ disk: String) {
+        keys.removeValue(forKey: disk)
+        guard let session = sessions.removeValue(forKey: disk) else { return }
+        session.stop()
     }
 
     private func create(name: String?) {
@@ -306,7 +353,7 @@ struct Welcome: View {
                         Label("New virtual machine", systemImage: "plus")
                     }
                     .help("New virtual machine")
-                    .disabled(library.cloning || library.naming || library.renaming || !library.snapshotReady)
+                    .disabled(library.cloning || library.naming || library.renaming || library.deleting || !library.snapshotReady)
                 }
             }
         } detail: {
@@ -314,6 +361,13 @@ struct Welcome: View {
                 if let disk = library.selected {
                     Install(iso: "", disk: disk, fromSnapshot: true, fill: true, session: library.session(for: disk))
                         .id(library.machines.first { $0.disk == disk }?.key ?? disk)
+                        .toolbar {
+                            ToolbarItem(placement: .primaryAction) {
+                                Button("Delete") { library.askDelete(disk) }
+                                    .disabled(library.cloning || library.naming || library.renaming || library.deleting)
+                                    .help("Delete this virtual machine")
+                            }
+                        }
                 } else if library.machines.isEmpty || library.cloning {
                     ProgressView()
                 } else {
@@ -327,6 +381,11 @@ struct Welcome: View {
             if !shown { library.cancelName() }
         })) {
             NameMachine(library: library)
+        }
+        .sheet(isPresented: Binding(get: { library.deleting }, set: { shown in
+            if !shown { library.cancelDelete() }
+        })) {
+            DeleteMachine(library: library)
         }
     }
 
@@ -362,6 +421,42 @@ private struct NameMachine: View {
                     .buttonStyle(.borderedProminent)
                     .disabled(library.draftName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || library.cloning)
                     .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(20)
+        .frame(width: 320)
+    }
+}
+
+/// Delete removes the machine folder. The confirm is required; Cancel leaves the guest running.
+private struct DeleteMachine: View {
+    @ObservedObject var library: LibraryModel
+
+    private var name: String {
+        library.machines.first { $0.disk == library.selected }?.name ?? "this virtual machine"
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Delete this virtual machine?")
+                .font(.headline)
+            Text("\(name) will be removed. This cannot be undone.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            if let error = library.error {
+                Text(error).font(.callout).foregroundStyle(.red)
+            }
+            HStack {
+                Spacer()
+                Button("Cancel") {
+                    library.cancelDelete()
+                }
+                .keyboardShortcut(.cancelAction)
+                Button("Delete") { library.confirmDelete() }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.red)
+                    .disabled(library.cloning)
             }
         }
         .padding(20)

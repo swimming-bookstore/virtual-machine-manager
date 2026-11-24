@@ -543,6 +543,15 @@ enum Command {
         #[arg(long, value_name = "NAME")]
         name: String,
     },
+    /// Delete a clone. The folder under machines/ is removed. The snapshot is not a clone.
+    Delete {
+        /// Support directory. Defaults to the app support directory.
+        #[arg(long, value_name = "PATH")]
+        dir: Option<PathBuf>,
+        /// Guest disk of the machine to delete.
+        #[arg(long, value_name = "PATH")]
+        disk: PathBuf,
+    },
     /// One SSH attempt. A closed port is not a finished install.
     Ssh {
         /// Guest disk whose host key should log in.
@@ -589,6 +598,9 @@ fn main() {
         }
         Command::Rename { dir, disk, name } => {
             finish("rename", snapshot::rename_machine(&dir.unwrap_or_else(support_dir), &disk, &name))
+        }
+        Command::Delete { dir, disk } => {
+            finish("delete", snapshot::delete_machine(&dir.unwrap_or_else(support_dir), &disk))
         }
         Command::Ssh { disk } => {
             ssh::own_group();

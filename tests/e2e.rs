@@ -381,6 +381,9 @@ fn clap_parses_download_and_rejects_unknown_args() {
     let rename_help = String::from_utf8_lossy(&rename.stdout);
     assert!(rename_help.contains("--disk"));
     assert!(rename_help.contains("--name"));
+    let delete = cli(&["delete", "--help"]);
+    assert!(delete.status.success(), "{}", String::from_utf8_lossy(&delete.stderr));
+    assert!(String::from_utf8_lossy(&delete.stdout).contains("--disk"));
     let pause = cli(&["pause", "--help"]);
     assert!(
         pause.status.success(),
@@ -1675,6 +1678,42 @@ fn snapshot_waits_for_ssh_then_clones() {
     ]);
     assert!(!snapshot.status.success());
     assert!(String::from_utf8_lossy(&snapshot.stdout).contains("not a virtual machine"));
+    let deleted = cli(&[
+        "delete",
+        "--dir",
+        dir.to_str().unwrap(),
+        "--disk",
+        dir.join("machines/Other Debian/disk.img").to_str().unwrap(),
+    ]);
+    assert!(
+        deleted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&deleted.stdout)
+    );
+    assert_eq!(
+        one_event(&deleted.stdout)["disk"],
+        dir.join("machines/Other Debian/disk.img").display().to_string()
+    );
+    assert!(!dir.join("machines/Other Debian").exists());
+    let gone = cli(&[
+        "delete",
+        "--dir",
+        dir.to_str().unwrap(),
+        "--disk",
+        dir.join("machines/Other Debian/disk.img").to_str().unwrap(),
+    ]);
+    assert!(!gone.status.success());
+    assert!(String::from_utf8_lossy(&gone.stdout).contains("missing"));
+    let snap_delete = cli(&[
+        "delete",
+        "--dir",
+        dir.to_str().unwrap(),
+        "--disk",
+        dir.join("snapshots/debian/disk.img").to_str().unwrap(),
+    ]);
+    assert!(!snap_delete.status.success());
+    assert!(String::from_utf8_lossy(&snap_delete.stdout).contains("not a virtual machine"));
+    assert!(dir.join("machines/lab").exists());
 
     let cloned = cli(&["clone", "--dir", dir.to_str().unwrap()]);
     assert!(
@@ -3762,6 +3801,10 @@ fn quick_start_swift_gates_the_bar_on_a_real_download() {
     assert!(include_str!("../Sources/Welcome.swift").contains("Button(\"Rename\")"));
     assert!(include_str!("../Sources/Welcome.swift").contains("Rename this virtual machine"));
     assert!(include_str!("../Sources/QuickStart.swift").contains("[\"rename\", \"--dir\", dir.path, \"--disk\", disk, \"--name\", name]"));
+    assert!(include_str!("../Sources/Welcome.swift").contains("Button(\"Delete\")"));
+    assert!(include_str!("../Sources/Welcome.swift").contains("Delete this virtual machine?"));
+    assert!(include_str!("../Sources/Welcome.swift").contains("func confirmDelete()"));
+    assert!(include_str!("../Sources/QuickStart.swift").contains("[\"delete\", \"--dir\", dir.path, \"--disk\", disk]"));
     assert!(include_str!("../Sources/Install.swift").contains("func retarget"));
     assert!(!include_str!("../Sources/Welcome.swift").contains("func checkDraft()"));
     assert!(!include_str!("../Sources/QuickStart.swift").contains("[\"name\", \"--dir\", dir.path, \"--name\", name]"));

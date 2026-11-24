@@ -423,6 +423,18 @@ enum Worker {
         return .success(disk)
     }
 
+    /// The folder under machines/ is the machine. Delete removes that folder, not the snapshot.
+    static func deleteMachine(dir: URL, disk: String) -> ClonedDisk {
+        let (code, text) = run(["delete", "--dir", dir.path, "--disk", disk])
+        if code != 0 {
+            return .failure(message(text) ?? "Could not delete the virtual machine.")
+        }
+        guard let disk = diskPath(text) else {
+            return .failure("The delete did not name a disk.")
+        }
+        return .success(disk)
+    }
+
     /// One SSH attempt in the worker. A closed port is not a finished install.
     /// `cancel` is set when the app closes so a scan cannot keep the next open on "Checking SSH".
     static func probe(disk: URL, cancel: @escaping () -> Bool) -> Bool {
