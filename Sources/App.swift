@@ -34,9 +34,11 @@ enum WindowMetrics {
 @main
 struct VirtualMachinesApp: App {
     @StateObject private var quickStart = QuickStartModel()
+    /// The library and a machine window share one session. A session owned by the library view would die when that window closes.
+    @StateObject private var library = LibraryModel()
 
     var body: some Scene {
-        WindowGroup("Virtual Machine Manager", id: "main") { Welcome() }
+        WindowGroup("Virtual Machine Manager", id: "main") { Welcome(library: library) }
             .windowResizability(.automatic)
             .defaultSize(width: WindowMetrics.library.width, height: WindowMetrics.library.height)
         Window("Quick start", id: "quick-start") {
@@ -45,5 +47,13 @@ struct VirtualMachinesApp: App {
             // The list scrolls inside the window. Do not size the window to the full list.
             .windowResizability(.automatic)
             .defaultSize(width: WindowMetrics.quickStart.width, height: WindowMetrics.quickStart.height)
+        // One window per machine. The library stays the list. This window is the guest, at the scanout size.
+        WindowGroup(id: "machine", for: String.self) { key in
+            if let key = key.wrappedValue, !key.isEmpty {
+                MachineWindow(library: library, machineKey: key)
+            }
+        }
+            .windowResizability(.automatic)
+            .defaultSize(width: Guest.scanoutSize.width, height: Guest.scanoutSize.height)
     }
 }
