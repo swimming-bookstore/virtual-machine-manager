@@ -27,6 +27,8 @@ final class LibraryModel: ObservableObject {
     /// Row identity for each disk. Rename moves the entry so the open guest stays mounted.
     private var keys: [String: String] = [:]
     @Published var snapshotReady = SupportDir.snapshotReady
+    /// The wizard asked to open the main window. That window may not exist yet, so the notification can be missed.
+    private static var pendingFirstName = false
     /// Running clones. The detail view is one machine; this keeps the others alive.
     private var sessions: [String: GuestSession] = [:]
 
@@ -34,11 +36,27 @@ final class LibraryModel: ObservableObject {
         refresh()
     }
 
-    /// Opening the library with no machines asks for the first name. Becoming active does not ask again.
+    /// The main window does not force a virtual machine. Opening an empty machine window is not that, and becoming active does not ask again.
+    /// The wizard can ask before this window exists. That ask is shown here, once.
     func offerFirstName() {
         appear()
-        guard machines.isEmpty, !cloning, !naming, !renaming, !deleting, error == nil, snapshotReady else { return }
+        guard Self.pendingFirstName else { return }
+        askFromWizard()
+    }
+
+    /// A machine window with no guest. Opening it is not a request to create a virtual machine.
+    func noteBlankMachine(_: Bool) {}
+
+    /// The wizard opened the main window. That is the prompt for the first machine. An empty library on its own is not.
+    func askFromWizard() {
+        Self.pendingFirstName = false
+        guard machines.isEmpty else { return }
         askName()
+    }
+
+    /// showLibrary posts before the main window exists. Remember the ask until this window opens.
+    static func noteWizardAsk() {
+        pendingFirstName = true
     }
 
     /// A machine is not created until the name is chosen. The + button uses this same popup.
@@ -224,6 +242,10 @@ final class LibraryModel: ObservableObject {
         if selected == nil || !next.contains(where: { $0.disk == selected }) {
             selected = next.first?.disk
         }
+        // The sidebar binding can keep the deleted path after the last row is gone. That path is not a machine.
+        if let selected, !next.contains(where: { $0.disk == selected }) {
+            self.selected = nil
+        }
     }
 
     /// Point the running guest at the new disk before refresh drops the old path.
@@ -281,6 +303,16 @@ struct Welcome: View {
             }
         }
         .background(MainWindowChrome(splash: !showsLibrary))
+        .sheet(isPresented: Binding(get: { library.naming || library.renaming }, set: { shown in
+            if !shown { library.cancelName() }
+        })) {
+            NameMachine(library: library)
+        }
+        .sheet(isPresented: Binding(get: { library.deleting }, set: { shown in
+            if !shown { library.cancelDelete() }
+        })) {
+            DeleteMachine(library: library)
+        }
         .onAppear {
             library.offerFirstName()
             AppWindow.closeQuickStart()
@@ -295,8 +327,9 @@ struct Welcome: View {
             // Pause, stop, and start post this with no disk. Do not rebuild the left list for those.
             guard let disk = note.object as? String else { return }
             library.refresh()
+            // "name" is the wizard finishing. Opening the main window from there prompts for the first machine.
             if disk == "name" {
-                if library.machines.isEmpty { library.askName() }
+                library.askFromWizard()
             } else {
                 library.selected = disk
             }
@@ -381,7 +414,8 @@ struct Welcome: View {
                         }
                     )
                         .id(library.machines.first { $0.disk == disk }?.key ?? disk)
-                } else if library.machines.isEmpty || library.cloning {
+                } else if library.cloning {
+                    // Creating the next machine. An empty library is not this; the last delete already finished.
                     ProgressView()
                 } else {
                     Color.clear
@@ -390,16 +424,6 @@ struct Welcome: View {
             .navigationTitle("Virtual Machine Manager")
         }
         .frame(minWidth: WindowMetrics.libraryMin.width, idealWidth: WindowMetrics.library.width, maxWidth: .infinity, minHeight: WindowMetrics.libraryMin.height, idealHeight: WindowMetrics.library.height, maxHeight: .infinity)
-        .sheet(isPresented: Binding(get: { library.naming || library.renaming }, set: { shown in
-            if !shown { library.cancelName() }
-        })) {
-            NameMachine(library: library)
-        }
-        .sheet(isPresented: Binding(get: { library.deleting }, set: { shown in
-            if !shown { library.cancelDelete() }
-        })) {
-            DeleteMachine(library: library)
-        }
     }
 
     /// The guest window is keyed by the stable machine id, not the folder. Rename moves the folder and must not open a second window.
@@ -482,6 +506,18 @@ private struct DeleteMachine: View {
         }
         .padding(20)
         .frame(width: 320)
+    }
+}
+
+/// A machine window with no guest. Opening it is not the wizard, so it does not ask to create a virtual machine.
+struct EmptyMachineWindow: View {
+    @ObservedObject var library: LibraryModel
+
+    var body: some View {
+        Color.black
+            .frame(minWidth: Guest.installerMin.width, minHeight: Guest.installerMin.height)
+            .onAppear { library.noteBlankMachine(true) }
+            .onDisappear { library.noteBlankMachine(false) }
     }
 }
 

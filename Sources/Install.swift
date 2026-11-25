@@ -350,6 +350,10 @@ struct Install: View {
     }
 
     private func showLibrary(select disk: String? = nil) {
+        // "name" is the wizard finishing. The main window may not exist yet, so remember the ask.
+        if disk == "name" {
+            LibraryModel.noteWizardAsk()
+        }
         NotificationCenter.default.post(name: .libraryDidChange, object: disk)
         if let window = NSApp.windows.first(where: { AppWindow.isMain($0) }) {
             window.makeKeyAndOrderFront(nil)
