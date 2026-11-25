@@ -160,6 +160,11 @@ final class LibraryModel: ObservableObject {
         session.stop()
     }
 
+    /// The dedicated window sets this. Closing that window clears it. Do not create a session just to clear the flag.
+    func setDedicatedWindow(_ disk: String, open: Bool) {
+        sessions[disk]?.inDedicatedWindow = open
+    }
+
     private func create(name: String?) {
         if let name, name.isEmpty { return }
         guard !cloning, snapshotReady else { return }
@@ -263,7 +268,7 @@ enum AppWindow {
 struct Welcome: View {
     @Environment(\.openWindow) private var openWindow
     @Environment(\.dismissWindow) private var dismissWindow
-    @StateObject private var library = LibraryModel()
+    @ObservedObject var library: LibraryModel
 
     private var showsLibrary: Bool { library.snapshotReady || !library.machines.isEmpty }
 
@@ -338,8 +343,10 @@ struct Welcome: View {
                 Text(machine.name)
                     .lineLimit(1)
                     .contextMenu {
+                        Button("Open") { openMachine(machine.key) }
                         Button("Rename") { library.askRename(machine.disk) }
                     }
+                    .simultaneousGesture(TapGesture(count: 2).onEnded { openMachine(machine.key) })
             }
             .listStyle(.sidebar)
             .navigationSplitViewColumnWidth(min: 200, ideal: 240, max: 300)
@@ -366,7 +373,12 @@ struct Welcome: View {
                         fill: true,
                         session: library.session(for: disk),
                         onDelete: { library.askDelete(disk) },
-                        deleteDisabled: library.cloning || library.naming || library.renaming || library.deleting
+                        deleteDisabled: library.cloning || library.naming || library.renaming || library.deleting,
+                        onOpen: {
+                            if let key = library.machines.first(where: { $0.disk == disk })?.key {
+                                openMachine(key)
+                            }
+                        }
                     )
                         .id(library.machines.first { $0.disk == disk }?.key ?? disk)
                 } else if library.machines.isEmpty || library.cloning {
@@ -388,6 +400,14 @@ struct Welcome: View {
         })) {
             DeleteMachine(library: library)
         }
+    }
+
+    /// The guest window is keyed by the stable machine id, not the folder. Rename moves the folder and must not open a second window.
+    private func openMachine(_ key: String) {
+        guard let machine = library.machines.first(where: { $0.key == key }) else { return }
+        // Let go of the guest view before the other window embeds it. Two panes cannot share that view.
+        library.session(for: machine.disk).inDedicatedWindow = true
+        openWindow(id: "machine", value: key)
     }
 
     private func openQuickStart() {
@@ -465,6 +485,68 @@ private struct DeleteMachine: View {
     }
 }
 
+/// The machine, outside the sidebar. Closing it does not stop the guest. The library still owns the session.
+struct MachineWindow: View {
+    @ObservedObject var library: LibraryModel
+    let machineKey: String
+    @Environment(\.dismiss) private var dismiss
+    @State private var looked = false
+
+    private var machine: Machine? {
+        library.machines.first { $0.key == machineKey }
+    }
+
+    var body: some View {
+        Group {
+            if let machine {
+                Install(
+                    iso: "",
+                    disk: machine.disk,
+                    fromSnapshot: true,
+                    fill: true,
+                    windowed: true,
+                    session: library.session(for: machine.disk)
+                )
+                .id(machine.key)
+                .navigationTitle(machine.name)
+            } else if looked {
+                Color.black.onAppear { dismiss() }
+            } else {
+                Color.black
+            }
+        }
+        .frame(minWidth: Guest.installerMin.width, minHeight: Guest.installerMin.height)
+        .background(GuestWindowChrome(title: machine?.name ?? "Debian", onShow: restoreScreen))
+        .onAppear {
+            library.appear()
+            looked = true
+            if let disk = machine?.disk {
+                library.session(for: disk).claimScreen()
+                library.setDedicatedWindow(disk, open: true)
+            }
+        }
+        .onDisappear {
+            // Closing the window gives the guest view back to the library. Do not clear this later, or a new open loses the flag.
+            // Take the guest view out before the window is destroyed. A view left there draws blank the next time it is shown.
+            if let disk = library.machines.first(where: { $0.key == machineKey })?.disk {
+                library.session(for: disk).releaseScreen()
+                library.setDedicatedWindow(disk, open: false)
+            }
+        }
+        .onChange(of: library.machines.map(\.key)) { _, keys in
+            if looked, !keys.contains(machineKey) { dismiss() }
+        }
+    }
+
+    /// The window came back without a new Open. The guest view from the closed window is blank, so mount another.
+    private func restoreScreen() {
+        guard let disk = machine?.disk else { return }
+        let session = library.session(for: disk)
+        session.claimScreen()
+        library.setDedicatedWindow(disk, open: true)
+    }
+}
+
 /// Splash stays the compact card. The library is a normal resizable window.
 /// The title is applied before the window is shown, so it does not pop in after the first frame.
 private struct MainWindowChrome: NSViewRepresentable {
@@ -523,6 +605,125 @@ private final class ChromeView: NSView {
             if frame != window.frame {
                 window.setFrame(frame, display: true)
             }
+        }
+    }
+}
+
+/// Title is the machine name. The size stays whatever the user made it. A forced frame would fight the resize.
+/// A restored window may not run onAppear. This view moves into that window, so it can mount the guest again.
+private struct GuestWindowChrome: NSViewRepresentable {
+    var title: String
+    var onShow: () -> Void
+
+    func makeNSView(context: Context) -> GuestChromeView {
+        let view = GuestChromeView()
+        view.title = title
+        view.onShow = onShow
+        return view
+    }
+
+    func updateNSView(_ view: GuestChromeView, context: Context) {
+        view.title = title
+        view.onShow = onShow
+        view.apply()
+    }
+}
+
+private final class GuestChromeView: NSView {
+    var title = "Debian"
+    var onShow: () -> Void = {}
+    private var keyObserver: NSObjectProtocol?
+    private var closeObserver: NSObjectProtocol?
+    private var fullObserver: NSObjectProtocol?
+    private var leaveObserver: NSObjectProtocol?
+    private var closed = false
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        apply()
+        if let keyObserver { NotificationCenter.default.removeObserver(keyObserver) }
+        if let closeObserver { NotificationCenter.default.removeObserver(closeObserver) }
+        if let fullObserver { NotificationCenter.default.removeObserver(fullObserver) }
+        if let leaveObserver { NotificationCenter.default.removeObserver(leaveObserver) }
+        keyObserver = nil
+        closeObserver = nil
+        fullObserver = nil
+        leaveObserver = nil
+        guard let window else { return }
+        closeObserver = NotificationCenter.default.addObserver(
+            forName: NSWindow.willCloseNotification,
+            object: window,
+            queue: .main
+        ) { [weak self] _ in
+            self?.closed = true
+        }
+        keyObserver = NotificationCenter.default.addObserver(
+            forName: NSWindow.didBecomeKeyNotification,
+            object: window,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self, self.closed else { return }
+            self.closed = false
+            self.onShow()
+        }
+        // Full screen keeps the toolbar unless the window itself hides it.
+        fullObserver = NotificationCenter.default.addObserver(
+            forName: NSWindow.willEnterFullScreenNotification,
+            object: window,
+            queue: .main
+        ) { [weak self] note in
+            guard let window = note.object as? NSWindow else { return }
+            self?.hideBar(window)
+        }
+        leaveObserver = NotificationCenter.default.addObserver(
+            forName: NSWindow.didExitFullScreenNotification,
+            object: window,
+            queue: .main
+        ) { [weak self] note in
+            guard let window = note.object as? NSWindow else { return }
+            self?.showBar(window)
+        }
+        window.makeKeyAndOrderFront(nil)
+    }
+
+    deinit {
+        if let keyObserver { NotificationCenter.default.removeObserver(keyObserver) }
+        if let closeObserver { NotificationCenter.default.removeObserver(closeObserver) }
+        if let fullObserver { NotificationCenter.default.removeObserver(fullObserver) }
+        if let leaveObserver { NotificationCenter.default.removeObserver(leaveObserver) }
+    }
+
+    func apply() {
+        guard let window else { return }
+        window.title = title
+        window.styleMask.insert(.resizable)
+        window.styleMask.insert(.fullSizeContentView)
+        let min = NSSize(width: Guest.installerMin.width, height: Guest.installerMin.height)
+        if window.contentMinSize != min {
+            window.contentMinSize = min
+        }
+        if window.styleMask.contains(.fullScreen) {
+            hideBar(window)
+        } else {
+            showBar(window)
+        }
+    }
+
+    /// The guest fills the screen. The title bar and the Open / Start / Pause / Stop / Delete bar go with it.
+    private func hideBar(_ window: NSWindow) {
+        window.titleVisibility = .hidden
+        window.titlebarAppearsTransparent = true
+        window.toolbar?.isVisible = false
+        window.styleMask.insert(.fullSizeContentView)
+    }
+
+    /// Back to the windowed bar. The title stays the machine name.
+    private func showBar(_ window: NSWindow) {
+        window.toolbar?.isVisible = true
+        window.titleVisibility = .visible
+        window.titlebarAppearsTransparent = false
+        if window.toolbarStyle != .unified {
+            window.toolbarStyle = .unified
         }
     }
 }

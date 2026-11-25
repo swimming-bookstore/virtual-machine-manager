@@ -3815,6 +3815,9 @@ fn quick_start_swift_gates_the_bar_on_a_real_download() {
     assert!(include_str!("../Sources/Welcome.swift").contains("New virtual machine"));
     assert!(include_str!("../Sources/Welcome.swift").contains("func session(for"));
     assert!(include_str!("../Sources/Welcome.swift").contains("session: library.session(for: disk)"));
+    assert!(include_str!("../Sources/Welcome.swift").contains("willEnterFullScreenNotification"));
+    assert!(include_str!("../Sources/Welcome.swift").contains("window.toolbar?.isVisible = false"));
+    assert!(include_str!("../Sources/Welcome.swift").contains("didExitFullScreenNotification"));
     assert!(include_str!("../Sources/Install.swift").contains("if fromSnapshot { return }"));
     assert!(!include_str!("../Sources/Install.swift").contains("keepRunning"));
     assert!(include_str!("../Sources/Install.swift").contains("openWindow(id: \"main\")"));

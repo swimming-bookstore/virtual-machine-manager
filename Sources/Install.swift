@@ -26,21 +26,27 @@ struct Install: View {
     var freshInstall = false
     /// The library window fills with the guest. A clone window keeps the fixed page.
     var fill = false
+    /// This copy is the dedicated window. The library copy must not embed the same guest view.
+    var windowed = false
     /// Library delete. Nil on the installer, so Quick start has no Delete button.
     var onDelete: (() -> Void)? = nil
     var deleteDisabled = false
+    /// Opens the dedicated window. Nil on the installer and on that window.
+    var onOpen: (() -> Void)? = nil
     @StateObject private var guest: GuestSession
     @Environment(\.openWindow) private var openWindow
 
-    init(iso: String, disk: String, fromSnapshot: Bool = false, embedded: Bool = false, freshInstall: Bool = false, fill: Bool = false, session: GuestSession? = nil, onDelete: (() -> Void)? = nil, deleteDisabled: Bool = false, steps: Binding<[WizardStep]>? = nil, slot: InstallSlotModel? = nil) {
+    init(iso: String, disk: String, fromSnapshot: Bool = false, embedded: Bool = false, freshInstall: Bool = false, fill: Bool = false, windowed: Bool = false, session: GuestSession? = nil, onDelete: (() -> Void)? = nil, deleteDisabled: Bool = false, onOpen: (() -> Void)? = nil, steps: Binding<[WizardStep]>? = nil, slot: InstallSlotModel? = nil) {
         self.iso = iso
         self.disk = disk
         self.fromSnapshot = fromSnapshot
         self.embedded = embedded
         self.freshInstall = freshInstall
         self.fill = fill
+        self.windowed = windowed
         self.onDelete = onDelete
         self.deleteDisabled = deleteDisabled
+        self.onOpen = onOpen
         self.steps = steps
         self.slot = slot
         let loggedIn = fromSnapshot || GuestSSH.loggedIn(beside: URL(fileURLWithPath: disk))
@@ -129,15 +135,40 @@ struct Install: View {
 
     private var filled: some View {
         ZStack {
-            guestScreen
+            screenBody
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .background(.black)
-                .allowsHitTesting(!guest.stopped)
             if let error = guest.error {
                 Text(error).font(.callout).foregroundStyle(.red).padding()
             }
         }
         .toolbar { machineToolbar }
+    }
+
+    /// The guest view can live in one window. While the dedicated window has it, the library shows a way back.
+    private var showsGuest: Bool { windowed || !guest.inDedicatedWindow }
+
+    @ViewBuilder private var screenBody: some View {
+        if showsGuest {
+            guestScreen.allowsHitTesting(!guest.stopped)
+        } else {
+            dedicatedNote
+        }
+    }
+
+    private var dedicatedNote: some View {
+        ZStack {
+            Color.black
+            if let preview = guest.pausePreview {
+                Image(nsImage: preview)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+            }
+            if let onOpen {
+                Button("Show window", action: onOpen)
+                    .buttonStyle(.borderedProminent)
+            }
+        }
     }
 
     private var page: some View {
@@ -161,22 +192,40 @@ struct Install: View {
         }
     }
 
-    /// Start, Pause, and Stop, then Delete at the far right. Delete is red because it removes the machine.
+    /// Open, Start, Pause, and Stop, then Delete at the far right. Icons only; the help text names the action.
+    /// Open uses rectangle.on.rectangle, the same glyph UTM uses for Windows.
+    /// Delete stays red because it removes the machine.
     /// primaryAction stops before the centered title. confirmationAction is the trailing edge.
     @ToolbarContentBuilder
     private var machineToolbar: some ToolbarContent {
         ToolbarItemGroup(placement: .primaryAction) {
-            Button("Start") { guest.bootDisk(disk, pointer: true) }
-                .disabled(!guest.stopped)
-            Button("Pause") { guest.pauseGuest() }
-                .disabled(guest.stopped)
-            Button("Stop") { guest.halt() }
-                .disabled(guest.stopped && !guest.paused)
+            if let onOpen {
+                Button(action: onOpen) {
+                    Image(systemName: "rectangle.on.rectangle")
+                }
+                .help("Open in a window")
+            }
+            Button { guest.bootDisk(disk, pointer: true) } label: {
+                Image(systemName: "play.fill")
+            }
+            .disabled(!guest.stopped)
+            .help("Start")
+            Button { guest.pauseGuest() } label: {
+                Image(systemName: "pause.fill")
+            }
+            .disabled(guest.stopped)
+            .help("Pause")
+            Button { guest.halt() } label: {
+                Image(systemName: "stop.fill")
+            }
+            .disabled(guest.stopped && !guest.paused)
+            .help("Stop")
         }
         if let onDelete {
             ToolbarItem(placement: .confirmationAction) {
                 Button(action: onDelete) {
-                    Text("Delete").foregroundStyle(.red)
+                    Image(systemName: "trash")
+                        .foregroundStyle(.red)
                 }
                 .tint(.red)
                 .disabled(deleteDisabled)
@@ -201,6 +250,7 @@ struct Install: View {
     /// The still is an AppKit sibling on top of the Metal guest. A SwiftUI Image in the ZStack does not cover it.
     private var guestScreen: some View {
         GuestView(session: guest, capture: capturePointer, keyboard: captureKeyboard, preview: guest.pausePreview)
+            .id(guest.screenEpoch)
             .background(.black, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
             .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
     }
@@ -443,13 +493,18 @@ final class GuestSession: ObservableObject {
     @Published var showWindow = false
     @Published var cloning = false
     @Published var setupSteps = WizardStep.setup
+    /// The guest view is mounted in the dedicated window. The library must not embed it too.
+    @Published var inDedicatedWindow = false
+    /// Bumped so a closed window's guest view is created again. The old one stays blank.
+    @Published private(set) var screenEpoch = 0
     /// A pause save beside this disk. Start restores it instead of a cold boot.
     @Published var paused = false
     /// Last guest frame at pause. Shown while the machine is stopped.
     @Published var pausePreview: NSImage?
     /// Quick start passes its own list. A clone keeps the rows on this session.
     var steps: Binding<[WizardStep]>?
-    let view = InstallScreen()
+    /// Replaced when a window opens again. The view that closed stays blank if it is shown a second time.
+    var view = InstallScreen()
     private let callbacks = MachineDelegate()
     /// Bumped when the running machine changes, so a late callback cannot act on the next boot.
     private var generation = 0
@@ -506,6 +561,27 @@ final class GuestSession: ObservableObject {
     /// Rename moved the folder. The running guest keeps this session and reads the new disk path.
     func retarget(_ path: String) {
         diskURL = URL(fileURLWithPath: path)
+    }
+
+    /// The dedicated window is closing. Leave the guest view out of that window so the next open can embed it.
+    func releaseScreen() {
+        view.removeFromSuperview()
+    }
+
+    /// The dedicated window is opening. The view left behind by the closed window is blank, so mount a new one.
+    func claimScreen() {
+        view.virtualMachine = nil
+        view.removeFromSuperview()
+        view = InstallScreen()
+        screenEpoch += 1
+    }
+
+    /// The new guest view is in the window. Assigning the machine before that leaves the window black.
+    func showScreen() {
+        guard view.window != nil, let machine else { return }
+        if view.virtualMachine !== machine {
+            view.virtualMachine = machine
+        }
     }
 
     /// A clone stays off until Start. A pause save is restored then, not on open.
@@ -1356,6 +1432,9 @@ struct GuestView: NSViewRepresentable {
         session.view.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         session.view.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
         pane.show(preview)
+        pane.onWindow = { [weak session] in
+            DispatchQueue.main.async { session?.showScreen() }
+        }
         return pane
     }
 
@@ -1363,11 +1442,17 @@ struct GuestView: NSViewRepresentable {
         nsView.embed(session.view)
         session.view.capture = capture
         session.view.keyboard = keyboard
+        nsView.onWindow = { [weak session] in
+            DispatchQueue.main.async { session?.showScreen() }
+        }
         // A paused still must not be cleared by a SwiftUI pass that still has a nil preview.
         if let preview {
             nsView.show(preview)
         } else if !session.paused {
             nsView.show(nil)
+        }
+        if nsView.window != nil {
+            DispatchQueue.main.async { [weak session] in session?.showScreen() }
         }
     }
 
@@ -1381,6 +1466,7 @@ struct GuestView: NSViewRepresentable {
 /// guest.pausePreview is this overlay. A SwiftUI Image in a ZStack does not cover VZVirtualMachineView.
 final class GuestPane: NSView {
     let still = NSImageView()
+    var onWindow: () -> Void = {}
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -1394,6 +1480,12 @@ final class GuestPane: NSView {
     }
 
     required init?(coder: NSCoder) { nil }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        guard window != nil else { return }
+        onWindow()
+    }
 
     func embed(_ screen: InstallScreen) {
         if screen.superview !== self {
@@ -1479,6 +1571,8 @@ final class InstallScreen: VZVirtualMachineView {
     /// Closing the wizard mid-install proposes a zero size. That guess is a blank screen, so keep the last real one.
     /// The virtual machine stays running. The window is not the guest.
     private var drawn = Guest.cloneGuest
+    /// Set once this view has been in a window and then removed. The next window has to assign the machine again.
+    private var leftWindow = false
 
     var capture = false {
         didSet { applyCapture() }
@@ -1524,6 +1618,18 @@ final class InstallScreen: VZVirtualMachineView {
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         applyCapture()
+        // The first window works. A view that already left a window stays black until the machine is assigned again.
+        if window == nil {
+            leftWindow = true
+            return
+        }
+        guard leftWindow, let running = virtualMachine else { return }
+        leftWindow = false
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.window != nil else { return }
+            self.virtualMachine = nil
+            self.virtualMachine = running
+        }
     }
 
     override func layout() {
