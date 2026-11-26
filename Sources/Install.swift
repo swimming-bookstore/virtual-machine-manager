@@ -33,10 +33,12 @@ struct Install: View {
     var deleteDisabled = false
     /// Opens the dedicated window. Nil on the installer and on that window.
     var onOpen: (() -> Void)? = nil
+    /// CPU or memory changed. A pause save from the old counts cannot be restored.
+    var onHardware: (() -> Void)? = nil
     @StateObject private var guest: GuestSession
     @Environment(\.openWindow) private var openWindow
 
-    init(iso: String, disk: String, fromSnapshot: Bool = false, embedded: Bool = false, freshInstall: Bool = false, fill: Bool = false, windowed: Bool = false, session: GuestSession? = nil, onDelete: (() -> Void)? = nil, deleteDisabled: Bool = false, onOpen: (() -> Void)? = nil, steps: Binding<[WizardStep]>? = nil, slot: InstallSlotModel? = nil) {
+    init(iso: String, disk: String, fromSnapshot: Bool = false, embedded: Bool = false, freshInstall: Bool = false, fill: Bool = false, windowed: Bool = false, session: GuestSession? = nil, onDelete: (() -> Void)? = nil, deleteDisabled: Bool = false, onOpen: (() -> Void)? = nil, onHardware: (() -> Void)? = nil, steps: Binding<[WizardStep]>? = nil, slot: InstallSlotModel? = nil) {
         self.iso = iso
         self.disk = disk
         self.fromSnapshot = fromSnapshot
@@ -47,6 +49,7 @@ struct Install: View {
         self.onDelete = onDelete
         self.deleteDisabled = deleteDisabled
         self.onOpen = onOpen
+        self.onHardware = onHardware
         self.steps = steps
         self.slot = slot
         let loggedIn = fromSnapshot || GuestSSH.loggedIn(beside: URL(fileURLWithPath: disk))
@@ -134,6 +137,31 @@ struct Install: View {
     }
 
     private var filled: some View {
+        Group {
+            if windowed {
+                guestStage
+                    .toolbar { machineToolbar(nil) }
+            } else {
+                // The guest fills the window. Settings sit below it, so the gear jumps down.
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        VStack(spacing: 0) {
+                            guestStage
+                                .id("vm")
+                                .frame(minHeight: max(WindowMetrics.libraryMin.height - 52, Guest.cloneGuest.height))
+                            if fromSnapshot {
+                                MachineSettings(disk: disk, running: !guest.stopped, onChange: onHardware)
+                                    .id("settings")
+                            }
+                        }
+                    }
+                    .toolbar { machineToolbar(proxy) }
+                }
+            }
+        }
+    }
+
+    private var guestStage: some View {
         ZStack {
             screenBody
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -142,7 +170,6 @@ struct Install: View {
                 Text(error).font(.callout).foregroundStyle(.red).padding()
             }
         }
-        .toolbar { machineToolbar }
     }
 
     /// The guest view can live in one window. While the dedicated window has it, the library shows a way back.
@@ -188,17 +215,26 @@ struct Install: View {
         .padding(WindowMetrics.pagePad)
         .frame(width: setup ? WindowMetrics.quickStartWidth : Guest.cloneGuest.width + WindowMetrics.pagePad * 2, alignment: .topLeading)
         .toolbar {
-            if fromSnapshot { machineToolbar }
+            if fromSnapshot { machineToolbar(nil) }
         }
     }
 
-    /// Open, Start, Pause, and Stop, then Delete at the far right. Icons only; the help text names the action.
+    /// Settings sits left of Open. Then Start, Pause, and Stop, then Delete at the far right. Icons only; the help text names the action.
     /// Open uses rectangle.on.rectangle, the same glyph UTM uses for Windows.
+    /// Settings is the gear. One button. The guest is already the top of this window.
     /// Delete stays red because it removes the machine.
     /// primaryAction stops before the centered title. confirmationAction is the trailing edge.
     @ToolbarContentBuilder
-    private var machineToolbar: some ToolbarContent {
+    private func machineToolbar(_ scroll: ScrollViewProxy?) -> some ToolbarContent {
         ToolbarItemGroup(placement: .primaryAction) {
+            if let scroll {
+                Button {
+                    withAnimation { scroll.scrollTo("settings", anchor: .top) }
+                } label: {
+                    Image(systemName: "gearshape")
+                }
+                .help("Settings")
+            }
             if let onOpen {
                 Button(action: onOpen) {
                     Image(systemName: "rectangle.on.rectangle")
@@ -361,6 +397,74 @@ struct Install: View {
             openWindow(id: "main")
         }
         AppWindow.closeQuickStart()
+    }
+}
+
+/// The main window scrolls down to CPU and memory. The gear jumps here.
+/// A running guest keeps the values it booted with. The next Start reads the file beside the disk.
+private struct MachineSettings: View {
+    let disk: String
+    var running: Bool
+    var onChange: (() -> Void)? = nil
+    @State private var cpu = GuestHardware.defaultCPU
+    @State private var memory = GuestHardware.defaultMemoryGB
+    @State private var error: String?
+    @State private var savedCPU = GuestHardware.defaultCPU
+    @State private var savedMemory = GuestHardware.defaultMemoryGB
+
+    private var maxCPU: Int { VZVirtualMachineConfiguration.maximumAllowedCPUCount }
+    private var maxMemory: Int { Int(VZVirtualMachineConfiguration.maximumAllowedMemorySize / (1024 * 1024 * 1024)) }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("Settings").font(.title3.weight(.semibold))
+            Text(running ? "CPU and memory apply the next time this virtual machine starts." : "CPU and memory for this virtual machine.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            row("CPU", cpu, 1...max(1, maxCPU), cpu == 1 ? "core" : "cores") { cpu = $0; store() }
+            row("Memory", memory, 1...max(1, maxMemory), "GB") { memory = $0; store() }
+            if let error { Text(error).font(.callout).foregroundStyle(.red) }
+        }
+        .padding(WindowMetrics.pagePad)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.background)
+        .onAppear(perform: load)
+        .onChange(of: disk) { _, _ in load() }
+    }
+
+    private func row(_ title: String, _ value: Int, _ range: ClosedRange<Int>, _ unit: String, set: @escaping (Int) -> Void) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text(title)
+                Spacer()
+                Text("\(value) \(unit)").foregroundStyle(.secondary).monospacedDigit()
+            }
+            Slider(value: Binding(get: { Double(value) }, set: { set(Int($0.rounded())) }), in: Double(range.lowerBound)...Double(range.upperBound), step: 1)
+                .disabled(running)
+        }
+    }
+
+    private func load() {
+        let hardware = GuestHardware.load(beside: URL(fileURLWithPath: disk))
+        cpu = hardware.cpu
+        memory = hardware.memoryGB
+        savedCPU = cpu
+        savedMemory = memory
+        error = nil
+    }
+
+    private func store() {
+        let hardware = GuestHardware.clamp(cpuCount: cpu, memoryGB: memory)
+        cpu = hardware.cpu
+        memory = hardware.memoryGB
+        guard cpu != savedCPU || memory != savedMemory else { return }
+        error = GuestHardware.save(beside: URL(fileURLWithPath: disk), cpu: cpu, memoryGB: memory)
+        if error == nil {
+            savedCPU = cpu
+            savedMemory = memory
+            onChange?()
+        }
     }
 }
 
@@ -879,6 +983,20 @@ final class GuestSession: ObservableObject {
                 _ = Worker.clearPaused(disk: disk)
                 DispatchQueue.main.async { self?.publishLibrary() }
             }
+        }
+    }
+
+    /// Settings changed the CPU or memory. The pause save was made with the old counts, so Start boots fresh.
+    func forgetPause() {
+        guard fromSnapshotBoot, let disk = diskURL else { return }
+        let drop = paused || GuestPause.isPaused(beside: disk)
+        paused = false
+        pausePreview = nil
+        headline = stopped ? "Debian is stopped. The guest disk is the installed system." : headline
+        guard drop else { return }
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            _ = Worker.clearPaused(disk: disk)
+            DispatchQueue.main.async { self?.publishLibrary() }
         }
     }
 

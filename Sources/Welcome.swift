@@ -183,6 +183,11 @@ final class LibraryModel: ObservableObject {
         sessions[disk]?.inDedicatedWindow = open
     }
 
+    /// Settings changed CPU or memory. A pause save was made with the old counts, so it cannot be restored.
+    func dropPause(for disk: String) {
+        sessions[disk]?.forgetPause()
+    }
+
     private func create(name: String?) {
         if let name, name.isEmpty { return }
         guard !cloning, snapshotReady else { return }
@@ -411,7 +416,8 @@ struct Welcome: View {
                             if let key = library.machines.first(where: { $0.disk == disk })?.key {
                                 openMachine(key)
                             }
-                        }
+                        },
+                        onHardware: { library.dropPause(for: disk) }
                     )
                         .id(library.machines.first { $0.disk == disk }?.key ?? disk)
                 } else if library.cloning {

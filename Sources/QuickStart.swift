@@ -90,6 +90,8 @@ struct WorkerEvent: Decodable {
     var path: String?
     var disk: String?
     var key: String?
+    var cpu: Int?
+    var memoryGB: Int?
 }
 
 final class Wizard: ObservableObject {
@@ -387,6 +389,23 @@ enum Worker {
     static func clearPaused(disk: URL) -> String? {
         let (code, text) = run(["unpause", "--disk", disk.path])
         return code == 0 ? nil : (message(text) ?? "Could not clear the pause.")
+    }
+
+    /// CPU and memory beside the disk. A missing file is 2 CPUs and 2 GB.
+    static func hardware(disk: URL, cpu: Int? = nil, memoryGB: Int? = nil) -> (Int, Int)? {
+        var args = ["hardware", "--disk", disk.path]
+        if let cpu, let memoryGB {
+            args.append(contentsOf: ["--cpu", "\(cpu)", "--memory-gb", "\(memoryGB)"])
+        }
+        let (code, text) = run(args)
+        guard code == 0 else { return nil }
+        for line in text.split(separator: "\n") {
+            guard let data = line.data(using: .utf8),
+                  let event = try? JSONDecoder().decode(WorkerEvent.self, from: data),
+                  let cpu = event.cpu, let memory = event.memoryGB else { continue }
+            return (cpu, memory)
+        }
+        return nil
     }
 
     /// "My Debian" plus a short code. Rust picks the code.
