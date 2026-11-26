@@ -48,9 +48,12 @@ struct VirtualMachinesApp: App {
             .windowResizability(.automatic)
             .defaultSize(width: WindowMetrics.quickStart.width, height: WindowMetrics.quickStart.height)
         // One window per machine. The library stays the list. This window is the guest, at the scanout size.
+        // A nil value is an empty window, not a request to create a machine. The wizard asks when it opens the main window.
         WindowGroup(id: "machine", for: String.self) { key in
             if let key = key.wrappedValue, !key.isEmpty {
                 MachineWindow(library: library, machineKey: key)
+            } else {
+                EmptyMachineWindow(library: library)
             }
         }
             .windowResizability(.automatic)

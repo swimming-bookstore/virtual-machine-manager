@@ -3861,3 +3861,55 @@ fn quick_start_swift_gates_the_bar_on_a_real_download() {
         .unwrap()
         .contains("if downloading {"));
 }
+
+#[test]
+fn an_empty_machine_window_does_not_ask_to_create_one() {
+    let welcome = include_str!("../Sources/Welcome.swift");
+    assert!(welcome.contains("struct EmptyMachineWindow"));
+    assert!(welcome.contains("func noteBlankMachine"));
+    assert!(welcome.contains("Opening an empty machine window is not that"));
+    assert!(!welcome
+        .split("func offerFirstName()")
+        .nth(1)
+        .unwrap()
+        .split("func noteBlankMachine")
+        .next()
+        .unwrap()
+        .contains("askName"));
+    assert!(include_str!("../Sources/App.swift").contains("EmptyMachineWindow(library: library)"));
+    assert!(include_str!("../Sources/App.swift").contains("A nil value is an empty window, not a request to create a machine"));
+}
+
+#[test]
+fn the_main_window_does_not_force_a_virtual_machine() {
+    let welcome = include_str!("../Sources/Welcome.swift");
+    assert!(welcome.contains("The main window does not force a virtual machine"));
+    let offer = welcome
+        .split("func offerFirstName()")
+        .nth(1)
+        .unwrap()
+        .split("func noteBlankMachine")
+        .next()
+        .unwrap();
+    assert!(offer.contains("pendingFirstName"));
+    assert!(
+        !offer.contains("askName()"),
+        "an empty library must not ask for a machine"
+    );
+    let named = welcome
+        .split("// \"name\" is the wizard finishing")
+        .nth(1)
+        .unwrap()
+        .split("if library.snapshotReady")
+        .next()
+        .unwrap();
+    assert!(
+        named.contains("askFromWizard"),
+        "the wizard opening the main window prompts for the first machine"
+    );
+    assert!(welcome.contains("func askFromWizard()"));
+    assert!(welcome.contains("func noteWizardAsk()"));
+    assert!(include_str!("../Sources/Install.swift").contains("LibraryModel.noteWizardAsk()"));
+    assert!(welcome.contains("func cloneNew()"));
+    assert!(welcome.contains("askName()"));
+}
