@@ -143,6 +143,7 @@ struct Install: View {
                     .toolbar { machineToolbar(nil) }
             } else {
                 // The guest fills the window. Settings sit below it, so the gear jumps down.
+                // A running guest captures the pointer. The scroll view must not keep those drags, or the cursor never leaves the host.
                 ScrollViewReader { proxy in
                     ScrollView {
                         VStack(spacing: 0) {
@@ -155,6 +156,7 @@ struct Install: View {
                             }
                         }
                     }
+                    .scrollDisabled(capturePointer)
                     .toolbar { machineToolbar(proxy) }
                 }
             }
@@ -1740,6 +1742,12 @@ final class InstallScreen: VZVirtualMachineView {
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         applyCapture()
+        // The scroll view in the main window installs its own tracking areas after this view moves in.
+        // Capture has to win that pass, or the pointer stays with the host.
+        DispatchQueue.main.async { [weak self] in
+            self?.applyCapture()
+            self?.claimPointer()
+        }
         // The first window works. A view that already left a window stays black until the machine is assigned again.
         if window == nil {
             leftWindow = true
@@ -1756,7 +1764,12 @@ final class InstallScreen: VZVirtualMachineView {
 
     override func layout() {
         super.layout()
-        if !capture { disarm() }
+        if capture {
+            window?.invalidateCursorRects(for: self)
+            claimPointer()
+        } else {
+            disarm()
+        }
     }
 
     override func addTrackingArea(_ trackingArea: NSTrackingArea) {
@@ -1795,7 +1808,7 @@ final class InstallScreen: VZVirtualMachineView {
     }
 
     override func mouseDown(with event: NSEvent) {
-        if keyboard && !capture {
+        if capture || keyboard {
             window?.makeFirstResponder(self)
         }
         if capture { super.mouseDown(with: event) }
@@ -1822,6 +1835,8 @@ final class InstallScreen: VZVirtualMachineView {
         capturesSystemKeys = capture || keyboard
         if capture {
             updateTrackingAreas()
+            window?.makeFirstResponder(self)
+            claimPointer()
         } else {
             disarm()
             window?.makeFirstResponder(nil)
@@ -1829,6 +1844,27 @@ final class InstallScreen: VZVirtualMachineView {
             _ = CGAssociateMouseAndMouseCursorPosition(1)
         }
         window?.invalidateCursorRects(for: self)
+    }
+
+    /// The main window's scroll view keeps the drag unless its pan recognizer is off.
+    /// The dedicated window has no scroll view, so this is a no-op there.
+    /// Capture also needs this view to be key. A scroll view does not hand that over on its own.
+    private func claimPointer() {
+        guard capture else { return }
+        window?.makeFirstResponder(self)
+        guard let scroll = enclosingScrollView else { return }
+        scroll.hasHorizontalScroller = false
+        scroll.hasVerticalScroller = false
+        scroll.verticalScrollElasticity = .none
+        scroll.horizontalScrollElasticity = .none
+        var views: [NSView] = [scroll]
+        if let content = scroll.documentView { views.append(content) }
+        views.append(scroll.contentView)
+        for view in views {
+            for recognizer in view.gestureRecognizers {
+                recognizer.isEnabled = false
+            }
+        }
     }
 
     private func disarm() {
