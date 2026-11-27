@@ -143,7 +143,7 @@ struct Install: View {
                     .toolbar { machineToolbar(nil) }
             } else {
                 // The guest fills the window. Settings sit below it, so the gear jumps down.
-                // A running guest captures the pointer. The scroll view must not keep those drags, or the cursor never leaves the host.
+                // Scrolling stays on. The guest view only takes the pointer while the cursor is over it.
                 ScrollViewReader { proxy in
                     ScrollView {
                         VStack(spacing: 0) {
@@ -156,7 +156,6 @@ struct Install: View {
                             }
                         }
                     }
-                    .scrollDisabled(capturePointer)
                     .toolbar { machineToolbar(proxy) }
                 }
             }
@@ -1654,12 +1653,16 @@ final class GuestPane: NSView {
     override var isOpaque: Bool { true }
 
     /// The thumbnail's click is a SwiftUI control above this pane. A Metal guest must not keep that click.
+    /// A miss also has to miss this pane. Otherwise the pane keeps the wheel and the window cannot scroll.
     override func hitTest(_ point: NSPoint) -> NSView? {
         guard let screen = subviews.first(where: { $0 is InstallScreen }) as? InstallScreen,
               screen.capture || screen.keyboard else {
             return nil
         }
-        return super.hitTest(point)
+        guard let hit = super.hitTest(point), hit === screen || hit.isDescendant(of: screen) else {
+            return nil
+        }
+        return hit
     }
 }
 
@@ -1697,6 +1700,8 @@ final class InstallScreen: VZVirtualMachineView {
     private var drawn = Guest.cloneGuest
     /// Set once this view has been in a window and then removed. The next window has to assign the machine again.
     private var leftWindow = false
+    /// Sees the cursor leave the guest picture. Enter and exit are not enough once capture hides the pointer.
+    private var pointerWatch: Any?
 
     var capture = false {
         didSet { applyCapture() }
@@ -1720,6 +1725,12 @@ final class InstallScreen: VZVirtualMachineView {
         guard let cg = rep.cgImage else { return nil }
         let cached = ownedImage(cg, size: rect.size)
         return visiblePixels(cached) ? cached : nil
+    }
+
+    deinit {
+        if let pointerWatch {
+            NSEvent.removeMonitor(pointerWatch)
+        }
     }
 
     override var intrinsicContentSize: NSSize { drawn }
@@ -1746,11 +1757,12 @@ final class InstallScreen: VZVirtualMachineView {
         // Capture has to win that pass, or the pointer stays with the host.
         DispatchQueue.main.async { [weak self] in
             self?.applyCapture()
-            self?.claimPointer()
         }
         // The first window works. A view that already left a window stays black until the machine is assigned again.
         if window == nil {
             leftWindow = true
+            releaseScroll()
+            stopWatchingPointer()
             return
         }
         guard leftWindow, let running = virtualMachine else { return }
@@ -1766,10 +1778,28 @@ final class InstallScreen: VZVirtualMachineView {
         super.layout()
         if capture {
             window?.invalidateCursorRects(for: self)
-            claimPointer()
+            followPointer(nil)
         } else {
             disarm()
+            releaseScroll()
         }
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        guard capture else { return }
+        followPointer(event)
+        super.mouseEntered(with: event)
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        releaseScroll()
+        if capture { super.mouseExited(with: event) }
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        guard capture else { return }
+        followPointer(event)
+        if eventInGuest(event) { super.mouseMoved(with: event) }
     }
 
     override func addTrackingArea(_ trackingArea: NSTrackingArea) {
@@ -1798,7 +1828,10 @@ final class InstallScreen: VZVirtualMachineView {
     }
 
     override func hitTest(_ point: NSPoint) -> NSView? {
-        (capture || keyboard) ? super.hitTest(point) : nil
+        // point is in the superview. The picture can be smaller than this view. Black bars must scroll.
+        let local = convert(point, from: superview)
+        guard (capture || keyboard), guestRect.contains(local) else { return nil }
+        return super.hitTest(point)
     }
 
     override var acceptsFirstResponder: Bool { capture || keyboard }
@@ -1814,12 +1847,17 @@ final class InstallScreen: VZVirtualMachineView {
         if capture { super.mouseDown(with: event) }
     }
 
-    override func mouseEntered(with event: NSEvent) { if capture { super.mouseEntered(with: event) } }
-    override func mouseMoved(with event: NSEvent) { if capture { super.mouseMoved(with: event) } }
     override func mouseUp(with event: NSEvent) { if capture { super.mouseUp(with: event) } }
     override func mouseDragged(with event: NSEvent) { if capture { super.mouseDragged(with: event) } }
     override func rightMouseDown(with event: NSEvent) { if capture { super.rightMouseDown(with: event) } }
-    override func scrollWheel(with event: NSEvent) { if capture { super.scrollWheel(with: event) } }
+    override func scrollWheel(with event: NSEvent) {
+        // This view fills the window. A wheel outside the picture has to reach the scroll view.
+        guard capture, eventInGuest(event) else {
+            nextResponder?.scrollWheel(with: event)
+            return
+        }
+        super.scrollWheel(with: event)
+    }
 
     override func keyDown(with event: NSEvent) {
         if capture || keyboard { super.keyDown(with: event) }
@@ -1835,10 +1873,14 @@ final class InstallScreen: VZVirtualMachineView {
         capturesSystemKeys = capture || keyboard
         if capture {
             updateTrackingAreas()
+            window?.acceptsMouseMovedEvents = true
+            watchPointer()
             window?.makeFirstResponder(self)
-            claimPointer()
+            followPointer(nil)
         } else {
             disarm()
+            releaseScroll()
+            stopWatchingPointer()
             window?.makeFirstResponder(nil)
             NSCursor.unhide()
             _ = CGAssociateMouseAndMouseCursorPosition(1)
@@ -1846,25 +1888,81 @@ final class InstallScreen: VZVirtualMachineView {
         window?.invalidateCursorRects(for: self)
     }
 
-    /// The main window's scroll view keeps the drag unless its pan recognizer is off.
+    /// The guest picture, aspect-fit in this view. Bars around it are not the virtual machine.
+    private var guestRect: NSRect {
+        let bounds = self.bounds
+        guard bounds.width > 1, bounds.height > 1 else { return bounds }
+        let aspect = Guest.aspect
+        if bounds.width / bounds.height > aspect {
+            let width = bounds.height * aspect
+            return NSRect(x: bounds.midX - width / 2, y: bounds.minY, width: width, height: bounds.height)
+        }
+        let height = bounds.width / aspect
+        return NSRect(x: bounds.minX, y: bounds.midY - height / 2, width: bounds.width, height: height)
+    }
+
+    /// Match the scroll lock to where the cursor is. A captured cursor hides the host pointer, so enter and exit are not enough.
+    private func followPointer(_ event: NSEvent?) {
+        guard capture else {
+            releaseScroll()
+            return
+        }
+        holdScroll(event.map { eventInGuest($0) } ?? pointerInside)
+    }
+
+    /// The host cursor, in this view. Capture hides it, so the window location is the one that still moves.
+    private var pointerInside: Bool {
+        guard let window else { return false }
+        let point = convert(window.mouseLocationOutsideOfEventStream, from: nil)
+        return guestRect.contains(point)
+    }
+
+    private func eventInGuest(_ event: NSEvent) -> Bool {
+        guestRect.contains(convert(event.locationInWindow, from: nil))
+    }
+
+    /// Scroll and move events still arrive after the cursor leaves the picture. Release the scroll view before it handles them.
+    private func watchPointer() {
+        guard pointerWatch == nil else { return }
+        pointerWatch = NSEvent.addLocalMonitorForEvents(matching: [.mouseMoved, .leftMouseDragged, .rightMouseDragged, .scrollWheel]) { [weak self] event in
+            guard let self, event.window === self.window else { return event }
+            self.followPointer(event)
+            return event
+        }
+    }
+
+    private func stopWatchingPointer() {
+        if let pointerWatch {
+            NSEvent.removeMonitor(pointerWatch)
+            self.pointerWatch = nil
+        }
+    }
+
+    /// The main window's scroll view keeps a drag that starts on the guest, so the cursor never leaves the host.
+    /// Hold that gesture only while the pointer is over the guest picture. Settings and the bars around it keep scrolling.
     /// The dedicated window has no scroll view, so this is a no-op there.
-    /// Capture also needs this view to be key. A scroll view does not hand that over on its own.
-    private func claimPointer() {
-        guard capture else { return }
-        window?.makeFirstResponder(self)
-        guard let scroll = enclosingScrollView else { return }
-        scroll.hasHorizontalScroller = false
-        scroll.hasVerticalScroller = false
-        scroll.verticalScrollElasticity = .none
-        scroll.horizontalScrollElasticity = .none
-        var views: [NSView] = [scroll]
+    private var holdingScroll = false
+
+    private func holdScroll(_ hold: Bool) {
+        guard let scroll = enclosingScrollView else {
+            holdingScroll = false
+            return
+        }
+        guard hold != holdingScroll else { return }
+        holdingScroll = hold
+        scroll.verticalScrollElasticity = hold ? .none : .automatic
+        scroll.horizontalScrollElasticity = hold ? .none : .automatic
+        var views: [NSView] = [scroll, scroll.contentView]
         if let content = scroll.documentView { views.append(content) }
-        views.append(scroll.contentView)
         for view in views {
             for recognizer in view.gestureRecognizers {
-                recognizer.isEnabled = false
+                recognizer.isEnabled = !hold
             }
         }
+    }
+
+    private func releaseScroll() {
+        holdScroll(false)
     }
 
     private func disarm() {

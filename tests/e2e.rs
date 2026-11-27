@@ -3920,8 +3920,10 @@ fn the_library_toolbar_jumps_to_settings() {
     assert!(install.contains("Image(systemName: \"gearshape\")"));
     assert!(install.contains(".help(\"Settings\")"));
     assert!(install.contains("scrollTo(\"settings\", anchor: .top)"));
-    assert!(install.contains(".scrollDisabled(capturePointer)"));
-    assert!(install.contains("func claimPointer()"));
+    assert!(!install.contains(".scrollDisabled("));
+    assert!(install.contains("func holdScroll("));
+    assert!(install.contains("func followPointer("));
+    assert!(install.contains("addLocalMonitorForEvents"));
     assert!(install.contains("struct MachineSettings"));
     assert!(!install.contains(".help(\"Virtual machine\")"));
 }
