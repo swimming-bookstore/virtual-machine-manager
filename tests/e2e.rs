@@ -3917,10 +3917,13 @@ fn the_main_window_does_not_force_a_virtual_machine() {
 #[test]
 fn the_library_toolbar_jumps_to_settings() {
     let install = include_str!("../Sources/Install.swift");
+    assert!(install.contains("Image(systemName: \"arrow.up.to.line\")"));
+    assert!(install.contains(".help(\"Scroll to top\")"));
+    assert!(install.contains("scrollTo(\"vm\", anchor: .top)"));
     assert!(install.contains("Image(systemName: \"gearshape\")"));
     assert!(install.contains(".help(\"Settings\")"));
     assert!(install.contains("scrollTo(\"settings\", anchor: .top)"));
-    assert!(!install.contains(".scrollDisabled("));
+    assert!(install.contains(".scrollDisabled(capturePointer && pointerInGuest)"));
     assert!(install.contains("func holdScroll("));
     assert!(install.contains("func followPointer("));
     assert!(install.contains("addLocalMonitorForEvents"));

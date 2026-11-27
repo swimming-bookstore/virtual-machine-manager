@@ -36,6 +36,7 @@ struct Install: View {
     /// CPU or memory changed. A pause save from the old counts cannot be restored.
     var onHardware: (() -> Void)? = nil
     @StateObject private var guest: GuestSession
+    @State private var pointerInGuest = false
     @Environment(\.openWindow) private var openWindow
 
     init(iso: String, disk: String, fromSnapshot: Bool = false, embedded: Bool = false, freshInstall: Bool = false, fill: Bool = false, windowed: Bool = false, session: GuestSession? = nil, onDelete: (() -> Void)? = nil, deleteDisabled: Bool = false, onOpen: (() -> Void)? = nil, onHardware: (() -> Void)? = nil, steps: Binding<[WizardStep]>? = nil, slot: InstallSlotModel? = nil) {
@@ -156,6 +157,7 @@ struct Install: View {
                             }
                         }
                     }
+                    .scrollDisabled(capturePointer && pointerInGuest)
                     .toolbar { machineToolbar(proxy) }
                 }
             }
@@ -220,15 +222,21 @@ struct Install: View {
         }
     }
 
-    /// Settings sits left of Open. Then Start, Pause, and Stop, then Delete at the far right. Icons only; the help text names the action.
+    /// Top and Settings sit left of Open. Then Start, Pause, and Stop, then Delete at the far right. Icons only; the help text names the action.
     /// Open uses rectangle.on.rectangle, the same glyph UTM uses for Windows.
-    /// Settings is the gear. One button. The guest is already the top of this window.
+    /// Top scrolls back to the guest; Settings is the gear.
     /// Delete stays red because it removes the machine.
     /// primaryAction stops before the centered title. confirmationAction is the trailing edge.
     @ToolbarContentBuilder
     private func machineToolbar(_ scroll: ScrollViewProxy?) -> some ToolbarContent {
         ToolbarItemGroup(placement: .primaryAction) {
             if let scroll {
+                Button {
+                    withAnimation { scroll.scrollTo("vm", anchor: .top) }
+                } label: {
+                    Image(systemName: "arrow.up.to.line")
+                }
+                .help("Scroll to top")
                 Button {
                     withAnimation { scroll.scrollTo("settings", anchor: .top) }
                 } label: {
@@ -286,7 +294,19 @@ struct Install: View {
     /// GuestView stays mounted under that frame. Replacing it unhooks the virtual machine view, and the next pause has nothing to snapshot.
     /// The still is an AppKit sibling on top of the Metal guest. A SwiftUI Image in the ZStack does not cover it.
     private var guestScreen: some View {
-        GuestView(session: guest, capture: capturePointer, keyboard: captureKeyboard, preview: guest.pausePreview)
+        GuestView(
+            session: guest,
+            capture: capturePointer,
+            keyboard: captureKeyboard,
+            preview: guest.pausePreview,
+            onPointerInGuest: { inside in
+                DispatchQueue.main.async {
+                    if pointerInGuest != inside {
+                        pointerInGuest = inside
+                    }
+                }
+            }
+        )
             .id(guest.screenEpoch)
             .background(.black, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
             .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
@@ -1543,10 +1563,12 @@ struct GuestView: NSViewRepresentable {
     /// Send key events to the guest. The installer thumbnail leaves this off.
     var keyboard: Bool = false
     var preview: NSImage? = nil
+    var onPointerInGuest: ((Bool) -> Void)? = nil
 
     func makeNSView(context: Context) -> GuestPane {
         let pane = GuestPane()
         pane.embed(session.view)
+        session.view.onPointerInGuest = onPointerInGuest
         session.view.capture = capture
         session.view.keyboard = keyboard
         // The view's own size guess is a tiny blank. The slot proposes the real size.
@@ -1563,6 +1585,7 @@ struct GuestView: NSViewRepresentable {
 
     func updateNSView(_ nsView: GuestPane, context: Context) {
         nsView.embed(session.view)
+        session.view.onPointerInGuest = onPointerInGuest
         session.view.capture = capture
         session.view.keyboard = keyboard
         nsView.onWindow = { [weak session] in
@@ -1711,6 +1734,8 @@ final class InstallScreen: VZVirtualMachineView {
     var keyboard = false {
         didSet { applyCapture() }
     }
+
+    var onPointerInGuest: ((Bool) -> Void)?
 
     /// Last pixels of the guest. Pause writes this before the machine is stopped.
     func snapshot() -> NSImage? {
@@ -1924,7 +1949,7 @@ final class InstallScreen: VZVirtualMachineView {
     /// Scroll and move events still arrive after the cursor leaves the picture. Release the scroll view before it handles them.
     private func watchPointer() {
         guard pointerWatch == nil else { return }
-        pointerWatch = NSEvent.addLocalMonitorForEvents(matching: [.mouseMoved, .leftMouseDragged, .rightMouseDragged, .scrollWheel]) { [weak self] event in
+        pointerWatch = NSEvent.addLocalMonitorForEvents(matching: [.mouseMoved, .leftMouseDown, .rightMouseDown, .leftMouseDragged, .rightMouseDragged, .scrollWheel]) { [weak self] event in
             guard let self, event.window === self.window else { return event }
             self.followPointer(event)
             return event
@@ -1945,11 +1970,15 @@ final class InstallScreen: VZVirtualMachineView {
 
     private func holdScroll(_ hold: Bool) {
         guard let scroll = enclosingScrollView else {
-            holdingScroll = false
+            if holdingScroll {
+                holdingScroll = false
+                onPointerInGuest?(false)
+            }
             return
         }
         guard hold != holdingScroll else { return }
         holdingScroll = hold
+        onPointerInGuest?(hold)
         scroll.verticalScrollElasticity = hold ? .none : .automatic
         scroll.horizontalScrollElasticity = hold ? .none : .automatic
         var views: [NSView] = [scroll, scroll.contentView]
