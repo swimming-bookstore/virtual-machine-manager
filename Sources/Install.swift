@@ -33,10 +33,13 @@ struct Install: View {
     var deleteDisabled = false
     /// Opens the dedicated window. Nil on the installer and on that window.
     var onOpen: (() -> Void)? = nil
+    /// CPU or memory changed. A pause save from the old counts cannot be restored.
+    var onHardware: (() -> Void)? = nil
     @StateObject private var guest: GuestSession
+    @State private var pointerInGuest = false
     @Environment(\.openWindow) private var openWindow
 
-    init(iso: String, disk: String, fromSnapshot: Bool = false, embedded: Bool = false, freshInstall: Bool = false, fill: Bool = false, windowed: Bool = false, session: GuestSession? = nil, onDelete: (() -> Void)? = nil, deleteDisabled: Bool = false, onOpen: (() -> Void)? = nil, steps: Binding<[WizardStep]>? = nil, slot: InstallSlotModel? = nil) {
+    init(iso: String, disk: String, fromSnapshot: Bool = false, embedded: Bool = false, freshInstall: Bool = false, fill: Bool = false, windowed: Bool = false, session: GuestSession? = nil, onDelete: (() -> Void)? = nil, deleteDisabled: Bool = false, onOpen: (() -> Void)? = nil, onHardware: (() -> Void)? = nil, steps: Binding<[WizardStep]>? = nil, slot: InstallSlotModel? = nil) {
         self.iso = iso
         self.disk = disk
         self.fromSnapshot = fromSnapshot
@@ -47,6 +50,7 @@ struct Install: View {
         self.onDelete = onDelete
         self.deleteDisabled = deleteDisabled
         self.onOpen = onOpen
+        self.onHardware = onHardware
         self.steps = steps
         self.slot = slot
         let loggedIn = fromSnapshot || GuestSSH.loggedIn(beside: URL(fileURLWithPath: disk))
@@ -134,6 +138,33 @@ struct Install: View {
     }
 
     private var filled: some View {
+        Group {
+            if windowed {
+                guestStage
+                    .toolbar { machineToolbar(nil) }
+            } else {
+                // The guest fills the window. Settings sit below it, so the gear jumps down.
+                // Scrolling stays on. The guest view only takes the pointer while the cursor is over it.
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        VStack(spacing: 0) {
+                            guestStage
+                                .id("vm")
+                                .frame(minHeight: max(WindowMetrics.libraryMin.height - 52, Guest.cloneGuest.height))
+                            if fromSnapshot {
+                                MachineSettings(disk: disk, running: !guest.stopped, onChange: onHardware)
+                                    .id("settings")
+                            }
+                        }
+                    }
+                    .scrollDisabled(capturePointer && pointerInGuest)
+                    .toolbar { machineToolbar(proxy) }
+                }
+            }
+        }
+    }
+
+    private var guestStage: some View {
         ZStack {
             screenBody
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -142,7 +173,6 @@ struct Install: View {
                 Text(error).font(.callout).foregroundStyle(.red).padding()
             }
         }
-        .toolbar { machineToolbar }
     }
 
     /// The guest view can live in one window. While the dedicated window has it, the library shows a way back.
@@ -188,17 +218,32 @@ struct Install: View {
         .padding(WindowMetrics.pagePad)
         .frame(width: setup ? WindowMetrics.quickStartWidth : Guest.cloneGuest.width + WindowMetrics.pagePad * 2, alignment: .topLeading)
         .toolbar {
-            if fromSnapshot { machineToolbar }
+            if fromSnapshot { machineToolbar(nil) }
         }
     }
 
-    /// Open, Start, Pause, and Stop, then Delete at the far right. Icons only; the help text names the action.
+    /// Top and Settings sit left of Open. Then Start, Pause, and Stop, then Delete at the far right. Icons only; the help text names the action.
     /// Open uses rectangle.on.rectangle, the same glyph UTM uses for Windows.
+    /// Top scrolls back to the guest; Settings is the gear.
     /// Delete stays red because it removes the machine.
     /// primaryAction stops before the centered title. confirmationAction is the trailing edge.
     @ToolbarContentBuilder
-    private var machineToolbar: some ToolbarContent {
+    private func machineToolbar(_ scroll: ScrollViewProxy?) -> some ToolbarContent {
         ToolbarItemGroup(placement: .primaryAction) {
+            if let scroll {
+                Button {
+                    withAnimation { scroll.scrollTo("vm", anchor: .top) }
+                } label: {
+                    Image(systemName: "arrow.up.to.line")
+                }
+                .help("Scroll to top")
+                Button {
+                    withAnimation { scroll.scrollTo("settings", anchor: .top) }
+                } label: {
+                    Image(systemName: "gearshape")
+                }
+                .help("Settings")
+            }
             if let onOpen {
                 Button(action: onOpen) {
                     Image(systemName: "rectangle.on.rectangle")
@@ -249,7 +294,19 @@ struct Install: View {
     /// GuestView stays mounted under that frame. Replacing it unhooks the virtual machine view, and the next pause has nothing to snapshot.
     /// The still is an AppKit sibling on top of the Metal guest. A SwiftUI Image in the ZStack does not cover it.
     private var guestScreen: some View {
-        GuestView(session: guest, capture: capturePointer, keyboard: captureKeyboard, preview: guest.pausePreview)
+        GuestView(
+            session: guest,
+            capture: capturePointer,
+            keyboard: captureKeyboard,
+            preview: guest.pausePreview,
+            onPointerInGuest: { inside in
+                DispatchQueue.main.async {
+                    if pointerInGuest != inside {
+                        pointerInGuest = inside
+                    }
+                }
+            }
+        )
             .id(guest.screenEpoch)
             .background(.black, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
             .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
@@ -361,6 +418,74 @@ struct Install: View {
             openWindow(id: "main")
         }
         AppWindow.closeQuickStart()
+    }
+}
+
+/// The main window scrolls down to CPU and memory. The gear jumps here.
+/// A running guest keeps the values it booted with. The next Start reads the file beside the disk.
+private struct MachineSettings: View {
+    let disk: String
+    var running: Bool
+    var onChange: (() -> Void)? = nil
+    @State private var cpu = GuestHardware.defaultCPU
+    @State private var memory = GuestHardware.defaultMemoryGB
+    @State private var error: String?
+    @State private var savedCPU = GuestHardware.defaultCPU
+    @State private var savedMemory = GuestHardware.defaultMemoryGB
+
+    private var maxCPU: Int { VZVirtualMachineConfiguration.maximumAllowedCPUCount }
+    private var maxMemory: Int { Int(VZVirtualMachineConfiguration.maximumAllowedMemorySize / (1024 * 1024 * 1024)) }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("Settings").font(.title3.weight(.semibold))
+            Text(running ? "CPU and memory apply the next time this virtual machine starts." : "CPU and memory for this virtual machine.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            row("CPU", cpu, 1...max(1, maxCPU), cpu == 1 ? "core" : "cores") { cpu = $0; store() }
+            row("Memory", memory, 1...max(1, maxMemory), "GB") { memory = $0; store() }
+            if let error { Text(error).font(.callout).foregroundStyle(.red) }
+        }
+        .padding(WindowMetrics.pagePad)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.background)
+        .onAppear(perform: load)
+        .onChange(of: disk) { _, _ in load() }
+    }
+
+    private func row(_ title: String, _ value: Int, _ range: ClosedRange<Int>, _ unit: String, set: @escaping (Int) -> Void) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text(title)
+                Spacer()
+                Text("\(value) \(unit)").foregroundStyle(.secondary).monospacedDigit()
+            }
+            Slider(value: Binding(get: { Double(value) }, set: { set(Int($0.rounded())) }), in: Double(range.lowerBound)...Double(range.upperBound), step: 1)
+                .disabled(running)
+        }
+    }
+
+    private func load() {
+        let hardware = GuestHardware.load(beside: URL(fileURLWithPath: disk))
+        cpu = hardware.cpu
+        memory = hardware.memoryGB
+        savedCPU = cpu
+        savedMemory = memory
+        error = nil
+    }
+
+    private func store() {
+        let hardware = GuestHardware.clamp(cpuCount: cpu, memoryGB: memory)
+        cpu = hardware.cpu
+        memory = hardware.memoryGB
+        guard cpu != savedCPU || memory != savedMemory else { return }
+        error = GuestHardware.save(beside: URL(fileURLWithPath: disk), cpu: cpu, memoryGB: memory)
+        if error == nil {
+            savedCPU = cpu
+            savedMemory = memory
+            onChange?()
+        }
     }
 }
 
@@ -879,6 +1004,20 @@ final class GuestSession: ObservableObject {
                 _ = Worker.clearPaused(disk: disk)
                 DispatchQueue.main.async { self?.publishLibrary() }
             }
+        }
+    }
+
+    /// Settings changed the CPU or memory. The pause save was made with the old counts, so Start boots fresh.
+    func forgetPause() {
+        guard fromSnapshotBoot, let disk = diskURL else { return }
+        let drop = paused || GuestPause.isPaused(beside: disk)
+        paused = false
+        pausePreview = nil
+        headline = stopped ? "Debian is stopped. The guest disk is the installed system." : headline
+        guard drop else { return }
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            _ = Worker.clearPaused(disk: disk)
+            DispatchQueue.main.async { self?.publishLibrary() }
         }
     }
 
@@ -1424,10 +1563,12 @@ struct GuestView: NSViewRepresentable {
     /// Send key events to the guest. The installer thumbnail leaves this off.
     var keyboard: Bool = false
     var preview: NSImage? = nil
+    var onPointerInGuest: ((Bool) -> Void)? = nil
 
     func makeNSView(context: Context) -> GuestPane {
         let pane = GuestPane()
         pane.embed(session.view)
+        session.view.onPointerInGuest = onPointerInGuest
         session.view.capture = capture
         session.view.keyboard = keyboard
         // The view's own size guess is a tiny blank. The slot proposes the real size.
@@ -1444,6 +1585,7 @@ struct GuestView: NSViewRepresentable {
 
     func updateNSView(_ nsView: GuestPane, context: Context) {
         nsView.embed(session.view)
+        session.view.onPointerInGuest = onPointerInGuest
         session.view.capture = capture
         session.view.keyboard = keyboard
         nsView.onWindow = { [weak session] in
@@ -1534,12 +1676,16 @@ final class GuestPane: NSView {
     override var isOpaque: Bool { true }
 
     /// The thumbnail's click is a SwiftUI control above this pane. A Metal guest must not keep that click.
+    /// A miss also has to miss this pane. Otherwise the pane keeps the wheel and the window cannot scroll.
     override func hitTest(_ point: NSPoint) -> NSView? {
         guard let screen = subviews.first(where: { $0 is InstallScreen }) as? InstallScreen,
               screen.capture || screen.keyboard else {
             return nil
         }
-        return super.hitTest(point)
+        guard let hit = super.hitTest(point), hit === screen || hit.isDescendant(of: screen) else {
+            return nil
+        }
+        return hit
     }
 }
 
@@ -1577,6 +1723,8 @@ final class InstallScreen: VZVirtualMachineView {
     private var drawn = Guest.cloneGuest
     /// Set once this view has been in a window and then removed. The next window has to assign the machine again.
     private var leftWindow = false
+    /// Sees the cursor leave the guest picture. Enter and exit are not enough once capture hides the pointer.
+    private var pointerWatch: Any?
 
     var capture = false {
         didSet { applyCapture() }
@@ -1586,6 +1734,8 @@ final class InstallScreen: VZVirtualMachineView {
     var keyboard = false {
         didSet { applyCapture() }
     }
+
+    var onPointerInGuest: ((Bool) -> Void)?
 
     /// Last pixels of the guest. Pause writes this before the machine is stopped.
     func snapshot() -> NSImage? {
@@ -1600,6 +1750,12 @@ final class InstallScreen: VZVirtualMachineView {
         guard let cg = rep.cgImage else { return nil }
         let cached = ownedImage(cg, size: rect.size)
         return visiblePixels(cached) ? cached : nil
+    }
+
+    deinit {
+        if let pointerWatch {
+            NSEvent.removeMonitor(pointerWatch)
+        }
     }
 
     override var intrinsicContentSize: NSSize { drawn }
@@ -1622,9 +1778,16 @@ final class InstallScreen: VZVirtualMachineView {
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         applyCapture()
+        // The scroll view in the main window installs its own tracking areas after this view moves in.
+        // Capture has to win that pass, or the pointer stays with the host.
+        DispatchQueue.main.async { [weak self] in
+            self?.applyCapture()
+        }
         // The first window works. A view that already left a window stays black until the machine is assigned again.
         if window == nil {
             leftWindow = true
+            releaseScroll()
+            stopWatchingPointer()
             return
         }
         guard leftWindow, let running = virtualMachine else { return }
@@ -1638,7 +1801,30 @@ final class InstallScreen: VZVirtualMachineView {
 
     override func layout() {
         super.layout()
-        if !capture { disarm() }
+        if capture {
+            window?.invalidateCursorRects(for: self)
+            followPointer(nil)
+        } else {
+            disarm()
+            releaseScroll()
+        }
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        guard capture else { return }
+        followPointer(event)
+        super.mouseEntered(with: event)
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        releaseScroll()
+        if capture { super.mouseExited(with: event) }
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        guard capture else { return }
+        followPointer(event)
+        if eventInGuest(event) { super.mouseMoved(with: event) }
     }
 
     override func addTrackingArea(_ trackingArea: NSTrackingArea) {
@@ -1667,7 +1853,10 @@ final class InstallScreen: VZVirtualMachineView {
     }
 
     override func hitTest(_ point: NSPoint) -> NSView? {
-        (capture || keyboard) ? super.hitTest(point) : nil
+        // point is in the superview. The picture can be smaller than this view. Black bars must scroll.
+        let local = convert(point, from: superview)
+        guard (capture || keyboard), guestRect.contains(local) else { return nil }
+        return super.hitTest(point)
     }
 
     override var acceptsFirstResponder: Bool { capture || keyboard }
@@ -1677,18 +1866,23 @@ final class InstallScreen: VZVirtualMachineView {
     }
 
     override func mouseDown(with event: NSEvent) {
-        if keyboard && !capture {
+        if capture || keyboard {
             window?.makeFirstResponder(self)
         }
         if capture { super.mouseDown(with: event) }
     }
 
-    override func mouseEntered(with event: NSEvent) { if capture { super.mouseEntered(with: event) } }
-    override func mouseMoved(with event: NSEvent) { if capture { super.mouseMoved(with: event) } }
     override func mouseUp(with event: NSEvent) { if capture { super.mouseUp(with: event) } }
     override func mouseDragged(with event: NSEvent) { if capture { super.mouseDragged(with: event) } }
     override func rightMouseDown(with event: NSEvent) { if capture { super.rightMouseDown(with: event) } }
-    override func scrollWheel(with event: NSEvent) { if capture { super.scrollWheel(with: event) } }
+    override func scrollWheel(with event: NSEvent) {
+        // This view fills the window. A wheel outside the picture has to reach the scroll view.
+        guard capture, eventInGuest(event) else {
+            nextResponder?.scrollWheel(with: event)
+            return
+        }
+        super.scrollWheel(with: event)
+    }
 
     override func keyDown(with event: NSEvent) {
         if capture || keyboard { super.keyDown(with: event) }
@@ -1704,13 +1898,100 @@ final class InstallScreen: VZVirtualMachineView {
         capturesSystemKeys = capture || keyboard
         if capture {
             updateTrackingAreas()
+            window?.acceptsMouseMovedEvents = true
+            watchPointer()
+            window?.makeFirstResponder(self)
+            followPointer(nil)
         } else {
             disarm()
+            releaseScroll()
+            stopWatchingPointer()
             window?.makeFirstResponder(nil)
             NSCursor.unhide()
             _ = CGAssociateMouseAndMouseCursorPosition(1)
         }
         window?.invalidateCursorRects(for: self)
+    }
+
+    /// The guest picture, aspect-fit in this view. Bars around it are not the virtual machine.
+    private var guestRect: NSRect {
+        let bounds = self.bounds
+        guard bounds.width > 1, bounds.height > 1 else { return bounds }
+        let aspect = Guest.aspect
+        if bounds.width / bounds.height > aspect {
+            let width = bounds.height * aspect
+            return NSRect(x: bounds.midX - width / 2, y: bounds.minY, width: width, height: bounds.height)
+        }
+        let height = bounds.width / aspect
+        return NSRect(x: bounds.minX, y: bounds.midY - height / 2, width: bounds.width, height: height)
+    }
+
+    /// Match the scroll lock to where the cursor is. A captured cursor hides the host pointer, so enter and exit are not enough.
+    private func followPointer(_ event: NSEvent?) {
+        guard capture else {
+            releaseScroll()
+            return
+        }
+        holdScroll(event.map { eventInGuest($0) } ?? pointerInside)
+    }
+
+    /// The host cursor, in this view. Capture hides it, so the window location is the one that still moves.
+    private var pointerInside: Bool {
+        guard let window else { return false }
+        let point = convert(window.mouseLocationOutsideOfEventStream, from: nil)
+        return guestRect.contains(point)
+    }
+
+    private func eventInGuest(_ event: NSEvent) -> Bool {
+        guestRect.contains(convert(event.locationInWindow, from: nil))
+    }
+
+    /// Scroll and move events still arrive after the cursor leaves the picture. Release the scroll view before it handles them.
+    private func watchPointer() {
+        guard pointerWatch == nil else { return }
+        pointerWatch = NSEvent.addLocalMonitorForEvents(matching: [.mouseMoved, .leftMouseDown, .rightMouseDown, .leftMouseDragged, .rightMouseDragged, .scrollWheel]) { [weak self] event in
+            guard let self, event.window === self.window else { return event }
+            self.followPointer(event)
+            return event
+        }
+    }
+
+    private func stopWatchingPointer() {
+        if let pointerWatch {
+            NSEvent.removeMonitor(pointerWatch)
+            self.pointerWatch = nil
+        }
+    }
+
+    /// The main window's scroll view keeps a drag that starts on the guest, so the cursor never leaves the host.
+    /// Hold that gesture only while the pointer is over the guest picture. Settings and the bars around it keep scrolling.
+    /// The dedicated window has no scroll view, so this is a no-op there.
+    private var holdingScroll = false
+
+    private func holdScroll(_ hold: Bool) {
+        guard let scroll = enclosingScrollView else {
+            if holdingScroll {
+                holdingScroll = false
+                onPointerInGuest?(false)
+            }
+            return
+        }
+        guard hold != holdingScroll else { return }
+        holdingScroll = hold
+        onPointerInGuest?(hold)
+        scroll.verticalScrollElasticity = hold ? .none : .automatic
+        scroll.horizontalScrollElasticity = hold ? .none : .automatic
+        var views: [NSView] = [scroll, scroll.contentView]
+        if let content = scroll.documentView { views.append(content) }
+        for view in views {
+            for recognizer in view.gestureRecognizers {
+                recognizer.isEnabled = !hold
+            }
+        }
+    }
+
+    private func releaseScroll() {
+        holdScroll(false)
     }
 
     private func disarm() {

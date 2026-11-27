@@ -43,8 +43,10 @@ enum Guest {
     /// A HID boot keyboard makes Keyboard configuration a critical question, so the installer does not get one.
     private static func machine(disk: URL, extra: [URL], pointer: Bool, keyboard: Bool = false) throws -> VZVirtualMachine {
         let config = VZVirtualMachineConfiguration()
-        config.cpuCount = 2
-        config.memorySize = 2 * 1024 * 1024 * 1024
+        // The installer keeps the defaults. A clone reads the file the settings pane wrote.
+        let hardware = extra.isEmpty ? GuestHardware.load(beside: disk) : (cpu: GuestHardware.defaultCPU, memoryGB: GuestHardware.defaultMemoryGB)
+        config.cpuCount = hardware.cpu
+        config.memorySize = UInt64(hardware.memoryGB) * 1024 * 1024 * 1024
         // A pause save is tied to this identifier. A fresh one makes restore fail with an invalid argument.
         let platform = VZGenericPlatformConfiguration()
         platform.machineIdentifier = try machineIdentifier(beside: disk)
@@ -108,6 +110,38 @@ enum Guest {
     private static func guestDisk(_ url: URL) throws -> VZVirtioBlockDeviceConfiguration {
         let attachment = try VZDiskImageStorageDeviceAttachment(url: url, readOnly: false)
         return VZVirtioBlockDeviceConfiguration(attachment: attachment)
+    }
+}
+
+/// CPU and memory beside the disk. Rust stores the file. Swift only clamps to what this Mac will boot.
+enum GuestHardware {
+    static let defaultCPU = 2
+    static let defaultMemoryGB = 2
+
+    static func load(beside disk: URL) -> (cpu: Int, memoryGB: Int) {
+        let pair = Worker.hardware(disk: disk) ?? (defaultCPU, defaultMemoryGB)
+        return clamp(cpuCount: pair.0, memoryGB: pair.1)
+    }
+
+    /// What this Mac will boot. The settings pane uses the same bounds.
+    static func clamp(cpuCount: Int, memoryGB: Int) -> (cpu: Int, memoryGB: Int) {
+        let minCPU = max(1, VZVirtualMachineConfiguration.minimumAllowedCPUCount)
+        let maxCPU = max(minCPU, VZVirtualMachineConfiguration.maximumAllowedCPUCount)
+        let minBytes = VZVirtualMachineConfiguration.minimumAllowedMemorySize
+        let maxBytes = max(minBytes, VZVirtualMachineConfiguration.maximumAllowedMemorySize)
+        let minGB = max(1, Int((minBytes + (1024 * 1024 * 1024) - 1) / (1024 * 1024 * 1024)))
+        let maxGB = max(minGB, Int(maxBytes / (1024 * 1024 * 1024)))
+        return (
+            min(max(cpuCount, minCPU), maxCPU),
+            min(max(memoryGB, minGB), maxGB)
+        )
+    }
+
+    static func save(beside disk: URL, cpu: Int, memoryGB: Int) -> String? {
+        let hardware = clamp(cpuCount: cpu, memoryGB: memoryGB)
+        return Worker.hardware(disk: disk, cpu: hardware.cpu, memoryGB: hardware.memoryGB) == nil
+            ? "Could not save CPU and memory."
+            : nil
     }
 }
 

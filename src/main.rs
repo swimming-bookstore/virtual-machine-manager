@@ -1,6 +1,7 @@
 //! Quick start's disk worker. One JSON object per line. The signature is checked
 //! before the ISO is downloaded, and the checksum is checked after.
 
+mod hardware;
 mod pause;
 mod preseed;
 mod snapshot;
@@ -40,6 +41,10 @@ struct Event<'a> {
     disk: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cpu: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "memoryGB")]
+    memory_gb: Option<u32>,
 }
 
 fn emit(event: Event) {
@@ -61,6 +66,8 @@ fn ev<'a>(event: &'a str, step: Option<&'a str>, state: Option<&'a str>) -> Even
         path: None,
         disk: None,
         key: None,
+        cpu: None,
+        memory_gb: None,
     }
 }
 
@@ -570,6 +577,18 @@ enum Command {
         #[arg(long, value_name = "PATH")]
         disk: PathBuf,
     },
+    /// Read CPU and memory beside the guest disk. A missing file is 2 CPUs and 2 GB.
+    Hardware {
+        /// Guest disk of the machine.
+        #[arg(long, value_name = "PATH")]
+        disk: PathBuf,
+        /// Write this CPU count. Omit to read.
+        #[arg(long)]
+        cpu: Option<u32>,
+        /// Write this memory size in GB. Omit to read.
+        #[arg(long)]
+        memory_gb: Option<u32>,
+    },
 }
 
 fn main() {
@@ -629,6 +648,23 @@ fn main() {
             }
             Err(err) => die(err),
         },
+        Command::Hardware { disk, cpu, memory_gb } => {
+            let result = match (cpu, memory_gb) {
+                (None, None) => Ok(hardware::load(&disk)),
+                (Some(cpu), Some(memory_gb)) => hardware::save(&disk, cpu, memory_gb),
+                _ => Err(anyhow!("cpu and memory are set together")),
+            };
+            match result {
+                Ok(saved) => {
+                    let mut event = ev("hardware", None, Some("done"));
+                    event.disk = Some(disk.display().to_string());
+                    event.cpu = Some(saved.cpu);
+                    event.memory_gb = Some(saved.memory_gb);
+                    emit(event);
+                }
+                Err(err) => die(err),
+            }
+        }
     }
 }
 

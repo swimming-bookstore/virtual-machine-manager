@@ -3913,3 +3913,43 @@ fn the_main_window_does_not_force_a_virtual_machine() {
     assert!(welcome.contains("func cloneNew()"));
     assert!(welcome.contains("askName()"));
 }
+
+#[test]
+fn the_library_toolbar_jumps_to_settings() {
+    let install = include_str!("../Sources/Install.swift");
+    assert!(install.contains("Image(systemName: \"arrow.up.to.line\")"));
+    assert!(install.contains(".help(\"Scroll to top\")"));
+    assert!(install.contains("scrollTo(\"vm\", anchor: .top)"));
+    assert!(install.contains("Image(systemName: \"gearshape\")"));
+    assert!(install.contains(".help(\"Settings\")"));
+    assert!(install.contains("scrollTo(\"settings\", anchor: .top)"));
+    assert!(install.contains(".scrollDisabled(capturePointer && pointerInGuest)"));
+    assert!(install.contains("func holdScroll("));
+    assert!(install.contains("func followPointer("));
+    assert!(install.contains("addLocalMonitorForEvents"));
+    assert!(install.contains("struct MachineSettings"));
+    assert!(!install.contains(".help(\"Virtual machine\")"));
+}
+
+/// CPU and memory live beside the disk. Rust reads and writes the file. Swift only boots with the numbers.
+#[test]
+fn hardware_is_stored_beside_the_disk() {
+    let dir = dir();
+    let disk = dir.join("machines/lab/disk.img");
+    std::fs::create_dir_all(disk.parent().unwrap()).unwrap();
+    let missing = cli(&["hardware", "--disk", disk.to_str().unwrap()]);
+    assert!(missing.status.success(), "{}", String::from_utf8_lossy(&missing.stdout));
+    let event = one_event(&missing.stdout);
+    assert_eq!(event["cpu"], 2);
+    assert_eq!(event["memoryGB"], 2);
+
+    std::fs::write(&disk, b"disk").unwrap();
+    let saved = cli(&["hardware", "--disk", disk.to_str().unwrap(), "--cpu", "4", "--memory-gb", "8"]);
+    assert!(saved.status.success(), "{}", String::from_utf8_lossy(&saved.stdout));
+    assert_eq!(one_event(&saved.stdout)["cpu"], 4);
+    assert_eq!(one_event(&saved.stdout)["memoryGB"], 8);
+    let again = cli(&["hardware", "--disk", disk.to_str().unwrap()]);
+    assert_eq!(one_event(&again.stdout)["memoryGB"], 8);
+    assert!(include_str!("../Sources/Guest.swift").contains("Worker.hardware"));
+    assert!(!include_str!("../Sources/Guest.swift").contains("hardware.json"));
+}
