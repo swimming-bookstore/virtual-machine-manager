@@ -362,7 +362,15 @@ enum SupportDir {
     /// The snapshot saved after SSH. A partition table, a hash, or a leftover login file is not that.
     /// Deleting the snapshot disk is the same as deleting the ready marker.
     static var snapshotReady: Bool {
-        let snap = url.appendingPathComponent("snapshots/debian", isDirectory: true)
+        isReady(url.appendingPathComponent("snapshots/debian", isDirectory: true))
+    }
+
+    /// True when either the current snapshot or the previous one (kept during a rebuild) is ready to clone.
+    static var goldenReady: Bool {
+        snapshotReady || isReady(url.appendingPathComponent("snapshots/debian.prev", isDirectory: true))
+    }
+
+    private static func isReady(_ snap: URL) -> Bool {
         let fm = FileManager.default
         guard fm.fileExists(atPath: snap.appendingPathComponent("disk.img").path),
               let text = try? String(contentsOf: snap.appendingPathComponent("ready"), encoding: .utf8) else { return false }
@@ -653,7 +661,7 @@ struct QuickStart: View {
             .background {
                 if let iso = wizard.readyPath, let disk = wizard.diskPath, wizard.error == nil {
                     // Reset drops the previous guest. The same disk path must not keep a session that already finished.
-                    Install(iso: iso, disk: disk, embedded: true, freshInstall: wizard.runID > 0, steps: $wizard.steps, slot: installSlot)
+                    Install(iso: iso, disk: disk, embedded: true, freshInstall: wizard.runID > 0 && !SupportDir.snapshotReady, steps: $wizard.steps, slot: installSlot)
                         .id(wizard.runID)
                         .opacity(0)
                         .allowsHitTesting(false)

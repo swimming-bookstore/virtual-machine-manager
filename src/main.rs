@@ -358,8 +358,17 @@ fn write_manifest(url: &str, published: &verify::Published, dest: &Path) -> Resu
 }
 
 /// Reset keeps the download cache and does every later step again, the way Packer rebuilds an image.
+/// A finished snapshot is moved aside so cloning can still use it while the new image is building.
 fn clear_for_rebuild(dir: &Path) -> Result<()> {
-    for path in [dir.join(preseed::DIR), dir.join("ssh"), dir.join(preseed::SNAPSHOT)] {
+    let snap = dir.join(preseed::SNAPSHOT);
+    let prev = dir.join(format!("{}.prev", preseed::SNAPSHOT));
+    if snapshot::is_ready(&snap) {
+        if prev.exists() {
+            fs::remove_dir_all(&prev).map_err(|err| anyhow!("cannot remove {}: {err}", prev.display()))?;
+        }
+        fs::rename(&snap, &prev).map_err(|err| anyhow!("cannot move {}: {err}", snap.display()))?;
+    }
+    for path in [dir.join(preseed::DIR), dir.join("ssh"), snap] {
         if path.exists() {
             fs::remove_dir_all(&path).map_err(|err| anyhow!("cannot remove {}: {err}", path.display()))?;
         }
