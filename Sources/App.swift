@@ -33,6 +33,7 @@ enum WindowMetrics {
 
 @main
 struct VirtualMachinesApp: App {
+    @Environment(\.openWindow) private var openWindow
     @StateObject private var quickStart = QuickStartModel()
     /// The library and a machine window share one session. A session owned by the library view would die when that window closes.
     @StateObject private var library = LibraryModel()
@@ -41,6 +42,14 @@ struct VirtualMachinesApp: App {
         WindowGroup("Virtual Machine Manager", id: "main") { Welcome(library: library) }
             .windowResizability(.automatic)
             .defaultSize(width: WindowMetrics.library.width, height: WindowMetrics.library.height)
+            .commands {
+                CommandGroup(after: .newItem) {
+                    Button("Rebuild Golden Image") {
+                        quickStart.wizard.resetWizard(session: quickStart.installSlot.session)
+                        openWindow(id: "quick-start")
+                    }
+                }
+            }
         Window("Quick start", id: "quick-start") {
             QuickStart(wizard: quickStart.wizard, installSlot: quickStart.installSlot)
         }

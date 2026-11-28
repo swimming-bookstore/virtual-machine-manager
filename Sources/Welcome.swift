@@ -26,7 +26,7 @@ final class LibraryModel: ObservableObject {
     private var renamingDisk: String?
     /// Row identity for each disk. Rename moves the entry so the open guest stays mounted.
     private var keys: [String: String] = [:]
-    @Published var snapshotReady = SupportDir.snapshotReady
+    @Published var snapshotReady = SupportDir.goldenReady
     /// The wizard asked to open the main window. That window may not exist yet, so the notification can be missed.
     private static var pendingFirstName = false
     /// Running clones. The detail view is one machine; this keeps the others alive.
@@ -216,7 +216,7 @@ final class LibraryModel: ObservableObject {
     }
 
     func refresh() {
-        snapshotReady = SupportDir.snapshotReady
+        snapshotReady = SupportDir.goldenReady
         let root = SupportDir.url.appendingPathComponent("machines", isDirectory: true)
         let fm = FileManager.default
         var found: [Machine] = []

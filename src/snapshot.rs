@@ -47,15 +47,24 @@ pub fn save(support: &Path) -> Result<Saved> {
     // The installer writes snapshots/debian/disk.img. That file is the snapshot, so it is not copied onto itself.
     copy_beside(&guest, &dest, &[DISK, NVRAM, MACHINE_ID])?;
     write_ready(&dest.join(READY))?;
+    let prev = support.join(format!("{SNAPSHOT}.prev"));
+    if prev.exists() {
+        let _ = fs::remove_dir_all(&prev);
+    }
     Ok(saved(&dest))
 }
 
 /// Clone the snapshot into `machines/NAME`. The copy shares blocks when the disk allows it.
 pub fn clone_machine(support: &Path, name: Option<&str>) -> Result<Saved> {
-    let src = support.join("snapshots").join(MACHINE);
-    if !snapshot_ready(&src)? {
+    let current = support.join("snapshots").join(MACHINE);
+    let prev = support.join(format!("{SNAPSHOT}.prev"));
+    let src = if snapshot_ready(&current)? {
+        current
+    } else if snapshot_ready(&prev)? {
+        prev
+    } else {
         bail!("no Debian snapshot yet. Finish the installer first.");
-    }
+    };
     let machines = support.join("machines");
     fs::create_dir_all(&machines)
         .map_err(|err| anyhow!("cannot create {}: {err}", machines.display()))?;
@@ -152,6 +161,10 @@ fn saved(dir: &Path) -> Saved {
 }
 
 /// Both files, and a real installed disk. A removed or broken copy is not ready, so save replaces it.
+pub fn is_ready(dir: &Path) -> bool {
+    snapshot_ready(dir).unwrap_or(false)
+}
+
 fn snapshot_ready(dir: &Path) -> Result<bool> {
     let ready = dir.join(READY);
     let disk = dir.join(DISK);

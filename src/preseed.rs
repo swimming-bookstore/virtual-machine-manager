@@ -78,7 +78,7 @@ pub fn preseed_cfg(example: &str) -> Result<String> {
 /// The account is debian / debian. The host key is still copied in late_command.
 /// tasksel installs only the XFCE desktop task.
 /// `tasksel/first` names `xfce-desktop` directly, so the GNOME default behind
-/// `desktop` is never read. pkgsel/include installs openssh-server and spice-vdagent.
+/// `desktop` is never read. pkgsel/include installs openssh-server, spice-vdagent, and git.
 /// <https://www.debian.org/releases/trixie/example-preseed.txt>
 /// <https://www.debian.org/releases/stable/amd64/apbs05.en.html>
 pub fn debian_cfg() -> &'static str {
@@ -1007,7 +1007,7 @@ mod tests {
         assert!(!answers.contains("tasksel/desktop"));
         assert!(!answers.contains("task-xfce-desktop"));
         assert!(!answers.contains("debian-installer/locale"));
-        assert!(answers.contains("d-i pkgsel/include string openssh-server spice-vdagent"));
+        assert!(answers.contains("d-i pkgsel/include string openssh-server spice-vdagent git"));
         assert!(!answers.contains("apt-install"));
         assert!(answers.contains("cp /authorized_keys"));
         assert!(!answers.contains("systemctl enable ssh"));
