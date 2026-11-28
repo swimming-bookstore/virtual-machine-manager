@@ -3,13 +3,13 @@
 //! filesystem inside the image. A shorter file must still cover every partition.
 //! A GPT backup header is moved to the new end so the guest sees the free space.
 
-use std::fs::{self, File, OpenOptions};
+use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use anyhow::{anyhow, bail, Result};
 
-use crate::preseed::{DISK, GUEST};
+use crate::preseed::GUEST;
 
 const GIB: u64 = 1024 * 1024 * 1024;
 const SECTOR: u64 = 512;
@@ -380,6 +380,8 @@ fn crc32(data: &[u8]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::preseed::DISK;
+    use std::fs;
     use std::os::unix::fs::MetadataExt;
 
     #[test]
