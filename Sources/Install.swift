@@ -293,8 +293,8 @@ struct Install: View {
     /// A pause keeps the last frame, the way UTM caches the view before the machine is stopped.
     /// GuestView stays mounted under that frame. Replacing it unhooks the virtual machine view, and the next pause has nothing to snapshot.
     /// The still is an AppKit sibling on top of the Metal guest. A SwiftUI Image in the ZStack does not cover it.
-    private var guestScreen: some View {
-        GuestView(
+    @ViewBuilder private var guestScreen: some View {
+        let view = GuestView(
             session: guest,
             capture: capturePointer,
             keyboard: captureKeyboard,
@@ -307,9 +307,14 @@ struct Install: View {
                 }
             }
         )
-            .id(guest.screenEpoch)
-            .background(.black, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .id(guest.screenEpoch)
+        if fill {
+            view.background(.black)
+        } else {
+            view
+                .background(.black, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        }
     }
 
     /// Installer rows. A clone window is not this wizard.
