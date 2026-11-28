@@ -37,6 +37,7 @@ struct Install: View {
     var onHardware: (() -> Void)? = nil
     @StateObject private var guest: GuestSession
     @State private var pointerInGuest = false
+    @State private var viewport: CGSize = .zero
     @Environment(\.openWindow) private var openWindow
 
     init(iso: String, disk: String, fromSnapshot: Bool = false, embedded: Bool = false, freshInstall: Bool = false, fill: Bool = false, windowed: Bool = false, session: GuestSession? = nil, onDelete: (() -> Void)? = nil, deleteDisabled: Bool = false, onOpen: (() -> Void)? = nil, onHardware: (() -> Void)? = nil, steps: Binding<[WizardStep]>? = nil, slot: InstallSlotModel? = nil) {
@@ -150,11 +151,22 @@ struct Install: View {
                         VStack(spacing: 0) {
                             guestStage
                                 .id("vm")
-                                .frame(minHeight: max(WindowMetrics.libraryMin.height - 52, Guest.cloneGuest.height))
+                                .frame(
+                                    height: viewport.width > 1 && viewport.height > 1
+                                        ? min(viewport.width / Guest.aspect, viewport.height)
+                                        : max(WindowMetrics.libraryMin.height - 52, Guest.cloneGuest.height)
+                                )
                             if fromSnapshot {
                                 MachineSettings(disk: disk, running: !guest.stopped, onChange: onHardware)
                                     .id("settings")
                             }
+                        }
+                    }
+                    .background {
+                        GeometryReader { geo in
+                            Color.clear
+                                .onAppear { viewport = geo.size }
+                                .onChange(of: geo.size) { _, size in viewport = size }
                         }
                     }
                     .scrollDisabled(capturePointer && pointerInGuest)

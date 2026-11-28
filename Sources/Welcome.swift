@@ -621,6 +621,13 @@ private final class ChromeView: NSView {
         if window.toolbarStyle != .unified {
             window.toolbarStyle = .unified
         }
+        if let toolbar = window.toolbar {
+            toolbar.displayMode = .iconOnly
+            toolbar.allowsUserCustomization = false
+            if #available(macOS 15.0, *) {
+                toolbar.allowsDisplayModeCustomization = false
+            }
+        }
         if splash {
             window.title = "Welcome"
             window.titleVisibility = .visible
@@ -766,6 +773,13 @@ private final class GuestChromeView: NSView {
         window.titlebarAppearsTransparent = false
         if window.toolbarStyle != .unified {
             window.toolbarStyle = .unified
+        }
+        if let toolbar = window.toolbar {
+            toolbar.displayMode = .iconOnly
+            toolbar.allowsUserCustomization = false
+            if #available(macOS 15.0, *) {
+                toolbar.allowsDisplayModeCustomization = false
+            }
         }
     }
 }
