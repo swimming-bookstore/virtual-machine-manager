@@ -92,6 +92,9 @@ struct WorkerEvent: Decodable {
     var key: String?
     var cpu: Int?
     var memoryGB: Int?
+    var diskGB: Int?
+    var minDiskGB: Int?
+    var maxDiskGB: Int?
 }
 
 final class Wizard: ObservableObject {
@@ -414,6 +417,28 @@ enum Worker {
             return (cpu, memory)
         }
         return nil
+    }
+
+    /// Size of the guest disk image in GB. The other two numbers are the slider ends from the worker.
+    static func diskSize(disk: URL, gb: Int? = nil) -> (current: Int, min: Int, max: Int)? {
+        var args = ["disk", "--disk", disk.path]
+        if let gb {
+            args.append(contentsOf: ["--gb", "\(gb)"])
+        }
+        let (code, text) = run(args)
+        guard code == 0 else { return nil }
+        for line in text.split(separator: "\n") {
+            guard let data = line.data(using: .utf8),
+                  let event = try? JSONDecoder().decode(WorkerEvent.self, from: data),
+                  let gb = event.diskGB else { continue }
+            return (gb, event.minDiskGB ?? gb, event.maxDiskGB ?? gb)
+        }
+        return nil
+    }
+
+    static func diskSizeError(disk: URL, gb: Int) -> String? {
+        let (code, text) = run(["disk", "--disk", disk.path, "--gb", "\(gb)"])
+        return code == 0 ? nil : (message(text) ?? "Could not resize the disk.")
     }
 
     /// "My Debian" plus a short code. Rust picks the code.

@@ -192,7 +192,7 @@ fn installed(disk: &Path) -> Result<()> {
         bail!("install is not finished: the guest disk has no partition table");
     }
     let len = file.metadata()?.len();
-    if len != GUEST {
+    if len < GUEST {
         bail!("install is not finished: guest disk is {len} bytes");
     }
     Ok(())

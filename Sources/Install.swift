@@ -443,6 +443,11 @@ private struct MachineSettings: View {
     @State private var error: String?
     @State private var savedCPU = GuestHardware.defaultCPU
     @State private var savedMemory = GuestHardware.defaultMemoryGB
+    @State private var diskGB = 16
+    @State private var savedDiskGB = 16
+    @State private var minDiskGB = 16
+    @State private var maxDiskGB = 16
+    @State private var resizing = false
 
     private var maxCPU: Int { VZVirtualMachineConfiguration.maximumAllowedCPUCount }
     private var maxMemory: Int { Int(VZVirtualMachineConfiguration.maximumAllowedMemorySize / (1024 * 1024 * 1024)) }
@@ -456,6 +461,7 @@ private struct MachineSettings: View {
                 .fixedSize(horizontal: false, vertical: true)
             row("CPU", cpu, 1...max(1, maxCPU), cpu == 1 ? "core" : "cores") { cpu = $0; store() }
             row("Memory", memory, 1...max(1, maxMemory), "GB") { memory = $0; store() }
+            diskRow
             if let error { Text(error).font(.callout).foregroundStyle(.red) }
         }
         .padding(WindowMetrics.pagePad)
@@ -463,6 +469,32 @@ private struct MachineSettings: View {
         .background(.background)
         .onAppear(perform: load)
         .onChange(of: disk) { _, _ in load() }
+    }
+
+    /// The image changes size while the virtual machine is stopped. The filesystem inside is left as it is.
+    private var diskRow: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("Disk")
+                Spacer()
+                Text("\(diskGB) GB").foregroundStyle(.secondary).monospacedDigit()
+            }
+            Slider(
+                value: Binding(get: { Double(diskGB) }, set: { diskGB = Int($0.rounded()) }),
+                in: Double(minDiskGB)...Double(max(minDiskGB, maxDiskGB)),
+                step: 1
+            )
+            .disabled(running || resizing || minDiskGB >= maxDiskGB)
+            HStack {
+                Text(running ? "Stop the virtual machine to change the disk size." : "Changes the disk image. It does not change the filesystem inside.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Spacer()
+                Button(resizing ? "Resizing..." : "Resize") { resize() }
+                    .disabled(running || resizing || diskGB == savedDiskGB)
+            }
+        }
     }
 
     private func row(_ title: String, _ value: Int, _ range: ClosedRange<Int>, _ unit: String, set: @escaping (Int) -> Void) -> some View {
@@ -483,7 +515,38 @@ private struct MachineSettings: View {
         memory = hardware.memoryGB
         savedCPU = cpu
         savedMemory = memory
+        if let size = Worker.diskSize(disk: URL(fileURLWithPath: disk)) {
+            diskGB = size.current
+            savedDiskGB = size.current
+            minDiskGB = min(size.current, size.min)
+            maxDiskGB = max(size.current, size.max)
+        }
         error = nil
+    }
+
+    private func resize() {
+        guard !running, !resizing, diskGB != savedDiskGB else { return }
+        resizing = true
+        error = nil
+        let path = disk
+        let gb = diskGB
+        DispatchQueue.global(qos: .userInitiated).async {
+            let failure = Worker.diskSizeError(disk: URL(fileURLWithPath: path), gb: gb)
+            let read = Worker.diskSize(disk: URL(fileURLWithPath: path))
+            DispatchQueue.main.async {
+                resizing = false
+                if let failure {
+                    error = failure
+                    diskGB = savedDiskGB
+                } else if let read {
+                    diskGB = read.current
+                    savedDiskGB = read.current
+                    minDiskGB = min(read.current, read.min)
+                    maxDiskGB = max(read.current, read.max)
+                    onChange?()
+                }
+            }
+        }
     }
 
     private func store() {

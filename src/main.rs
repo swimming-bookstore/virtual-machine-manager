@@ -1,6 +1,7 @@
 //! Quick start's disk worker. One JSON object per line. The signature is checked
 //! before the ISO is downloaded, and the checksum is checked after.
 
+mod disk;
 mod hardware;
 mod pause;
 mod preseed;
@@ -45,6 +46,12 @@ struct Event<'a> {
     cpu: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "memoryGB")]
     memory_gb: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "diskGB")]
+    disk_gb: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "minDiskGB")]
+    min_disk_gb: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "maxDiskGB")]
+    max_disk_gb: Option<u64>,
 }
 
 fn emit(event: Event) {
@@ -68,6 +75,9 @@ fn ev<'a>(event: &'a str, step: Option<&'a str>, state: Option<&'a str>) -> Even
         key: None,
         cpu: None,
         memory_gb: None,
+        disk_gb: None,
+        min_disk_gb: None,
+        max_disk_gb: None,
     }
 }
 
@@ -598,6 +608,15 @@ enum Command {
         #[arg(long)]
         memory_gb: Option<u32>,
     },
+    /// Read or resize the guest disk image. This does not change the filesystem inside.
+    Disk {
+        /// Guest disk of the machine.
+        #[arg(long, value_name = "PATH")]
+        disk: PathBuf,
+        /// New size in GB. Omit to read. Must cover every partition.
+        #[arg(long)]
+        gb: Option<u64>,
+    },
 }
 
 fn main() {
@@ -669,6 +688,23 @@ fn main() {
                     event.disk = Some(disk.display().to_string());
                     event.cpu = Some(saved.cpu);
                     event.memory_gb = Some(saved.memory_gb);
+                    emit(event);
+                }
+                Err(err) => die(err),
+            }
+        }
+        Command::Disk { disk, gb } => {
+            let result = match gb {
+                None => disk::load(&disk),
+                Some(gb) => disk::resize(&disk, gb),
+            };
+            match result {
+                Ok(saved) => {
+                    let mut event = ev("disk", None, Some("done"));
+                    event.disk = Some(disk.display().to_string());
+                    event.disk_gb = Some(saved.gib);
+                    event.min_disk_gb = Some(saved.min_gib);
+                    event.max_disk_gb = Some(saved.max_gib);
                     emit(event);
                 }
                 Err(err) => die(err),
