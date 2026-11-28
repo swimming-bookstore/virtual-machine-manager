@@ -455,10 +455,6 @@ private struct MachineSettings: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             Text("Settings").font(.title3.weight(.semibold))
-            Text(running ? "CPU and memory apply the next time this virtual machine starts." : "CPU and memory for this virtual machine.")
-                .font(.callout)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
             row("CPU", cpu, 1...maxCPU, cpu == 1 ? "core" : "cores") { cpu = $0; store() }
             row("Memory", memory, 1...maxMemory, "GB") { memory = $0; store() }
             diskRow
@@ -471,35 +467,30 @@ private struct MachineSettings: View {
         .onChange(of: disk) { _, _ in load() }
     }
 
-    /// A reversed or zero-width range makes Slider trap. The window dies with that trap.
-    private var diskUpper: Double { Double(max(minDiskGB + 1, maxDiskGB)) }
+    /// Same scale as CPU and memory: 1 through the largest size this Mac will offer.
+    /// A floor of 16 on a 512 end leaves the knob stuck at the left.
+    private var diskUpper: Int { max(1, maxDiskGB) }
 
     /// The image changes size while the virtual machine is stopped. The filesystem inside is left as it is.
+    /// Resize sits on the label line so the slider lines up with CPU and memory.
     private var diskRow: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack {
                 Text("Disk")
                 Spacer()
                 Text("\(diskGB) GB").foregroundStyle(.secondary).monospacedDigit()
+                Button(resizing ? "Resizing..." : "Resize") { resize() }
+                    .disabled(running || resizing || diskGB == savedDiskGB || diskGB < minDiskGB)
             }
             Slider(
                 value: Binding(
-                    get: { min(max(Double(diskGB), Double(minDiskGB)), diskUpper) },
+                    get: { min(max(Double(diskGB), 1), Double(diskUpper)) },
                     set: { diskGB = Int($0.rounded()) }
                 ),
-                in: Double(minDiskGB)...diskUpper,
+                in: 1...Double(diskUpper),
                 step: 1
             )
-            .disabled(running || resizing || minDiskGB >= maxDiskGB)
-            HStack {
-                Text(running ? "Stop the virtual machine to change the disk size." : "Changes the disk image. It does not change the filesystem inside.")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-                Spacer()
-                Button(resizing ? "Resizing..." : "Resize") { resize() }
-                    .disabled(running || resizing || diskGB == savedDiskGB)
-            }
+            .disabled(running || resizing)
         }
     }
 
@@ -539,14 +530,13 @@ private struct MachineSettings: View {
         }
     }
 
-    /// The worker's ends can arrive out of order. The slider still needs a rising range.
+    /// The worker's ends can arrive out of order. The scale stays 1 through the largest offer.
     private func apply(_ size: (current: Int, min: Int, max: Int)?) {
         guard let size else { return }
-        let lower = min(size.current, size.min)
-        let upper = max(size.current, size.max, lower + 1)
-        minDiskGB = lower
+        let upper = max(1, size.current, size.max)
+        minDiskGB = min(size.current, size.min)
         maxDiskGB = upper
-        diskGB = min(max(size.current, lower), upper)
+        diskGB = min(max(size.current, 1), upper)
         savedDiskGB = diskGB
     }
 
@@ -563,7 +553,7 @@ private struct MachineSettings: View {
                 resizing = false
                 if let failure {
                     error = failure
-                    diskGB = min(max(savedDiskGB, minDiskGB), Int(diskUpper))
+                    diskGB = min(max(savedDiskGB, 1), diskUpper)
                 } else if read != nil {
                     apply(read)
                     onChange?()
