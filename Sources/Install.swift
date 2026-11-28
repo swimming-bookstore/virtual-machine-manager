@@ -448,6 +448,8 @@ private struct MachineSettings: View {
     @State private var minDiskGB = 16
     @State private var maxDiskGB = 16
     @State private var resizing = false
+    /// True while the knob is held. A key change has no drag, so that still resizes.
+    @State private var draggingDisk = false
 
     private var maxCPU: Int { max(1, VZVirtualMachineConfiguration.maximumAllowedCPUCount) }
     private var maxMemory: Int { max(1, Int(VZVirtualMachineConfiguration.maximumAllowedMemorySize / (1024 * 1024 * 1024))) }
@@ -471,16 +473,13 @@ private struct MachineSettings: View {
     /// A floor of 16 on a 512 end leaves the knob stuck at the left.
     private var diskUpper: Int { max(1, maxDiskGB) }
 
-    /// The image changes size while the virtual machine is stopped. The filesystem inside is left as it is.
-    /// Resize sits on the label line so the slider lines up with CPU and memory.
+    /// The image changes size when the slider is released. The filesystem inside is left as it is.
     private var diskRow: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack {
                 Text("Disk")
                 Spacer()
                 Text("\(diskGB) GB").foregroundStyle(.secondary).monospacedDigit()
-                Button(resizing ? "Resizing..." : "Resize") { resize() }
-                    .disabled(running || resizing || diskGB == savedDiskGB || diskGB < minDiskGB)
             }
             Slider(
                 value: Binding(
@@ -488,9 +487,17 @@ private struct MachineSettings: View {
                     set: { diskGB = Int($0.rounded()) }
                 ),
                 in: 1...Double(diskUpper),
-                step: 1
+                step: 1,
+                onEditingChanged: { editing in
+                    draggingDisk = editing
+                    if !editing { resize(diskGB) }
+                }
             )
             .disabled(running || resizing)
+        }
+        .onChange(of: diskGB) { _, value in
+            guard !draggingDisk else { return }
+            resize(value)
         }
     }
 
@@ -540,12 +547,11 @@ private struct MachineSettings: View {
         savedDiskGB = diskGB
     }
 
-    private func resize() {
-        guard !running, !resizing, diskGB != savedDiskGB else { return }
+    private func resize(_ gb: Int) {
+        guard !running, !resizing, gb != savedDiskGB else { return }
         resizing = true
         error = nil
         let path = disk
-        let gb = diskGB
         DispatchQueue.global(qos: .userInitiated).async {
             let failure = Worker.diskSizeError(disk: URL(fileURLWithPath: path), gb: gb)
             let read = Worker.diskSize(disk: URL(fileURLWithPath: path))
