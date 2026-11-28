@@ -307,9 +307,8 @@ struct Install: View {
                 }
             }
         )
-            .id(guest.screenEpoch)
-            .background(.black, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .id(guest.screenEpoch)
+        .background(.black)
     }
 
     /// Installer rows. A clone window is not this wizard.
