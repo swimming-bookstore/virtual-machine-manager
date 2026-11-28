@@ -449,8 +449,8 @@ private struct MachineSettings: View {
     @State private var maxDiskGB = 16
     @State private var resizing = false
 
-    private var maxCPU: Int { VZVirtualMachineConfiguration.maximumAllowedCPUCount }
-    private var maxMemory: Int { Int(VZVirtualMachineConfiguration.maximumAllowedMemorySize / (1024 * 1024 * 1024)) }
+    private var maxCPU: Int { max(1, VZVirtualMachineConfiguration.maximumAllowedCPUCount) }
+    private var maxMemory: Int { max(1, Int(VZVirtualMachineConfiguration.maximumAllowedMemorySize / (1024 * 1024 * 1024))) }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -459,8 +459,8 @@ private struct MachineSettings: View {
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
-            row("CPU", cpu, 1...max(1, maxCPU), cpu == 1 ? "core" : "cores") { cpu = $0; store() }
-            row("Memory", memory, 1...max(1, maxMemory), "GB") { memory = $0; store() }
+            row("CPU", cpu, 1...maxCPU, cpu == 1 ? "core" : "cores") { cpu = $0; store() }
+            row("Memory", memory, 1...maxMemory, "GB") { memory = $0; store() }
             diskRow
             if let error { Text(error).font(.callout).foregroundStyle(.red) }
         }
@@ -471,6 +471,9 @@ private struct MachineSettings: View {
         .onChange(of: disk) { _, _ in load() }
     }
 
+    /// A reversed or zero-width range makes Slider trap. The window dies with that trap.
+    private var diskUpper: Double { Double(max(minDiskGB + 1, maxDiskGB)) }
+
     /// The image changes size while the virtual machine is stopped. The filesystem inside is left as it is.
     private var diskRow: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -480,8 +483,11 @@ private struct MachineSettings: View {
                 Text("\(diskGB) GB").foregroundStyle(.secondary).monospacedDigit()
             }
             Slider(
-                value: Binding(get: { Double(diskGB) }, set: { diskGB = Int($0.rounded()) }),
-                in: Double(minDiskGB)...Double(max(minDiskGB, maxDiskGB)),
+                value: Binding(
+                    get: { min(max(Double(diskGB), Double(minDiskGB)), diskUpper) },
+                    set: { diskGB = Int($0.rounded()) }
+                ),
+                in: Double(minDiskGB)...diskUpper,
                 step: 1
             )
             .disabled(running || resizing || minDiskGB >= maxDiskGB)
@@ -504,24 +510,44 @@ private struct MachineSettings: View {
                 Spacer()
                 Text("\(value) \(unit)").foregroundStyle(.secondary).monospacedDigit()
             }
-            Slider(value: Binding(get: { Double(value) }, set: { set(Int($0.rounded())) }), in: Double(range.lowerBound)...Double(range.upperBound), step: 1)
+            Slider(
+                value: Binding(
+                    get: { min(max(Double(value), Double(range.lowerBound)), Double(range.upperBound)) },
+                    set: { set(Int($0.rounded())) }
+                ),
+                in: Double(range.lowerBound)...Double(range.upperBound),
+                step: 1
+            )
                 .disabled(running)
         }
     }
 
     private func load() {
-        let hardware = GuestHardware.load(beside: URL(fileURLWithPath: disk))
-        cpu = hardware.cpu
-        memory = hardware.memoryGB
-        savedCPU = cpu
-        savedMemory = memory
-        if let size = Worker.diskSize(disk: URL(fileURLWithPath: disk)) {
-            diskGB = size.current
-            savedDiskGB = size.current
-            minDiskGB = min(size.current, size.min)
-            maxDiskGB = max(size.current, size.max)
-        }
         error = nil
+        let path = disk
+        DispatchQueue.global(qos: .userInitiated).async {
+            let hardware = GuestHardware.load(beside: URL(fileURLWithPath: path))
+            let size = Worker.diskSize(disk: URL(fileURLWithPath: path))
+            DispatchQueue.main.async {
+                guard path == disk, !resizing else { return }
+                cpu = hardware.cpu
+                memory = hardware.memoryGB
+                savedCPU = cpu
+                savedMemory = memory
+                apply(size)
+            }
+        }
+    }
+
+    /// The worker's ends can arrive out of order. The slider still needs a rising range.
+    private func apply(_ size: (current: Int, min: Int, max: Int)?) {
+        guard let size else { return }
+        let lower = min(size.current, size.min)
+        let upper = max(size.current, size.max, lower + 1)
+        minDiskGB = lower
+        maxDiskGB = upper
+        diskGB = min(max(size.current, lower), upper)
+        savedDiskGB = diskGB
     }
 
     private func resize() {
@@ -537,12 +563,9 @@ private struct MachineSettings: View {
                 resizing = false
                 if let failure {
                     error = failure
-                    diskGB = savedDiskGB
-                } else if let read {
-                    diskGB = read.current
-                    savedDiskGB = read.current
-                    minDiskGB = min(read.current, read.min)
-                    maxDiskGB = max(read.current, read.max)
+                    diskGB = min(max(savedDiskGB, minDiskGB), Int(diskUpper))
+                } else if read != nil {
+                    apply(read)
                     onChange?()
                 }
             }
